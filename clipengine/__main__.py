@@ -15,6 +15,7 @@ import os
 import sys
 
 from . import headers as H
+from . import untrusted as UT
 from . import pipeline as P
 from . import twitch as T
 
@@ -133,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     it.add_argument("--streamers", help="comma-separated Twitch logins (default: suggested from what's live)")
     it.add_argument("--hashtags", help='comma-separated; "{creator}" = the streamer\'s tag')
     it.add_argument("--force", action="store_true", help="start over (keeps a .bak of the current pack)")
+    it.add_argument("--accept-risks", action="store_true", help="the user heard the risks (printed without this) and said yes")
     pv = sub.add_parser("preview", help="render a sample frame + 5 s clip in this channel's look")
     pv.add_argument("--clip", help="use a real .ts/.mp4 instead of the neutral background")
     pv.add_argument("--title"); pv.add_argument("--quote")
@@ -232,7 +234,8 @@ def main(argv: list[str] | None = None) -> int:
         from . import onboard as OB
         OB.init(a.name, a.youtube, a.instagram, a.tiktok, a.category,
                 a.streamers.split(",") if a.streamers else None,
-                [h.strip() for h in a.hashtags.split(",")] if a.hashtags else None, a.force)
+                [h.strip() for h in a.hashtags.split(",")] if a.hashtags else None, a.force,
+                accept_risks=a.accept_risks)
         return 0
     if a.cmd == "preview":
         from . import onboard as OB
@@ -343,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.channel:
             v = T.latest_vod(a.channel)
             a.vod = v["id"]
-            print(f"{a.channel}: newest VOD {v['id']} '{v['title'][:60]}' "
+            print(f"{a.channel}: newest VOD {v['id']} {UT.quote(v['title'], 60)} "
                   f"{T.fmt(v['length_s'])}{' (LIVE — still recording)' if v['live'] else ''}")
             if a.last:
                 a.start = str(max(0, v["length_s"] - T.parse_time(a.last)))

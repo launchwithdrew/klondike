@@ -29,6 +29,7 @@ import re
 import subprocess
 
 from . import safety as SF
+from . import untrusted as UT
 from . import twitch as T
 from . import grade as G
 from . import gate as GT
@@ -113,7 +114,8 @@ def record_clipped(entry: dict, push: bool) -> None:
     os.makedirs(os.path.dirname(CLIPPED), exist_ok=True)
     with open(CLIPPED, "a") as fh:
         fh.write(json.dumps(entry) + "\n")
-    if push:
+    from . import repo as RP
+    if push and RP.sync():
         g = ["git", "-C", REPO]
         subprocess.run(g + ["add", CLIPPED], check=False)
         subprocess.run(g + ["-c", "user.name=clipengine", "-c", "user.email=clipengine@users.noreply.github.com",
@@ -177,7 +179,7 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
     said = " ".join(seg["text"] for seg in tr["segments"])
     sf = SF.screen(said, headline=(title or "") + " " + (quote or ""))
     report = {"out": rep["out"], "frames": rep.get("frames"), "safety": sf, "moment_at": moment.isoformat(),
-              "length_s": round(e - s, 1), "captions_preview": said[:400]}
+              "length_s": round(e - s, 1), "captions_preview": UT.quote(said, 400)}
     if sf["flagged"]:
         report["status"] = "REFUSED — sexual content: " + sf["why"]
         print(json.dumps(report, indent=2))

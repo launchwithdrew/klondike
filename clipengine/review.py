@@ -12,6 +12,7 @@ import html
 import os
 
 from . import headers as H
+from . import untrusted as UT
 from .twitch import fmt
 
 
@@ -52,7 +53,7 @@ def write_review(res: dict, path: str) -> None:
         cr = c.get("crowd")
         crowd_line = (f'<p class="crowd">🔥 Viewers clipped this: <b>{cr["clips"]} clip{"s" if cr["clips"] > 1 else ""}, '
                       f'{cr["views"]:,} views</b> ({cr["views_per_min"]}/min) — '
-                      + " · ".join(f"“{e(t[:60])}”" for t in cr["titles"]) + "</p>") if cr else ""
+                      + " · ".join(e(UT.quote(t, 60)) for t in cr["titles"]) + "</p>") if cr else ""
         labels = ("start", "chat peak", "middle", "end")
         thumbs = ('<div class="thumbs">' + "".join(
             f'<figure><img src="{u}" alt="{lab} frame"><figcaption>{lab}</figcaption></figure>'
@@ -118,7 +119,7 @@ ul{{margin:0;padding-left:18px}} .kv small{{color:var(--mut)}}
 .ty{{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin:2px;font-size:12px}}
 code{{display:block;overflow-x:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;font-size:12px}}
 </style></head><body><main>
-<h1>{e(name)} — {e(vod['title'][:90])}</h1>
+<h1>{e(name)} — {e(UT.quote(vod['title'], 90))}</h1>
 <p class="sub">VOD {vod['id']} · {fmt(res['range'][0])}–{fmt(res['range'][1])} · {res['messages']:,} chat messages ·
 scan {res['timing_s']['total']}s (chat {res['timing_s']['chat']}s, audio probe {res['timing_s']['probe']}s) ·
 chapters: {e(', '.join(f"{fmt(c['start_s'])} {c['game']}" for c in vod['chapters']))}</p>

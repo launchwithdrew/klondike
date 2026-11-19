@@ -28,6 +28,7 @@ import math
 import os
 
 from . import twitch as T
+from . import untrusted as UT
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(REPO, "config", "radar.json")
@@ -234,7 +235,7 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
     for m in moments[:show]:
         flag = f"  ⛔ {m['unsafe']}" if m["unsafe"] else (f"  ✓ published as {m['published']}" if m["published"] else "")
         print(f"  {m['vpm']:7.1f}/min {m['views']:>7,} views  {m['login']:<16} {m['age_min']:>4}m ago  "
-              f"\"{m['titles'][0][:48]}\"{flag}")
+              f"{UT.quote(m['titles'][0], 48)}{flag}")
         if not flag:
             print(f"           -> python -m clipengine {m['cut']}")
     if out:

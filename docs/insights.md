@@ -10,3 +10,7 @@ chat, passwords, or anything that identifies the user.
 
 **Turn it on (with the user's yes):** `clipengine insights --enable`. See exactly what would be sent
 first: `clipengine insights --show`. Turn it off any time: `clipengine insights --disable`.
+
+**Right now nothing leaves this machine.** Sharing opens in a later release, through a channel where no
+one can read or change anyone else's results. Until then each day's numbers are kept in
+`local/insights/outbox/`, and turning it off stops that too.

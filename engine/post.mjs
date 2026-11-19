@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { ROOT, OUTBOX, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, acquireLock, probe } from './lib.mjs';
+import { ROOT, SYNC, OUTBOX, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, acquireLock, probe } from './lib.mjs';
 import { postYouTube, checkYouTube } from './youtube.mjs';
 import { postInstagram, checkInstagram } from './instagram.mjs';
 import { postTikTok, checkTikTok } from './tiktok.mjs';
@@ -111,10 +111,11 @@ async function processItem(ctx, dir) {
 const GIT_ENV = { ...process.env, GIT_SSH_COMMAND: 'ssh -o StrictHostKeyChecking=accept-new' };
 function git(...a) { return execFileSync('git', ['-C', ROOT, ...a], { env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim(); }
 function pull() {
+  if (!SYNC) return;               // a public copy gets engine releases only through `clipengine update`
   try { git('pull', '--rebase', '--autostash', '-q'); } catch (e) { log('git pull failed:', String(e.stderr || e.message).split('\n')[0]); }
 }
 function pushResults(msg) {
-  if (DRY) return;
+  if (DRY || !SYNC) return;
   try {
     // Commit only the ledger and the removal of drops that were pulled from the repo — never new media.
     git('add', 'ledger.jsonl');

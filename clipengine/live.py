@@ -27,6 +27,7 @@ import time
 import urllib.parse
 
 from . import twitch as T
+from . import untrusted as UT
 
 SEG_RE = re.compile(r"#EXT-X-PROGRAM-DATE-TIME:(\S+)\s*#EXTINF:([\d.]+),([^\n]*)\n(\S+)")
 
@@ -282,7 +283,7 @@ def render_live(rec_dir: str, top: int = 3, out_dir: str | None = None, model: s
         rep = {**info, "views": m["views"], "titles": m["titles"][:3], "length_s": round(e - s, 1),
                "status": "DRAFT — a person must watch it and approve before posting"}
         json.dump(rep, open(os.path.join(out_dir, name + ".report.json"), "w"), indent=2)
-        print(f"[live] {out}  {e - s:.0f}s  {m['views']:,} views  “{m['titles'][0][:50]}”", flush=True)
+        print(f"[live] {out}  {e - s:.0f}s  {m['views']:,} views  {UT.quote(m['titles'][0], 50)}", flush=True)
         reports.append(rep)
     return reports
 

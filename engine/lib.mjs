@@ -9,6 +9,8 @@ import { execFileSync } from 'node:child_process';
 // It is wherever the repo was cloned.
 export const ROOT = process.env.CLIPENGINE_ROOT || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 export const OUTBOX = path.join(ROOT, 'outbox');
+// Our shared operation syncs through git; a public copy (.public-build) is one machine and never commits or pushes.
+export const SYNC = !fs.existsSync(path.join(ROOT, '.public-build')) && process.env.CLIPENGINE_NO_SYNC !== '1';
 export const POSTED = path.join(ROOT, 'posted');
 export const FAILED = path.join(ROOT, 'failed');
 export const LEDGER = path.join(ROOT, 'ledger.jsonl');

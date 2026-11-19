@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { ROOT, ACCOUNTS, GIT_AUTHOR, log, readLedger } from './lib.mjs';
+import { ROOT, SYNC, ACCOUNTS, GIT_AUTHOR, log, readLedger } from './lib.mjs';
 
 const HANDLES = { tiktok: ACCOUNTS.tiktok.username.replace(/^@/, ''), instagram: ACCOUNTS.instagram.username,
                   youtube: ACCOUNTS.youtube.handle.replace(/^@/, '') };
@@ -90,7 +90,7 @@ async function main() {
   fs.mkdirSync(path.dirname(PERF), { recursive: true });
   fs.appendFileSync(PERF, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
   log(`stats: ${rows.length} snapshots -> data/performance.jsonl`);
-  if (process.argv.includes('--no-push')) return;
+  if (process.argv.includes('--no-push') || !SYNC) return;
   // share the numbers with every machine (the agent learns from them); a failed push is retried next hour
   const git = (...a) => execFileSync('git', ['-C', ROOT, ...a], { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
   try {

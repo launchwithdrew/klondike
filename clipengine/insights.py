@@ -6,8 +6,9 @@ settings are used, and which known problems `diagnose` matched. Never handles, c
 names, titles, clips, transcripts, chat, or anything identifying. A random contributor id (not tied to
 the user) groups submissions so the same channel isn't double-counted.
 
-Submissions go to a private repo the maintainers grant access to (config/insights.json "repo"); the
-shared detector is retrained on them each release.
+Sharing must be write-only — no contributor may read or change anyone else's submissions — so until
+that channel exists, nothing leaves this machine: each day's anonymous numbers are kept in
+local/insights/outbox/ and will be sent once sharing opens (with the user's yes already recorded).
 
   clipengine insights --show       exactly what would be sent
   clipengine insights --enable     (only after the user agrees)   --disable   --submit
@@ -111,8 +112,8 @@ def enable(repo: str | None = None) -> None:
     if repo:
         cfg["repo"] = repo
     _save(cfg)
-    print("insights: on (anonymous numbers only; `clipengine insights --disable` turns it off)"
-          + ("" if cfg.get("repo") else " — no submission repo set yet: --repo <git url> from the maintainers"))
+    print("insights: on (anonymous numbers only, kept on this machine until sharing opens; "
+          "`clipengine insights --disable` turns it off)")
 
 
 def disable() -> None:
@@ -121,25 +122,13 @@ def disable() -> None:
 
 
 def submit(quiet: bool = False) -> str:
+    """Keep today's anonymous numbers locally. Nothing is sent until a write-only channel exists."""
     cfg = config()
     if not cfg.get("enabled"):
         return "insights: off"
-    if not cfg.get("repo"):
-        return "insights: on, but no submission repo set (ask the maintainers for the repo URL)"
     p = payload()
-    clone = os.path.join(LOCAL, "repo")
-    if not os.path.isdir(os.path.join(clone, ".git")):
-        os.makedirs(LOCAL, exist_ok=True)
-        r = subprocess.run(["git", "clone", "-q", "--depth", "1", cfg["repo"], clone], capture_output=True, text=True)
-        if r.returncode != 0:
-            return "insights: couldn't reach the submission repo (this account may not have access yet)"
-    g = lambda *a: subprocess.run(["git", "-C", clone, *a], capture_output=True, text=True)
-    g("pull", "-q", "--rebase")
-    d = os.path.join(clone, "submissions", p["contributor"])
-    os.makedirs(d, exist_ok=True)
-    json.dump(p, open(os.path.join(d, f"{p['date']}.json"), "w"))
-    g("add", "-A")
-    g("-c", "user.name=clip-engine", "-c", "user.email=clip-engine@users.noreply.github.com", "commit", "-qm",
-      f"insights {p['contributor']} {p['date']}")
-    ok = g("push", "-q").returncode == 0
-    return f"insights: {'submitted' if ok else 'saved locally, push failed (will retry)'} ({len(p['outcomes'])} outcomes, {len(p['fired'])} firings)"
+    out = os.path.join(LOCAL, "outbox")
+    os.makedirs(out, exist_ok=True)
+    json.dump(p, open(os.path.join(out, f"{p['date']}.json"), "w"))
+    return (f"insights: kept on this machine ({len(p['outcomes'])} outcomes, {len(p['fired'])} firings) — "
+            "sharing opens in a later release; nothing was sent")

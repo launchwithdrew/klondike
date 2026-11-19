@@ -10,7 +10,7 @@ ok() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
 die() { printf '  \033[31m✗\033[0m %s\n' "$1"; exit 1; }
 
-echo "Clip engine setup in $REPO"
+echo "Engine setup in $REPO"
 
 # 1. ffmpeg / ffprobe (rendering, audio probe, frame checks)
 if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then ok "ffmpeg $(ffmpeg -version | head -1 | cut -d' ' -f3)"
@@ -25,6 +25,12 @@ PY=$(command -v python3.12 || command -v python3.11 || command -v python3 || tru
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 ok "python venv (.venv) with $(.venv/bin/python -c 'import faster_whisper,PIL;print("faster-whisper",faster_whisper.__version__,"/ pillow",PIL.__version__)')"
+
+# 2b. A public copy only ever pulls engine releases (clipengine update) — never pushes to the engine's repo
+if [ -f .public-build ]; then
+  .venv/bin/python -c "from clipengine import repo; raise SystemExit(0 if repo.lock_push() else 1)" && ok "this copy only pulls engine updates (push disabled)"
+fi
+[ -d chrome-profile ] && chmod 700 chrome-profile
 
 # 3. Whisper models (small = words, tiny = timing). First run downloads ~540 MB.
 HF_HUB_DISABLE_XET=1 .venv/bin/python - <<'PY'

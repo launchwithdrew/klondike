@@ -20,6 +20,13 @@ seconds from chat, audio and viewer clips, cuts them with captions in your brand
 safety, scores them, posts only the winners within each platform's daily budget, and learns from your
 views. Needs macOS or Linux, Python 3.11+, Node 18+, ffmpeg and Google Chrome (setup installs the rest).
 
+**Before you start — four things to know.** (1) Posting drives a signed-in Chrome and stream data comes
+from Twitch's website; both are against the platforms' terms, so accounts can be limited or banned —
+use accounts made for clipping. (2) Clips are of other people's streams: they can be removed or draw
+copyright strikes, and if a streamer asks you to stop, stop. (3) Your sign-ins live on your computer;
+keep it locked. (4) Updates come from this repository and are tested on your computer before they're
+kept. Setup asks you to agree to these.
+
 Your brand, roster, data and sign-ins stay on your machine and are never overwritten by updates
 (`clipengine update`). Use it responsibly: clip public streams, follow each platform's rules, and respect
 any creator who asks you to stop.

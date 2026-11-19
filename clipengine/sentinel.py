@@ -498,6 +498,7 @@ def set_status(entry: dict, status: str, **extra) -> None:
 def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_age_h: float = 6.0) -> list[dict]:
     """One line per draft worth a look: new, safe, fresh, and able to clear some platform's bar."""
     from . import gate as GT
+    from . import untrusted as UT
     floor = min(r["min_score"] for r in GT.config()["platforms"].values())
     now = time.time()
     rows = []
@@ -509,8 +510,8 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
     rows.sort(key=lambda r: -r.get("best", 0))
     for r in rows:
         mark = f" ⛔{r['unsafe']}" if r.get("unsafe") else ""
-        print(f"{r['id']:<22} best {r.get('best', 0):>4.0f}  {r['age_min']:>3}m ago  chat: {r.get('chat', '')[:40]:<40} "
-              f"said: \"{r.get('said', '')[:70]}\"{mark}")
+        print(f"{r['id']:<22} best {r.get('best', 0):>4.0f}  {r['age_min']:>3}m ago  chat: {UT.quote(r.get('chat', ''), 40):<42} "
+              f"said: {UT.quote(r.get('said', ''), 70)}{mark}")
         print(f"{'':<22} sheet {os.path.relpath(r['sheet'], REPO) if r.get('sheet') else '-'}"
               f"{'  flags: ' + ', '.join(r['flags']) if r.get('flags') else ''}")
     return rows
@@ -528,7 +529,11 @@ def health(root: str = os.path.join(REPO, "runs")) -> list[dict]:
         age = time.time() - s.get("beat", 0)
         alive = age < 120
         out.append({**s, "alive": alive, "dir": os.path.dirname(sp)})
-        if not alive or not s.get("chat_connected"):
+        pidf = os.path.join(os.path.dirname(sp), "sentinel.pid")
+        just_started = os.path.exists(pidf) and time.time() - os.path.getmtime(pidf) < 120
+        if alive and not s.get("chat_connected") and just_started:
+            print(f"start {s['login']:<16} connecting to chat — check again next cycle")
+        elif not alive or not s.get("chat_connected"):
             print(f"DOWN  {s['login']:<16} last beat {age / 60:.0f} min ago — restart: "
                   f".venv/bin/python -m clipengine start --channel {s['login']}  (or just run `cycle`)")
         else:

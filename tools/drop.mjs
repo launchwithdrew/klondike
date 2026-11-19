@@ -63,7 +63,8 @@ if (grade) { try { post.grade = JSON.parse(grade); } catch { die('--grade must b
 fs.writeFileSync(path.join(dir, 'post.json'), JSON.stringify(post, null, 2) + '\n'); // written last
 console.log(`staged outbox/${slug}`);
 
-if (flag('no-push')) process.exit(0);
+// a public copy (.public-build) is one machine: the poster reads outbox/ directly, nothing is committed
+if (flag('no-push') || fs.existsSync(path.join(ROOT, '.public-build')) || process.env.CLIPENGINE_NO_SYNC === '1') process.exit(0);
 const git = (...a) => execFileSync('git', ['-C', ROOT, ...a], { stdio: ['ignore', 'pipe', 'inherit'] }).toString();
 git('pull', '--rebase', '--autostash', '-q');
 git('add', '-f', `outbox/${slug}/clip.mp4`, `outbox/${slug}/post.json`);

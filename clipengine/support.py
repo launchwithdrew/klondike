@@ -129,30 +129,67 @@ def _git(*a: str, check: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", REPO, *a], capture_output=True, text=True, check=check)
 
 
-def update() -> None:
+def _tests_pass() -> tuple[bool, str]:
+    try:
+        r = subprocess.run([sys.executable, "-m", "pytest", "tests", "-q", "-x"], cwd=REPO, capture_output=True,
+                           text=True, timeout=1200)
+    except subprocess.TimeoutExpired:
+        return False, "tests timed out"
+    return r.returncode == 0, ((r.stdout or "").strip().splitlines() or [""])[-1]
+
+
+def update(test: bool = True) -> bool:
+    """Pull the newest engine, keep this channel's fixes, and keep the new version only if it passes its
+    tests on this machine — otherwise go back to the version that worked."""
+    from . import repo as RP
+    RP.lock_push()
     os.makedirs(PATCHES, exist_ok=True)
+    old = _git("rev-parse", "HEAD").stdout.strip()
     diff = _git("diff", "HEAD", "--", ".", ":(exclude)brand", ":(exclude)config", ":(exclude)data",
                 ":(exclude)local").stdout
     if diff.strip():
         name = os.path.join(PATCHES, f"local-{dt.datetime.now():%Y%m%d-%H%M%S}.patch")
         open(name, "w").write(diff)
         print(f"saved your local fixes: {os.path.relpath(name, REPO)}")
-    _git("stash", "push", "--include-untracked", "-q", "-m", "clipengine-update", "--", ".",
+    # tracked changes are saved as patches above; untracked files stay where they are (never stashed and dropped)
+    _git("stash", "push", "-q", "-m", "clipengine-update", "--", ".",
          ":(exclude)brand", ":(exclude)local", ":(exclude)runs", ":(exclude)data", ":(exclude)config")
     pull = _git("pull", "--ff-only", "-q")
     if pull.returncode != 0:
         _git("stash", "pop", "-q")
         raise SystemExit("update failed (couldn't pull): " + (pull.stderr or pull.stdout)[-200:])
-    applied, merged, conflict = [], [], []
-    for p in sorted(glob.glob(os.path.join(PATCHES, "*.patch"))):
-        if _git("apply", "--reverse", "--check", p).returncode == 0:
-            merged.append(p); os.rename(p, p + ".merged")         # the new version already has it
-        elif _git("apply", "--3way", p).returncode == 0:
-            applied.append(p)
-        else:
-            conflict.append(p)
+    new = _git("rev-parse", "HEAD").stdout.strip()
+
+    def apply_all() -> tuple[list, list, list]:
+        applied, merged, conflict = [], [], []
+        for p in sorted(glob.glob(os.path.join(PATCHES, "*.patch"))):
+            if _git("apply", "--reverse", "--check", p).returncode == 0:
+                merged.append(p)                                   # this version already has it
+            elif _git("apply", "--check", p).returncode == 0 and _git("apply", p).returncode == 0:
+                applied.append(p)                                  # clean apply only — never conflict markers
+            else:
+                conflict.append(p)
+        return applied, merged, conflict
+
+    applied, merged, conflict = apply_all()
     _git("stash", "drop", "-q")
-    print(f"updated to {_git('log', '-1', '--format=%h %s').stdout.strip()}")
+    if new == old:
+        print(f"already up to date ({_git('log', '-1', '--format=%h %s').stdout.strip()})")
+        return True
+    if test:
+        ok, line = _tests_pass()
+        if not ok:
+            _git("reset", "-q")                                    # this channel's fixes are saved as patches:
+            _git("checkout", "-q", "--", ".", ":(exclude)brand", ":(exclude)config", ":(exclude)data", ":(exclude)local")
+            _git("reset", "--keep", "-q", old)                     # back to the version that worked
+            apply_all()                                            # and put this channel's fixes back on it
+            print(f"UPDATE ROLLED BACK — the new version failed its tests on this machine ({line}). You're still on "
+                  f"{_git('log', '-1', '--format=%h %s').stdout.strip()}, which worked. "
+                  "Run `clipengine support --problem \"update failed its tests\"` and send the bundle to the maintainers.")
+            return False
+    for p in merged:
+        os.rename(p, p + ".merged")
+    print(f"updated to {_git('log', '-1', '--format=%h %s').stdout.strip()}" + (" (tests pass)" if test else ""))
     if applied:
         print(f"re-applied {len(applied)} local fix(es)")
     if merged:
@@ -163,6 +200,7 @@ def update() -> None:
     subprocess.run(["bash", os.path.join(REPO, "setup", "setup.sh"), "--quiet"], cwd=REPO)
     from .ops import doctor
     doctor()
+    return True
 
 
 # ---- support ----------------------------------------------------------------------------------------

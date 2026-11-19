@@ -1,0 +1,2 @@
+This is one channel's own copy of the engine. It never commits or pushes; it only pulls engine
+releases with `clipengine update`. Don't delete this file.

@@ -25,6 +25,8 @@ import subprocess
 import sys
 import time
 
+from . import untrusted as UT
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(REPO, "runs")
 STATE = os.path.join(RUNS, ".cycle.json")
@@ -225,7 +227,7 @@ def cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False)
             hot = ", ".join(f"{r['login']} {r['score']:.0f}" for r in res["streamers"][:top + 2])
             moments = [m for m in res["moments"] if not m["unsafe"] and not m["published"]][:1]
             lines.append(f"radar: {len(live)} live — top: {hot}" + (
-                f" · hottest viewer-clipped moment: {moments[0]['login']} \"{moments[0]['titles'][0][:40]}\" "
+                f" · hottest viewer-clipped moment: {moments[0]['login']} {UT.quote(moments[0]['titles'][0], 40)} "
                 f"({moments[0]['vpm']:.0f} views/min) → `{moments[0]['cut']}`" if moments else ""))
         except Exception as exc:
             notes.append(f"radar failed: {str(exc)[:80]}")
@@ -243,7 +245,10 @@ def cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False)
         else:
             lines.append("poster: running")
     else:
-        lines.append("poster: not this machine (no signed-in chrome-profile/) — drops are posted by the posting machine")
+        from . import repo as RP
+        lines.append("poster: not signed in yet — the user signs in once: cd engine && node post.mjs --login"
+                     if RP.public() else
+                     "poster: not this machine (no signed-in chrome-profile/) — drops are posted by the posting machine")
 
     # 3. hourly stats, daily learn
     now = time.time()
@@ -260,8 +265,10 @@ def cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False)
         with contextlib.redirect_stdout(io.StringIO()):
             res = LN.run(write=True)
         state["learn_day"] = today.strftime("%Y-%m-%d")
-        _git("add", "data/weights.json")
-        if _git("-c", "user.name=clipengine", "-c", "user.email=clipengine@users.noreply.github.com",
+        from . import repo as RP
+        if RP.sync():
+            _git("add", "data/weights.json")
+        if RP.sync() and _git("-c", "user.name=clipengine", "-c", "user.email=clipengine@users.noreply.github.com",
                 "commit", "-qm", "learn: daily weights"):
             _git("pull", "-q", "--no-rebase") and _git("push", "-q")
         lines.append("learn: updated data/weights.json" + (f" — {res['report'][0]}" if res.get("report") else ""))
@@ -303,6 +310,7 @@ def doctor(accounts: bool = False) -> bool:
         ok_all &= ok
         print(f"{'✓' if ok else '✗'} {name}" + ("" if ok else f" — {fix}"))
 
+    from . import repo as RP
     for mod in ("faster_whisper", "numpy", "PIL", "websocket", "yt_dlp"):
         try:
             __import__(mod)
@@ -319,6 +327,10 @@ def doctor(accounts: bool = False) -> bool:
           "cd engine && npm ci")
     from . import brand as B
     check("brand pack (brand/brand.json)", os.path.exists(B.path()), "clipengine init (sets up this channel)")
+    if RP.public() and os.path.exists(B.path()):
+        check("user agreed to the risks", bool(B.load(fresh=True).get("risks_acknowledged")),
+              "read the user the risks (clipengine init prints them), then add \"risks_acknowledged\": \"<date>\" "
+              "to brand/brand.json once they say yes")
     check("logo", os.path.isfile(B.asset(B.load(fresh=True)["logo"].get("file", ""))),
           "clipengine init makes one (brand/kit/logo.png), or set logo.file in brand/brand.json")
     check("fonts", os.path.exists(os.path.join(REPO, "assets", "fonts", "NotoColorEmoji.ttf")), "git pull (assets/ is in the repo)")
@@ -347,16 +359,36 @@ def doctor(accounts: bool = False) -> bool:
         check("twitch live chat (irc-ws.chat.twitch.tv)", True)
     except Exception as exc:
         check("twitch live chat (irc-ws.chat.twitch.tv)", False, str(exc)[:80])
-    check("git push access", subprocess.run(["git", "-C", REPO, "push", "--dry-run", "-q", "origin", "HEAD:refs/heads/_doctor_push_check"],
-                         capture_output=True).returncode == 0,
-          "this machine needs push access to the repo")
+    from . import repo as RP
+    if RP.sync():
+        check("git push access", subprocess.run(["git", "-C", REPO, "push", "--dry-run", "-q", "origin", "HEAD:refs/heads/_doctor_push_check"],
+                             capture_output=True).returncode == 0,
+              "this machine needs push access to the repo")
+    else:
+        check("engine updates reachable", subprocess.run(["git", "-C", REPO, "ls-remote", "-q", "origin", "HEAD"],
+                                                          capture_output=True, timeout=60).returncode == 0,
+              "this GitHub account needs access to the engine's repository — ask whoever invited you")
+        check("this copy only pulls (never pushes to the engine)", RP.lock_push(), "bash setup/setup.sh")
+    prof = os.path.join(REPO, "chrome-profile")
+    if os.path.isdir(prof):
+        try:
+            os.chmod(prof, 0o700)
+        except OSError:
+            pass
+        check("sign-ins private to this user (chrome-profile/)", (os.stat(prof).st_mode & 0o077) == 0,
+              "chmod 700 chrome-profile")
     free = _free_gb()
     check(f"disk ({free:.0f} GB free)", free >= config()["min_free_gb"], f"free up space (needs {config()['min_free_gb']} GB)")
     for f in ("radar.json", "grading.json", "distribution.json", "creators.json", "sentinel_model.json"):
+        fp = os.path.join(REPO, "config", f)
+        if not os.path.exists(fp):
+            if f == "creators.json":
+                check(f"config/{f}", False, "clipengine init (sets up this channel's streamers)")
+            continue                                # the others are optional: built-in defaults apply
         try:
-            json.load(open(os.path.join(REPO, "config", f)))
+            json.load(open(fp))
             check(f"config/{f}", True)
         except Exception as exc:
-            check(f"config/{f}", False, str(exc)[:80])
+            check(f"config/{f}", False, f"not valid JSON ({str(exc)[:60]}) — fix it or delete it to use the defaults")
     print("READY" if ok_all else "NOT READY — fix the ✗ lines, then run doctor again")
     return ok_all
