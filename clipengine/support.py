@@ -1,6 +1,6 @@
 """Results, updates and help — so nobody has to learn anything technical.
 
-  report    what posted, views per platform, the best clip, the trend — about 400 tokens
+  report    what posted (links), views + shares/watch time, what was learned, pools, money thresholds — ~400 tokens
   update    pull the newest engine without losing the channel's own fixes: local code changes are
             saved as patches (local/patches/), the update is pulled, patches are re-applied (and
             dropped when the new version already contains them), then setup + doctor run
@@ -47,7 +47,50 @@ def _ts(iso):
 
 # ---- report ---------------------------------------------------------------------------------------
 
-def report(days: float = 1.0, now: float | None = None) -> str:
+YT_PARTNER = {"subs": 1000, "shorts_views_90d": 10_000_000}
+TIKTOK_PROGRAM = {"followers": 10_000}
+MAX_LINES, MAX_LINE = 12, 130          # ~400 tokens (test_budget_report_queue_and_diagnose)
+
+
+def _n(x: float) -> str:
+    x = float(x)
+    return f"{x / 1e6:.1f}M" if x >= 1e6 else f"{x / 1e3:.1f}k" if x >= 1e4 else f"{x:,.0f}"
+
+
+def money_line(now: float | None = None, repo: str | None = None) -> str:
+    """Progress to YouTube Partner (1,000 subs + 10M Shorts views in 90 days) and TikTok's creator
+    program (about 10k followers), from follower counts the agent records and our view reads."""
+    repo = repo or REPO
+    now = now or time.time()
+    fol: dict[str, tuple[float, int]] = {}
+    for r in _rows(os.path.join(repo, "data", "followers.jsonl")):
+        t = _ts(r.get("at")) or 0
+        if r.get("platform") and r.get("followers") is not None and t >= fol.get(r["platform"], (-1, 0))[0]:
+            fol[r["platform"]] = (t, int(r["followers"]))
+    live = {r["slug"]: _ts(r.get("at")) or 0 for r in _rows(os.path.join(repo, "ledger.jsonl"))
+            if r.get("status") == "live" and r.get("platform") == "youtube"}
+    yt_views: dict[str, tuple[float, int]] = {}
+    for r in _rows(os.path.join(repo, "data", "performance.jsonl")):
+        if r.get("platform") == "youtube" and r.get("views") is not None and now - live.get(r.get("slug"), 0) <= 90 * 86400:
+            t = _ts(r.get("checked_at")) or 0
+            if t >= yt_views.get(r["slug"], (-1, 0))[0]:
+                yt_views[r["slug"]] = (t, int(r["views"]))
+    shorts = sum(v for _, v in yt_views.values())
+    if not fol:
+        return (f"money: Shorts {_n(shorts)}/10M views (90 d) — record followers: "
+                "`clipengine followers --platform P --count N`")
+    yt = fol.get("youtube", (0, None))[1]
+    tk = fol.get("tiktok", (0, None))[1]
+    parts = [f"YouTube Partner {'?' if yt is None else _n(yt)}/1,000 subs + {_n(shorts)}/10M Shorts views (90 d)"
+             + (" ✓" if (yt or 0) >= YT_PARTNER["subs"] and shorts >= YT_PARTNER["shorts_views_90d"] else "")]
+    parts.append(f"TikTok {'?' if tk is None else _n(tk)}/10k followers" + (" ✓" if (tk or 0) >= TIKTOK_PROGRAM["followers"] else ""))
+    if fol.get("instagram"):
+        parts.append(f"IG {_n(fol['instagram'][1])}")
+    return "money: " + " · ".join(parts)
+
+
+def report_text(days: float = 1.0, now: float | None = None) -> str:
+    """The report as text, nothing printed — what a daily-report trigger sends (ops calls this)."""
     now = now or time.time()
     since, before = now - days * 86400, now - 2 * days * 86400
     ledger = [r for r in _rows(os.path.join(REPO, "ledger.jsonl")) if r.get("status") == "live"]
@@ -60,44 +103,92 @@ def report(days: float = 1.0, now: float | None = None) -> str:
         if k not in latest or (_ts(r.get("checked_at")) or 0) >= (_ts(latest[k].get("checked_at")) or 0):
             latest[k] = r
     titles = {r["slug"]: r.get("title", r["slug"]) for r in ledger}
-    lines = [f"REPORT — last {days:g} day(s)"]
+    urls = {(r["slug"], r["platform"]): r.get("url", "") for r in ledger}
+    from . import __version__
+    lines = [f"REPORT — last {days:g} day(s) · engine v{__version__}"]
     for plat in ("youtube", "instagram", "tiktok"):
         now_posts = [r for r in ledger if r["platform"] == plat and (_ts(r.get("at")) or 0) >= since]
         prev_posts = [r for r in ledger if r["platform"] == plat and before <= (_ts(r.get("at")) or 0) < since]
-        views = [latest[(r["slug"], plat)]["views"] for r in now_posts if (r["slug"], plat) in latest]
+        reads = [latest[(r["slug"], plat)] for r in now_posts if (r["slug"], plat) in latest]
         all_views = [v["views"] for (s, p), v in latest.items() if p == plat]
-        total = sum(views)
         med = st.median(all_views) if all_views else 0
-        lines.append(f"  {plat:<10} {len(now_posts)} posts (prev {len(prev_posts)}) · {total:,} views on them"
-                     + (f" · typical post {med:,.0f}" if all_views else ""))
+        shares = [x.get("shares") for x in reads if x.get("shares") is not None]
+        watch = [x.get("watch_s") for x in reads if x.get("watch_s") is not None]
+        lines.append(f"  {plat:<10} {len(now_posts)} posts (prev {len(prev_posts)}) · {sum(x['views'] for x in reads):,} views on them"
+                     + (f" · typical post {med:,.0f}" if all_views else "")
+                     + (f" · {sum(shares):,} shares" if shares else "")
+                     + (f" · watch {st.median(watch):.1f} s" if watch else ""))
     recent = [(v["views"], s, p) for (s, p), v in latest.items()
               if any(r["slug"] == s and (_ts(r.get("at")) or 0) >= since for r in ledger)]
-    if recent:
-        v, s, p = max(recent)
-        lines.append(f"  best: \"{titles.get(s, s)[:60]}\" — {v:,} views on {p}")
-    all_time = sorted(((v["views"], s, p) for (s, p), v in latest.items()), reverse=True)[:1]
-    if all_time:
-        v, s, p = all_time[0]
-        lines.append(f"  best ever: \"{titles.get(s, s)[:60]}\" — {v:,} views on {p}")
+    pick = max(recent) if recent else max(((v["views"], s, p) for (s, p), v in latest.items()), default=None)
+    if pick:
+        v, s, p = pick
+        lines.append(f"  {'best' if recent else 'best ever'}: \"{titles.get(s, s)[:50]}\" — {v:,} views on {p} {urls.get((s, p), '')}")
+    new_posts = sorted((r for r in ledger if (_ts(r.get("at")) or 0) >= since), key=lambda r: -(_ts(r.get("at")) or 0))
+    if new_posts:
+        lines.append("  posted: " + " · ".join(f"{r['platform'][:2]} {r.get('url') or r['slug']}" for r in new_posts[:3])
+                     + (f" · +{len(new_posts) - 3} more" if len(new_posts) > 3 else ""))
     try:
         w = json.load(open(os.path.join(REPO, "data", "weights.json")))
+        learned = w.get("summary") or next(iter(w.get("report") or []), "")
+        if learned:
+            lines.append("  " + (learned if learned.startswith("learned") else "learned: " + learned))
         top = sorted((w.get("streamers") or {}).items(), key=lambda x: -x[1])[:3]
         if top:
             lines.append("  streamers doing best for you: " + ", ".join(f"{l} {f:.1f}×" for l, f in top))
-        for r in (w.get("report") or [])[:2]:
-            lines.append(f"  learned: {r}")
     except (OSError, ValueError):
         pass
     try:
-        from .sentinel import load_queue
-        q = [r for r in load_queue() if r.get("status") == "new"]
-        if q:
-            lines.append(f"  waiting in the queue: {len(q)} draft(s) — run `clipengine queue`")
+        from . import campaigns as CP
+        if os.path.realpath(CP.REPO) == os.path.realpath(REPO):
+            t = CP.totals(since)
+            if CP.pools() or t["submitted_all"] or t["paid"]:
+                lines.append(f"  pools: {t['submitted']} submitted (all-time {t['submitted_all']}) · "
+                             f"${t['paid']:,.2f} paid (${t['paid_since']:,.2f} this period)")
     except Exception:
         pass
+    lines.append("  " + money_line(now))
+    todo = []
+    try:
+        from .sentinel import load_queue
+        rows = load_queue(os.path.join(REPO, "runs"))
+        period = [r for r in rows if (r.get("stop") or 0) >= since]
+        skipped = sum(1 for r in period if r.get("status") == "skipped")
+        unsafe = sum(1 for r in period if r.get("unsafe"))
+        if skipped or unsafe:
+            lines.append(f"  dropped: {skipped} draft(s) skipped after a look, {unsafe} unsafe")
+        q = [r for r in rows if r.get("status") == "new"]
+        if q:
+            todo.append(f"{len(q)} draft(s) in `clipengine queue`")
+    except Exception:
+        pass
+    try:
+        from .handpost import to_measure
+        m = to_measure(now, ledger=ledger, perf=perf)
+        if m:
+            todo.append(f"{len(m)} post(s) to measure (`to-measure`)")
+    except Exception:
+        pass
+    try:
+        from . import campaigns as CP
+        if os.path.realpath(CP.REPO) == os.path.realpath(REPO):
+            n = len(CP.to_submit(now))
+            if n:
+                todo.append(f"{n} to submit to pools (`to-submit`)")
+    except Exception:
+        pass
+    if todo:
+        lines.append("  to do: " + " · ".join(todo))
     if not ledger:
         lines.append("  nothing posted yet — the first clips are the hardest; run `clipengine cycle`")
-    out = "\n".join(lines)
+    lines = [l if len(l) <= MAX_LINE else l[:MAX_LINE - 1] + "…" for l in lines]
+    if len(lines) > MAX_LINES:
+        lines = lines[:MAX_LINES - 1] + [lines[-1]]
+    return "\n".join(lines)
+
+
+def report(days: float = 1.0, now: float | None = None) -> str:
+    out = report_text(days, now)
     print(out)
     return out
 
@@ -138,6 +229,14 @@ def _tests_pass() -> tuple[bool, str]:
     return r.returncode == 0, ((r.stdout or "").strip().splitlines() or [""])[-1]
 
 
+def _install_requirements(quiet: bool) -> None:
+    """Add the packages a new version needs (pip only adds; the version that worked keeps working)."""
+    pip = os.path.join(REPO, ".venv", "bin", "pip")
+    if os.path.exists(pip):
+        subprocess.run([pip, "install", "-q", "-r", os.path.join(REPO, "requirements.txt")], cwd=REPO,
+                       capture_output=quiet)
+
+
 def update(test: bool = True, quiet: bool = False) -> bool:
     """Pull the newest engine, keep this channel's fixes, and keep the new version only if it passes its
     tests on this machine — otherwise go back to the version that worked."""
@@ -176,6 +275,8 @@ def update(test: bool = True, quiet: bool = False) -> bool:
     if new == old:
         print(f"already up to date ({_git('log', '-1', '--format=%h %s').stdout.strip()})")
         return True
+    if _git("diff", "--quiet", old, new, "--", "requirements.txt").returncode != 0:
+        _install_requirements(quiet)                       # new packages first, so the tests judge the code, not the venv
     if test:
         ok, line = _tests_pass()
         if not ok:
@@ -251,7 +352,8 @@ def support(problem: str = "") -> str:
         diag = d2.getvalue()
     except Exception:
         pass
-    version = _git("log", "-1", "--format=%h %cs").stdout.strip()
+    from . import __version__
+    version = f"v{__version__} " + _git("log", "-1", "--format=%h %cs").stdout.strip()
     logs = sorted(glob.glob(os.path.join(REPO, "logs", "*.log")) + glob.glob(os.path.join(REPO, "runs", "*.log")),
                   key=os.path.getmtime)[-8:]
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:

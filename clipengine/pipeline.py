@@ -27,6 +27,13 @@ def log(msg: str) -> None:
     print(f"[engine] {msg}", flush=True)
 
 
+def _plain(o):
+    """numpy scalars (np.bool_, np.float32 …) in a scan result: write them as plain JSON values."""
+    if hasattr(o, "item"):
+        return o.item()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float | None = None,
          top: int = 12, probe: int = 8, model: str = "small", length: float = 62.0,
          chat_file: str | None = None) -> dict:
@@ -93,13 +100,39 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
     to_probe = cands[:probe]
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         fetched = list(ex.map(fetch_audio, to_probe))
-    for c, path, first, ws, we in fetched:   # ASR is CPU-bound: one at a time, all cores
-        p = A.probe_audio(path, first, ws, we, c["peak_s"], model)
+    probes = [(c, A.probe_audio(path, first, ws, we, c["peak_s"], model), path, first, ws)
+              for c, path, first, ws, we in fetched]   # ASR is CPU-bound: one at a time, all cores
+    prof = None
+    try:                                     # who is talking: the session's voices across every candidate
+        prof, tagged = tag_speakers(probes)
+        log(f"speakers: {tagged}")
+    except Exception as exc:
+        log(f"speaker tags skipped: {exc}")
+    from . import speaker as SPK
+    from . import sentinel as SN
+    for c, p, path, first, ws in probes:
+        all_words = list(p.words)
+        p.words = SPK.streamer_words(p.words)     # hook, speech density and "said": the streamer only
         win = A.choose_window(p, c["peak_s"], length=length) if p.words else {
             "start_s": c["clip_start_s"], "end_s": c["clip_end_s"], "words": 0,
             "speech_s": 0.0, "first_word_at": length, "longest_gap": length}
         verdict = A.assess(p, win, c["peak_s"])
         game = vod.game_at(win["start_s"])
+        in_win = [w for w in all_words if win["start_s"] <= w["start"] < win["end_s"]]
+        spk = SPK.summary(in_win, prof)
+        c["speech"] = {"streamer_s": win["speech_s"], "dur": round(win["end_s"] - win["start_s"], 1),
+                       "game_share": spk["game_share"], "game_dialogue": spk["game_dialogue"]}
+        if spk["game_dialogue"]:
+            verdict["flags"].append(f"game dialogue ({int(spk['game_share'] * 100)}% of speech)")
+            verdict["audio_factor"] = round(verdict["audio_factor"] * 0.5, 3)
+        bad = SN.wrong_game(game)
+        if bad:                                 # fake "GTA 6" from GTA V footage: never ours
+            c["wrong_game"] = bad
+            verdict["flags"].append(f"recording from {bad}, not {SN.target_game()}")
+            verdict["hard_fail"] = verdict["hard_fail"] or f"wrong game: {bad}"
+        misheard = A.misheard_names(in_win)
+        if misheard:
+            verdict["flags"].append("names? " + ", ".join(f"{h}→{r}" for h, r in misheard))
         c.update({
             "probed": True, "game": game, "crop": V.crop_for_game(game),
             "window": win, "mean_db": p.mean_db, "muted_frac": p.muted_frac,
@@ -109,8 +142,7 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
             "score": round(c["chat_score"] * verdict["audio_factor"]
                            + crowd_bonus(c.get("crowd")) * (1.0 if not verdict["hard_fail"] else 0.0), 2),
             "chat_context": R.chat_near(msgs, c["peak_s"], 10, 30, 10),
-            "transcript_text": " ".join(s["text"] for s in p.transcript.get("segments", [])
-                                        if win["start_s"] - 1 <= s["start"] < win["end_s"]),
+            "transcript_text": " ".join(w["w"].strip() for w in in_win if w.get("spk", "streamer") != "game"),
         })
         from . import safety as SF
         sf = SF.screen(c["transcript_text"], (c.get("crowd") or {}).get("titles"),
@@ -161,7 +193,7 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
                            "total": round(time.time() - t_all, 1)},
               "candidates": ranked,
               "timeline": [{"t": r["start_s"], "s": r["score"], "u": r["users"]} for r in rows]}
-    json.dump(result, open(os.path.join(out_dir, "scan.json"), "w"), indent=2)
+    json.dump(result, open(os.path.join(out_dir, "scan.json"), "w"), indent=2, default=_plain)
     from .review import write_review
     write_review(result, os.path.join(out_dir, "review.html"))
     log(f"scan done in {result['timing_s']['total']}s -> {out_dir}/review.html")
@@ -212,6 +244,32 @@ def tight_cut(scan_dir: str, c: dict) -> dict | None:
     bt = BT.find_beat(BT.envelope(x), ws - 1, words, c["peak_s"])
     tw = BT.tight_window(words, segs, bt["beat_s"])
     return {"start_s": tw["start_s"], "end_s": tw["end_s"], "how": f"beat at +{tw['beat_at']}s ({bt['how']})"}
+
+
+def tag_speakers(probes: list) -> tuple[dict | None, str]:
+    """Speaker tags for a VOD scan: speech chunks from every probed candidate (spread across the scanned
+    range — the session) give the streamer's voice; each candidate's words are tagged in place."""
+    from . import speaker as SPK
+    chunks, pcm = [], {}
+    for c, p, path, first, ws in probes:
+        if not p.words:
+            continue
+        x = A.decode_pcm(path, 0, None)
+        pcm[id(p)] = (x, first)
+        for a, b in SPK.speech_chunks(x, first):
+            v = SPK.embed(x[max(0, int((a - first) * A.SR)):int((b - first) * A.SR)])
+            if v is not None:
+                chunks.append({"t": a, "emb": v})
+    prof = SPK.profile_from_chunks(chunks, bins=max(3, min(6, len(pcm))))
+    out = {"streamer_s": 0.0, "other_s": 0.0, "game_s": 0.0}
+    for c, p, path, first, ws in probes:
+        if id(p) in pcm:
+            x, t0 = pcm[id(p)]
+            sm = SPK.tag_words(p.words, x, t0, prof)
+            for k in out:
+                out[k] += sm[k]
+    return prof, ("no voice runs through the scan — untagged" if prof is None else
+                  ", ".join(f"{k[:-2]} {v:.0f}s" for k, v in out.items()))
 
 
 def crowd_bonus(m: dict | None) -> float:

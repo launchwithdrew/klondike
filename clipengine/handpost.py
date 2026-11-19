@@ -8,7 +8,9 @@ all keep working:
 
   clipengine to-post                                   what's due now: file + the exact text per platform
   clipengine posted --slug S --platform tiktok --url U  after it's live (moves the clip to posted/ when done)
-  clipengine views  --slug S --platform tiktok --views N  optional: a view count read off the post
+  clipengine views  --slug S --platform tiktok --views N [--watch-s --skip --shares ...]  what analytics show
+  clipengine to-measure                                 posts due a 1 h / 24 h / 72 h analytics read (with links)
+  clipengine followers --platform P --count N           follower count (report: progress to payout programs)
 """
 from __future__ import annotations
 
@@ -166,11 +168,141 @@ def _sync(paths: list[str], msg: str) -> None:
     g("push", "-q")
 
 
-def views(slug: str, platform: str, n: int) -> str:
+RICH = {"watch_s": "average watch time (s)", "skip": "skip rate (%)", "shares": "shares", "saves": "saves",
+        "follows": "follows from the post", "likes": "likes", "comments": "comments"}
+
+
+def _live_at(slug: str, platform: str, ledger: list[dict] | None = None) -> float | None:
+    for r in ledger if ledger is not None else _ledger():
+        if r.get("slug") == slug and r.get("platform") == platform and r.get("status") == "live":
+            try:
+                return dt.datetime.fromisoformat(str(r.get("at")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+    return None
+
+
+def views(slug: str, platform: str, n: int, now: float | None = None, **rich) -> str:
+    """Record what a post's analytics show: views, plus whatever else the agent read (watch time, skip rate,
+    shares, saves, follows, likes, comments). Shares and watch time teach more than views do."""
+    if platform not in PLATFORMS:
+        raise SystemExit(f"platform must be one of {', '.join(PLATFORMS)}")
     perf = _dirs()[3]
+    now = now or dt.datetime.now(dt.timezone.utc).timestamp()
+    rec = {"slug": slug, "platform": platform, "views": int(n)}
+    for k in RICH:
+        v = rich.get(k)
+        if v is None:
+            continue
+        if k == "skip":
+            v = float(v)
+            if not 0 <= v <= 100:
+                raise SystemExit("--skip is a percentage, 0-100")
+            rec["skip_pct"] = round(v, 1)
+        elif k == "watch_s":
+            rec["watch_s"] = round(float(v), 2)
+        else:
+            rec[k] = int(v)
+    t0 = _live_at(slug, platform)
+    if t0:
+        rec["age_h"] = round((now - t0) / 3600, 2)
+    rec.update({"source": "agent", "checked_at": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat()})
     os.makedirs(os.path.dirname(perf), exist_ok=True)
     with open(perf, "a") as fh:
-        fh.write(json.dumps({"slug": slug, "platform": platform, "views": int(n), "source": "agent",
-                             "checked_at": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
+        fh.write(json.dumps(rec) + "\n")
     _sync([perf], f"views: {slug} {platform} {int(n)}")
-    return f"{slug} on {platform}: {int(n):,} views recorded"
+    extra = [f"{rec[k]}{'s' if k == 'watch_s' else '%' if k == 'skip_pct' else ' ' + k}"
+             for k in ("watch_s", "skip_pct", "shares", "saves", "follows") if k in rec]
+    return f"{slug} on {platform}: {int(n):,} views recorded" + (f" ({', '.join(extra)})" if extra else "")
+
+
+# ---- what to measure next ----------------------------------------------------------------------------
+
+READS = (("1h", 1.0, 0.5, 6.0), ("24h", 24.0, 12.0, 48.0), ("72h", 72.0, 48.0, 120.0))   # same windows as learn
+
+
+def to_measure(now: float | None = None, ledger: list[dict] | None = None, perf: list[dict] | None = None,
+               lookback_h: float = 7 * 24) -> list[dict]:
+    """Live posts due a 1 h / 24 h / 72 h analytics read, and posts over 24 h old with no read at all."""
+    now = now or dt.datetime.now(dt.timezone.utc).timestamp()
+    ledger = _ledger() if ledger is None else ledger
+    if perf is None:
+        perf = []
+        if os.path.exists(_dirs()[3]):
+            for line in open(_dirs()[3]):
+                try:
+                    perf.append(json.loads(line))
+                except ValueError:
+                    pass
+    ages: dict[tuple, list[float]] = {}
+    for r in perf:
+        if r.get("views") is None or not r.get("slug"):
+            continue
+        key = (r["slug"], r.get("platform"))
+        t0 = _live_at(*key, ledger)
+        age = r.get("age_h")
+        if age is None and t0:
+            try:
+                age = (dt.datetime.fromisoformat(str(r.get("checked_at")).replace("Z", "+00:00")).timestamp() - t0) / 3600
+            except ValueError:
+                age = None
+        ages.setdefault(key, []).append(age if age is not None else -1.0)
+    out, seen = [], set()
+    for r in ledger:
+        if r.get("status") != "live" or not r.get("slug"):
+            continue
+        key = (r["slug"], r.get("platform"))
+        if key in seen:
+            continue
+        seen.add(key)
+        t0 = _live_at(*key, ledger)
+        if not t0:
+            continue
+        age = (now - t0) / 3600
+        if age > lookback_h:
+            continue
+        have = ages.get(key, [])
+        due = None
+        for name, target, lo, hi in READS:
+            if target <= age <= hi and not any(lo <= a <= hi for a in have):
+                due = name
+        item = {"slug": key[0], "platform": key[1], "url": r.get("url", ""), "age_h": round(age, 1), "due": due,
+                "missing": age > 24 and not have}
+        if due or item["missing"]:
+            out.append(item)
+    out.sort(key=lambda i: (not i["missing"], -i["age_h"]))
+    return out
+
+
+def show_measure(now: float | None = None, limit: int = 15) -> list[dict]:
+    items = to_measure(now)
+    if not items:
+        print("to-measure: nothing due")
+        return items
+    for it in items[:limit]:
+        tag = "NO DATA YET — " if it["missing"] else ""
+        what = f"{it['due']} read" if it["due"] else "any read"
+        print(f"{tag}{it['slug']} {it['platform']} ({it['age_h']:g} h) {what}: {it['url'] or '(no link)'}")
+    if len(items) > limit:
+        print(f"... +{len(items) - limit} more")
+    print("then: clipengine views --slug S --platform P --views N [--watch-s --skip --shares --saves --follows "
+          "--likes --comments]")
+    return items
+
+
+# ---- followers (money thresholds) --------------------------------------------------------------------
+
+def followers(platform: str, count: int, now: float | None = None) -> str:
+    """Record an account's follower/subscriber count read off its profile (report tracks payout thresholds)."""
+    if platform not in PLATFORMS:
+        raise SystemExit(f"platform must be one of {', '.join(PLATFORMS)}")
+    if count < 0:
+        raise SystemExit("--count must be 0 or more")
+    path = os.path.join(REPO, "data", "followers.jsonl")
+    now = now or dt.datetime.now(dt.timezone.utc).timestamp()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(json.dumps({"platform": platform, "followers": int(count),
+                             "at": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat()}) + "\n")
+    _sync([path], f"followers: {platform} {int(count)}")
+    return f"{platform}: {int(count):,} followers recorded"

@@ -77,7 +77,12 @@ def is_youtube(source: str) -> bool:
 
 
 def youtube_variant(source: str) -> str:
-    """Live HLS media playlist for a YouTube live stream ("yt:@handle", a channel or a watch URL), via yt-dlp."""
+    """Live HLS media playlist for a YouTube live stream ("yt:@handle", a channel or a watch URL)."""
+    from . import youtube as YT
+    return YT.variant(source)
+
+
+def _youtube_variant_ytdlp_only(source: str) -> str:
     import yt_dlp
     url = source[3:] if source.startswith("yt:") else source
     if url.startswith("@"):
@@ -94,7 +99,9 @@ def youtube_variant(source: str) -> str:
 
 
 def source_name(source: str) -> str:
-    """A short name for files and logs: Twitch login, or the YouTube handle."""
+    """A short name for files and logs: Twitch login, the YouTube handle, or kick-<slug>."""
+    if source.startswith("kick:"):
+        return "kick-" + re.sub(r"[^a-z0-9_-]", "", source[5:].lower())
     if not is_youtube(source):
         return source.lower()
     m = re.search(r"@([A-Za-z0-9_.-]+)", source)
@@ -126,7 +133,12 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
     has no stitched ads, and when its playlist carries no PROGRAM-DATE-TIME the segments are
     timed by arrival."""
     youtube = is_youtube(login)
-    resolve = (lambda: youtube_variant(login)) if youtube else (lambda: live_variant(login))
+    kick = login.startswith("kick:")
+    if kick:
+        from . import kick as K
+        resolve = lambda: K.variant(login)
+    else:
+        resolve = (lambda: youtube_variant(login)) if youtube else (lambda: live_variant(login))
     seg_dir = os.path.join(out_dir, "segments")
     os.makedirs(seg_dir, exist_ok=True)
     index = os.path.join(out_dir, "index.jsonl")
@@ -135,6 +147,11 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
     seen: set[str] = set()
     failed_hosts: set[str] = set()
     inits: dict[str, bytes] = {}
+    from . import autopilot as AP
+    prev_end, prev_wall = _index_end(index)
+    # what happened since the last saved segment — names the cause of a gap (ad break, reconnect, ...)
+    since = {"fresh": True, "ads": 0, "reconnects": 0, "failed": 0}
+    protect, protect_at = [], 0.0
     url = resolve()
     t_start, n_ads, n_segs = time.time(), 0, 0
     t_resolved = time.time()
@@ -149,13 +166,15 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
             pl = T.http(url, attempts=2, timeout=15).decode()
         except Exception as exc:
             print(f"[live] playlist fetch failed ({str(exc)[:80]}) — re-resolving", flush=True)
+            since["reconnects"] += 1
             try:
                 url, t_resolved = resolve(), time.time()
             except Exception as exc:
                 print(f"[live] {exc} — retrying in 30 s", flush=True)
                 time.sleep(30)
             continue
-        if youtube and time.time() - t_resolved > 4 * 3600:   # YouTube playlist URLs expire after ~6 h
+        if youtube and _yt_refresh(url, t_resolved):     # before the playlist URL expires (it says when)
+            print("[live] YouTube playlist URL expires soon — refreshing it", flush=True)
             try:
                 url, t_resolved = resolve(), time.time()
             except Exception:
@@ -168,7 +187,7 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
             time.sleep(2.0)
             continue
         segs = [(m.group(1), float(m.group(2)), m.group(3), m.group(4)) for m in SEG_RE.finditer(pl)]
-        if youtube and not segs:                       # no PROGRAM-DATE-TIME: time new segments by arrival
+        if (youtube or kick) and not segs:             # no PROGRAM-DATE-TIME: time new segments by arrival
             fresh = [(None, float(m.group(1)), "live", m.group(2)) for m in _SEG_ANY.finditer(pl)
                      if m.group(2) not in seen]
             t_next = time.time() - sum(d for _, d, _, _ in fresh)
@@ -181,8 +200,9 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
             if seg_url in seen:
                 continue
             seen.add(seg_url)
-            if not youtube and "live" not in title.lower():   # Twitch titles content segments "live"; ads are "Amazon" etc.
+            if not youtube and not kick and "live" not in title.lower():   # Twitch titles content "live"; ads "Amazon" etc.
                 n_ads += 1
+                since["ads"] += 1
                 continue
             t0 = when if isinstance(when, (int, float)) else _epoch(when)
             path = os.path.join(seg_dir, f"{int(t0 * 1000)}.ts")
@@ -190,6 +210,7 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
                 data = T.http(seg_url, attempts=2, timeout=20)
             except Exception as exc:              # download first: a failure must not leave an empty .ts behind
                 host = seg_url.split("/")[2]
+                since["failed"] += 1
                 if host not in failed_hosts:
                     failed_hosts.add(host)
                     print(f"[live] segment download failed from {host} ({str(exc)[:100]}) — "
@@ -198,12 +219,23 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
             with open(path, "wb") as fh:
                 fh.write(init + data)                     # fMP4: each saved segment carries its init
             with open(index, "a") as fh:
+                if prev_end is not None and t0 > prev_end + AP.GAP_S:
+                    # the hole, written down with its likely cause: a cut across it says why, not "pruned"
+                    cause = AP.gap_cause(since["fresh"], since["ads"], since["reconnects"], since["failed"],
+                                         prev_age_s=time.time() - (prev_wall or prev_end))
+                    fh.write(json.dumps({"t": round(prev_end, 3), "d": round(t0 - prev_end, 3), "gap": cause}) + "\n")
                 fh.write(json.dumps({"t": t0, "d": dur, "f": os.path.basename(path)}) + "\n")
+            if prev_end is None or t0 + dur > prev_end:
+                prev_end, prev_wall = t0 + dur, time.time()
+            since = {"fresh": False, "ads": 0, "reconnects": 0, "failed": 0}
             n_segs += 1
         # prune the buffer
         cutoff = time.time() - buffer_s
+        if time.time() - protect_at > 60:              # windows a queued draft still needs: never pruned
+            protect, protect_at = AP.protected_windows(out_dir), time.time()
         for f in glob.glob(os.path.join(seg_dir, "*.ts")):
-            if int(os.path.basename(f)[:-3]) / 1000 < cutoff:
+            t_f = int(os.path.basename(f)[:-3]) / 1000
+            if t_f < cutoff and not AP.is_protected(t_f, 2.0, protect):
                 os.remove(f)
         if n_segs and n_segs % 150 == 0:
             print(f"[live] {login}: {n_segs} segments ({n_segs * 2 / 60:.0f} min), {n_ads} ad segments skipped"
@@ -213,10 +245,90 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
         time.sleep(2.0)
 
 
+def _yt_refresh(url: str, resolved_at: float) -> bool:
+    from . import youtube as YT
+    return YT.needs_refresh(url, resolved_at)
+
+
+def record_supervised(source: str, out_dir: str, buffer_s: float) -> None:
+    """record() forever: the stream can drop, go offline, or land on a host this machine can't reach."""
+    delay = 15
+    while True:
+        try:
+            record(source, out_dir, buffer_s)
+            delay = 15
+        except Exception as exc:
+            print(f"[live] recorder stopped ({str(exc)[:100]}) — retrying in {delay}s", flush=True)
+        time.sleep(delay)
+        delay = min(300, delay * 2)
+
+
+def _index_end(index: str) -> tuple[float | None, float | None]:
+    """End (wall clock) of what an earlier run already recorded, and when that file was last written."""
+    try:
+        last = None
+        for line in open(index):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if "f" in r and (last is None or r["t"] + r["d"] > last):
+                last = r["t"] + r["d"]
+        return last, os.path.getmtime(index)
+    except OSError:
+        return None, None
+
+
+def gaps_in(rec_dir: str, t0: float, t1: float) -> list[dict]:
+    """Recorded holes overlapping [t0, t1] ({"t", "d", "gap": cause})."""
+    out = []
+    try:
+        for line in open(os.path.join(rec_dir, "index.jsonl")):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if "gap" in r and r["t"] < t1 and r["t"] + r["d"] > t0:
+                out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def why_missing(rec_dir: str, t0: float, t1: float) -> str:
+    """Plain-language reason a window can't be cut in full from the recording."""
+    g = gaps_in(rec_dir, t0, t1)
+    if g:
+        lost = sum(min(t1, x["t"] + x["d"]) - max(t0, x["t"]) for x in g)
+        return (f"the recording has a {lost:.0f} s hole there — {g[0]['gap']} "
+                f"({dt.datetime.fromtimestamp(g[0]['t'], dt.timezone.utc):%H:%M:%S}–"
+                f"{dt.datetime.fromtimestamp(g[0]['t'] + g[0]['d'], dt.timezone.utc):%H:%M:%S} UTC)")
+    try:
+        rec = json.load(open(os.path.join(rec_dir, "recording.json")))
+    except (OSError, ValueError):
+        rec = {}
+    idx = [r for r in load_index(rec_dir)] if os.path.exists(os.path.join(rec_dir, "index.jsonl")) else []
+    if not idx:
+        return "nothing is recorded yet (the recorder can't reach the stream — see its log)"
+    if t1 < idx[0]["t"]:
+        first = dt.datetime.fromtimestamp(idx[0]["t"], dt.timezone.utc)
+        started = rec.get("started")
+        return (f"that moment is before the oldest kept recording ({first:%H:%M:%S} UTC) — "
+                + ("the buffer pruned it" if started and started < idx[0]["t"] - 60 else "the recorder wasn't running yet"))
+    if t0 > idx[-1]["t"] + idx[-1]["d"]:
+        return "that moment hasn't been recorded yet (or the recorder stopped)"
+    return "segments in that window are missing (pruned, or a download failed)"
+
+
 def load_index(rec_dir: str) -> list[dict]:
     out = []
     for line in open(os.path.join(rec_dir, "index.jsonl")):
-        r = json.loads(line)
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if "f" not in r:                               # a gap marker, not a segment
+            continue
         if os.path.isfile(os.path.join(rec_dir, "segments", r["f"])):
             out.append(r)
     out.sort(key=lambda r: r["t"])
@@ -241,7 +353,7 @@ def cut_source(rec_dir: str, t0: float, t1: float, out_ts: str) -> float:
     demuxer re-times every segment to its wall-clock place instead: file time == wall time − first."""
     idx = [r for r in load_index(rec_dir) if r["t"] + r["d"] > t0 - 2 and r["t"] < t1 + 2]
     if not idx:
-        raise RuntimeError("that moment is not in the recording (before it started, or pruned)")
+        raise RuntimeError("that moment is not in the recording: " + why_missing(rec_dir, t0, t1))
     lst = out_ts + ".txt"
     with open(lst, "w") as fh:
         for i, r in enumerate(idx):
@@ -326,9 +438,10 @@ def render_live(rec_dir: str, top: int = 3, out_dir: str | None = None, model: s
 
 
 def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title: str | None = None,
-                  quote: str | None = None, layout: str = "stack", model: str = "small",
+                  quote: str | None = None, layout: str = "stack", model: str | None = None,
                   watermark: str | None = None, fixes: dict | None = None,
-                  extra_censor: set[str] | None = None, drop_captions: list | None = None) -> dict:
+                  extra_censor: set[str] | None = None, drop_captions: list | None = None,
+                  words: list[dict] | None = None) -> dict:
     """Render any wall-clock window of a recording (moments found by reading
     the recording itself, not only viewer clips)."""
     from . import audio as A
@@ -338,9 +451,16 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
     src = out + ".src.ts"
     say(f"cutting {end_ts - start_ts:.0f} s from the recording…")
     first = cut_source(rec_dir, start_ts - 3, end_ts + 3, src)
-    say("transcribing (the slow part: a few minutes on a CPU)…")
-    x = A.decode_pcm(src, 0, None)
-    words = A.real_words(A.transcribe(x, model, offset=first))
+    if words is None:
+        say("transcribing (the slow part: a few minutes on a CPU)…")
+        if not model:
+            from . import ops as O
+            model = O.whisper_model()
+        x = A.decode_pcm(src, 0, None)
+        words = A.real_words(A.transcribe(x, model, offset=first))
+    else:
+        say("reusing the draft's transcript (no second transcription)")
+        words = [dict(w) for w in words]
     say("rendering the vertical clip…")
     from . import censor as C
     words = C.apply_fixes(words, fixes)          # e.g. {"kill me?": "kill him?"}
@@ -351,8 +471,9 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
     got = media_duration(out)
     want = end_ts - start_ts
     if got and got < want - 1.5:      # never hand over a clip that silently lost its ending
-        raise RuntimeError(f"render came out {want - got:.1f} s short ({got:.1f} of {want:.1f} s) — the recording "
-                           "has a hole in this window; pick a window inside the recording or trim with --end")
+        raise RuntimeError(f"render came out {want - got:.1f} s short ({got:.1f} of {want:.1f} s) — "
+                           f"{why_missing(rec_dir, start_ts, end_ts)}; pick a window inside the recording or trim "
+                           "with --end")
     return info
 
 

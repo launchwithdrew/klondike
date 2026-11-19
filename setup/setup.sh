@@ -18,13 +18,13 @@ elif [ "$(uname)" = Darwin ] && command -v brew >/dev/null; then brew install ff
 elif command -v apt-get >/dev/null; then (sudo -n true 2>/dev/null && sudo apt-get install -y ffmpeg || apt-get install -y ffmpeg) && ok "ffmpeg installed"
 else die "install ffmpeg (brew install ffmpeg / apt-get install ffmpeg) and re-run"; fi
 
-# 2. Python venv + packages (faster-whisper, numpy, pillow, pytest)
+# 2. Python venv + packages (faster-whisper, numpy, pillow, opencv-python-headless, pytest)
 PY=$(command -v python3.12 || command -v python3.11 || command -v python3 || true)
 [ -n "$PY" ] || die "python3 not found"
 [ -d .venv ] || "$PY" -m venv .venv
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
-ok "python venv (.venv) with $(.venv/bin/python -c 'import faster_whisper,PIL;print("faster-whisper",faster_whisper.__version__,"/ pillow",PIL.__version__)')"
+ok "python venv (.venv) with $(.venv/bin/python -c 'import faster_whisper,PIL,cv2;print("faster-whisper",faster_whisper.__version__,"/ pillow",PIL.__version__,"/ opencv",cv2.__version__,"(facecam layout)")')"
 
 # 2b. A public copy only ever pulls engine releases (clipengine update) — never pushes to the engine's repo
 if [ -f .public-build ]; then
@@ -32,12 +32,28 @@ if [ -f .public-build ]; then
 fi
 [ -d chrome-profile ] && chmod 700 chrome-profile
 
+# 2c. The shared operation repo: git pushes with the GitHub CLI's login (`gh auth login` alone doesn't
+#     connect git to it — `gh auth setup-git` does; there is no `setup-gitconfig`)
+if [ ! -f .public-build ] && command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+  if ! git push --dry-run -q origin HEAD:refs/heads/_setup_push_check >/dev/null 2>&1; then
+    gh auth setup-git >/dev/null 2>&1 || true
+  fi
+  if git push --dry-run -q origin HEAD:refs/heads/_setup_push_check >/dev/null 2>&1; then ok "git can push (GitHub CLI login)"
+  else warn "git can't push yet — run: gh auth setup-git  (needs gh auth login first)"; fi
+fi
+
 # 3. Whisper models (small = words, tiny = timing). First run downloads ~540 MB.
 HF_HUB_DISABLE_XET=1 .venv/bin/python - <<'PY'
 from faster_whisper import WhisperModel
 for m in ("tiny", "small"):
     WhisperModel(m, device="cpu", compute_type="int8")
 print("  \033[32m✓\033[0m whisper tiny + small cached")
+PY
+# 3b. Speaker model (who is talking: streamer / other / game) — WeSpeaker ResNet34, ONNX, 26 MB, CPU
+HF_HUB_DISABLE_XET=1 .venv/bin/python - <<'PY' || echo "  ! speaker model not downloaded — speaker tags fall back to log-mel statistics"
+from huggingface_hub import hf_hub_download
+hf_hub_download("Wespeaker/wespeaker-voxceleb-resnet34-LM", "voxceleb_resnet34_LM.onnx")
+print("  \033[32m✓\033[0m speaker model cached")
 PY
 
 # 4. Brand assets
@@ -48,7 +64,15 @@ done
 ok "fonts (Inter Display, color emoji)"
 
 # 5. Tests (offline, real ffmpeg)
-.venv/bin/python -m pytest tests -q 2>&1 | tail -1 | sed 's/^/  ✓ tests: /'
+# a failing test must not stop setup (the poster steps below still matter) — but it must be loud
+if TEST_OUT="$(.venv/bin/python -m pytest tests -q 2>&1)"; then
+  ok "tests: $(printf '%s\n' "$TEST_OUT" | tail -1)"
+else
+  printf '  \033[31m✗ tests FAILED: %s\033[0m\n' "$(printf '%s\n' "$TEST_OUT" | tail -1)"
+  printf '%s\n' "$TEST_OUT" | grep -E '^(FAILED|ERROR)' | head -5 | sed 's/^/      /'
+  printf '  \033[31m  next: .venv/bin/python -m pytest tests -q   (read the first failure; do not merge or post until it passes)\033[0m\n'
+  SETUP_TESTS_FAILED=1
+fi
 
 # 6. Poster (posting from this machine)
 if [ "${1:-}" != "--no-post" ]; then
@@ -65,4 +89,8 @@ if [ "${1:-}" != "--no-post" ]; then
   else warn "Chrome not found — posting from this machine needs Google Chrome (or set CLIPENGINE_CHROME)"; fi
 fi
 
+if [ -n "${SETUP_TESTS_FAILED:-}" ]; then
+  printf '\033[31mSet up, but the tests FAILED (see above) — fix them before running the operation.\033[0m\n'
+  exit 1
+fi
 echo 'Ready. Next: .venv/bin/python -m clipengine doctor   (then read AGENTS.md: your rhythm is clipengine cycle)'

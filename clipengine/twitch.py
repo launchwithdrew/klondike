@@ -384,6 +384,7 @@ class Playlist:
     segments: list[str]
     starts: list[float]
     durs: list[float]
+    init: str | None = None          # fMP4 playlists: the #EXT-X-MAP init segment every fragment needs
 
     @property
     def length_s(self) -> float:
@@ -429,10 +430,14 @@ def playlists(vod_id: str) -> dict:
 
 def load_playlist(url: str) -> Playlist:
     text = http(url).decode("utf-8", "replace")
-    segs, durs = [], []
+    segs, durs, init = [], [], None
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("#EXTINF:"):
+        if line.startswith("#EXT-X-MAP:"):
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                init = urllib.parse.urljoin(url, m.group(1))
+        elif line.startswith("#EXTINF:"):
             try:
                 durs.append(float(line.split(":", 1)[1].split(",", 1)[0]))
             except ValueError:
@@ -444,7 +449,7 @@ def load_playlist(url: str) -> Playlist:
     for d in durs[:n]:
         starts.append(t)
         t += d
-    return Playlist(url, segs[:n], starts, durs[:n])
+    return Playlist(url, segs[:n], starts, durs[:n], init)
 
 
 def download_window(pl: Playlist, start_s: float, end_s: float, out_path: str,
@@ -463,6 +468,8 @@ def download_window(pl: Playlist, start_s: float, end_s: float, out_path: str,
                            f"(VOD is {pl.length_s:.0f}s long)")
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         blobs = list(ex.map(lambda j: http(pl.segments[j], timeout=60), idx))
+    if getattr(pl, "init", None):        # fMP4 (newer Twitch VODs): fragments are unplayable without the init
+        blobs.insert(0, http(pl.init, timeout=60))
     with open(out_path, "wb") as fh:
         for b in blobs:
             fh.write(b)

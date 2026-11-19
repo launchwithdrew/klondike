@@ -18,6 +18,16 @@ was of, and the banger score it had), then writes data/weights.json:
   headlines   which headline patterns (length, CAPS words, quotes, numbers) got
               more views
   streamer_posts  how many reads each streamer has (the gate explores the unknown)
+  formats     the same for layout, caption style and length bucket (format_factor() turns it into a nudge)
+  parts       per judge score part (grade.engine_score parts): worth of posts high vs low on it
+  taste       streamers whose clips keep failing the frame check / rubric / queue skip: pushed down
+  windows     per platform, the local hours whose posts did best (prime time until there's data);
+              the gate schedules clips that aren't time-critical into them
+  summary     ONE plain line: what changed this run and why (report shows it)
+
+What a post is worth is not its views alone: shares (and saves, at half) and average watch time, each
+against our median on that platform, outweigh raw views when the agent recorded them (`clipengine
+views --shares --watch-s --skip ...`). A post with only views is judged on views, as before.
 
 and reports whether high banger scores really got more views.
 """
@@ -109,8 +119,123 @@ def headline_features(title: str) -> dict:
             "number": "has a number" if re.search(r"\d", title or "") else "no number"}
 
 
+# what a post is worth: weights of each signal when it was recorded (renormalised over what's there)
+QUALITY_WEIGHTS = {"views": 0.25, "shares": 0.40, "watch": 0.25, "skip": 0.10}
+MIN_WINDOW_READS = 10        # reads on a platform before its posting hours are learned (prime time until then)
+
+
+def _median_of(rows: list[dict], fn) -> float | None:
+    vals = [v for v in (fn(r) for r in rows) if v is not None]
+    return st.median(vals) if vals else None
+
+
+def _shares(r: dict) -> float | None:
+    if r.get("shares") is None and r.get("saves") is None:
+        return None
+    return float(r.get("shares") or 0) + 0.5 * float(r.get("saves") or 0)
+
+
+def quality(r: dict, med: dict) -> tuple[float, dict]:
+    """One post's worth vs our median on its platform → (ratio, parts). Views only → the views ratio."""
+    cap = lambda x: max(0.1, min(5.0, x))
+    parts = {}
+    if med.get("views"):
+        parts["views"] = cap(float(r["views"]) / med["views"])
+    sh = _shares(r)
+    if sh is not None and med.get("shares") is not None:
+        parts["shares"] = cap((sh + 1.0) / (med["shares"] + 1.0))
+    if r.get("watch_s") is not None and med.get("watch"):
+        parts["watch"] = cap(float(r["watch_s"]) / med["watch"])
+    if r.get("skip_pct") is not None and med.get("skip") is not None:
+        parts["skip"] = cap((100.0 - float(r["skip_pct"])) / max(1.0, 100.0 - med["skip"]))
+    if not parts:
+        return 1.0, parts
+    tw = sum(QUALITY_WEIGHTS[k] for k in parts)
+    return sum(QUALITY_WEIGHTS[k] * v for k, v in parts.items()) / tw, parts
+
+
+def length_bucket(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    return "<20 s" if seconds < 20 else "20-35 s" if seconds < 35 else "35-60 s" if seconds <= 60 else "60 s+"
+
+
+def format_features(title: str | None, length_s: float | None = None, layout: str | None = None,
+                    caption_style: str | None = None) -> dict:
+    f = headline_features(title or "") if title else {}
+    if length_s is not None:
+        f["length_s"] = length_bucket(length_s)
+    f["layout"] = layout or "stack"
+    if caption_style:
+        f["caption"] = caption_style
+    return f
+
+
+def format_factor(learned: dict, title: str | None = None, length_s: float | None = None,
+                  layout: str | None = None, caption_style: str | None = None) -> float:
+    """How this clip's format did for us (1.0 = typical, bounded 0.8-1.2): the learned buckets it falls in."""
+    fm = learned.get("formats") or {}
+    xs = []
+    for k, b in format_features(title, length_s, layout, caption_style).items():
+        d = (fm.get(k) or {}).get(b)
+        if d and d.get("posts", 0) >= 3 and len(fm.get(k) or {}) >= 2:
+            xs.append(_shrink([d["median_x"]] * d["posts"], 1.0))
+    if not xs:
+        return 1.0
+    return round(max(0.8, min(1.2, st.median(xs))), 3)
+
+
+def _local_hour(ts: float, tz: str) -> int:
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.fromtimestamp(ts, ZoneInfo(tz)).hour
+    except Exception:
+        return dt.datetime.fromtimestamp(ts, dt.timezone.utc).hour
+
+
+def posting_windows(by_plat_hour: dict[str, list[tuple[int, float]]], tz: str, default: list[int]) -> dict:
+    """Per platform: the local hours whose posts (±1 h) did best, once there are enough reads."""
+    out = {}
+    for plat, rows in by_plat_hour.items():
+        if len(rows) < MIN_WINDOW_READS:
+            out[plat] = {"hours": list(default), "source": "default", "reads": len(rows), "tz": tz}
+            continue
+        score = {}
+        for h in range(24):
+            near = [q for hh, q in rows if min((hh - h) % 24, (h - hh) % 24) <= 1]
+            if len(near) >= 2:
+                score[h] = _shrink(near, 1.0)
+        good = sorted((h for h, v in score.items() if v >= 1.05), key=lambda h: -score[h])[:6]
+        out[plat] = ({"hours": sorted(good), "source": "learned", "reads": len(rows), "tz": tz,
+                      "factor": {str(h): round(score[h], 2) for h in sorted(good)}} if good else
+                     {"hours": list(default), "source": "default", "reads": len(rows), "tz": tz})
+    return out
+
+
+def taste(clipped_rows: list[dict], drafts: list[dict] | None = None) -> dict[str, dict]:
+    """Per streamer: clips that failed the frame check / rubric (≤1 check true) or were skipped in the queue."""
+    t: dict[str, dict] = {}
+    for r in clipped_rows:
+        login = (r.get("login") or "").lower()
+        if not login or r.get("rubric") is None:
+            continue
+        d = t.setdefault(login, {"miss": 0, "seen": 0})
+        d["seen"] += 1
+        d["miss"] += int(len(r.get("rubric") or []) <= 1)
+    for r in drafts or []:
+        login = (r.get("login") or "").lower()
+        if login and r.get("status") == "skipped":
+            d = t.setdefault(login, {"miss": 0, "seen": 0})
+            d["seen"] += 1
+            d["miss"] += 1
+    for d in t.values():
+        rate = d["miss"] / d["seen"] if d["seen"] else 0.0
+        d["factor"] = round(max(0.5, 1.0 - 0.5 * rate), 3) if d["miss"] >= 3 and rate >= 0.6 else 1.0
+    return t
+
+
 def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creators: dict,
-          previous: dict | None = None, now: float | None = None) -> dict:
+          previous: dict | None = None, now: float | None = None, drafts: list[dict] | None = None) -> dict:
     import time
     now = now or time.time()
     previous = previous or {}
@@ -126,13 +251,26 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
             by.setdefault(plat, []).append(float(r["views"]))
         cp_medians[name] = {p: st.median(v) for p, v in by.items() if v}
     snaps, medians = cp_snaps["24h"], cp_medians["24h"]
+    # the medians a post is judged against, per checkpoint and platform (shares, watch time, skip rate too)
+    cp_med: dict[str, dict[str, dict]] = {}
+    for name, sn in cp_snaps.items():
+        for plat in {p for (_, p) in sn}:
+            rows = [r for (s_, p), r in sn.items() if p == plat]
+            cp_med.setdefault(name, {})[plat] = {
+                "views": cp_medians[name].get(plat), "shares": _median_of(rows, _shares),
+                "watch": _median_of(rows, lambda r: r.get("watch_s")),
+                "skip": _median_of(rows, lambda r: r.get("skip_pct"))}
     # one ratio per post: the 24 h read, else the 1 h early read (half weight), else 72 h
     ratio: dict[tuple, tuple[float, float]] = {}
+    evidence: dict[tuple, dict] = {}
     for name, w in (("72h", 1.0), ("1h", 0.5), ("24h", 1.0)):
         for key, r in cp_snaps[name].items():
-            med = cp_medians[name].get(key[1])
-            if med:
-                ratio[key] = (float(r["views"]) / med, w)
+            med = cp_med[name][key[1]]
+            if med.get("views"):
+                q, parts = quality(r, med)
+                ratio[key] = (q, w)
+                evidence[key] = {"parts": parts, "shares": _shares(r), "med_shares": med.get("shares"),
+                                 "watch_s": r.get("watch_s"), "med_watch": med.get("watch"), "views": r["views"]}
     per_login: dict[str, list[float]] = {}
     per_fit: dict[tuple, list[float]] = {}
     for (slug, plat), (rv, w) in ratio.items():
@@ -146,6 +284,11 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
     fit: dict[str, dict[str, float]] = {}
     for (plat, login), v in per_fit.items():
         fit.setdefault(plat, {})[login] = round(_shrink(v, streamers.get(login, 1.0)), 3)
+    # taste: a streamer whose clips keep failing the frame check / rubric is pushed down (radar + gate read it)
+    tst = taste(clipped_rows, drafts)
+    for login, d in tst.items():
+        if d["factor"] < 1.0:
+            streamers[login] = round(streamers.get(login, 1.0) * d["factor"], 3)
     report = []
     graded = [(clipped[s]["grade"], rv) for (s, p), (rv, w) in ratio.items()
               if s in clipped and clipped[s].get("grade") is not None and w == 1.0]
@@ -198,7 +341,58 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
             low = min(d.items(), key=lambda kv: kv[1]["median_x"])
             if top[1]["median_x"] >= 1.3 * low[1]["median_x"]:
                 report.append(f"headlines: {top[0]} {top[1]['median_x']:.2f}× vs {low[0]} {low[1]['median_x']:.2f}×")
+    # formats: layout and length bucket (+ the headline patterns above), judged on the same worth
+    fmts: dict[str, dict[str, list[float]]] = {}
+    part_rows: dict[str, list[tuple[float, float]]] = {}
+    for (slug, plat), (rv, w) in ratio.items():
+        if w != 1.0:
+            continue
+        c = clipped.get(slug) or {}
+        length = (c["end_s"] - c["start_s"]) if c.get("end_s") is not None and c.get("start_s") is not None else None
+        for k, v in format_features(titles.get(slug) or c.get("title"), length, c.get("layout"),
+                                    c.get("caption_style")).items():
+            fmts.setdefault(k, {}).setdefault(v, []).append(rv)
+        for part, pv in (c.get("parts") or {}).items():
+            if pv is not None:
+                part_rows.setdefault(part, []).append((float(pv), rv))
+    formats = {k: {b: {"median_x": round(st.median(v), 2), "posts": len(v)} for b, v in d.items() if len(v) >= 3}
+               for k, d in fmts.items()}
+    formats = {k: d for k, d in formats.items() if d}
+    # the judge's score parts: do posts high on a part (above that part's median) do better than low ones?
+    judge_parts = {}
+    for part, rows in part_rows.items():
+        if len(rows) < 6:
+            continue
+        mid = st.median(v for v, _ in rows)
+        hi_ = [q for v, q in rows if v > mid]
+        lo_ = [q for v, q in rows if v <= mid]
+        if len(hi_) >= 3 and len(lo_) >= 3:
+            judge_parts[part] = {"high_x": round(st.median(hi_), 2), "low_x": round(st.median(lo_), 2), "posts": len(rows)}
+    for part, d in sorted(judge_parts.items(), key=lambda kv: -abs(kv[1]["high_x"] - kv[1]["low_x"]))[:1]:
+        if d["high_x"] >= 1.3 * d["low_x"] or d["low_x"] >= 1.3 * d["high_x"]:
+            report.append(f"judge part {part}: high {d['high_x']:.2f}× vs low {d['low_x']:.2f}×"
+                          + (" — it predicts results" if d["high_x"] > d["low_x"] else " — it does NOT predict results"))
+    for k in ("length_s", "layout", "caption"):
+        d = formats.get(k) or {}
+        if len(d) >= 2:
+            top = max(d.items(), key=lambda kv: kv[1]["median_x"])
+            low = min(d.items(), key=lambda kv: kv[1]["median_x"])
+            if top[1]["median_x"] >= 1.3 * low[1]["median_x"]:
+                report.append(f"format: {top[0]} {top[1]['median_x']:.2f}× vs {low[0]} {low[1]['median_x']:.2f}×")
+    # posting hours (local): which hours' posts did best, per platform
+    tz = gcfg.get("timezone", "America/New_York")
+    by_hour: dict[str, list[tuple[int, float]]] = {}
+    for (slug, plat), (rv, w) in ratio.items():
+        t0 = live_at.get((slug, plat))
+        if t0 and w == 1.0:
+            by_hour.setdefault(plat, []).append((_local_hour(t0, tz), rv))
+    windows = posting_windows(by_hour, tz, gcfg.get("prime_hours", GT.DEFAULTS["prime_hours"]))
+    summary = explain(previous, streamers, thresholds, windows, tst, ratio, evidence, clipped, creators, titles)
+    report.insert(0, summary)
     return {"updated": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(), "target_age_h": TARGET_AGE_H,
+            "summary": summary, "formats": formats, "windows": windows, "parts": judge_parts,
+            "taste": {l: d for l, d in tst.items() if d["factor"] < 1.0},
+            "rich_reads": sum(1 for e in evidence.values() if len(e["parts"]) > 1),
             "platforms": {p: {"median_views": round(m, 1), "posts": len([1 for (s, q) in snaps if q == p])}
                           for p, m in medians.items()},
             "checkpoints": {c: {p: round(m, 1) for p, m in ms.items()} for c, ms in cp_medians.items()},
@@ -207,13 +401,56 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
             "headlines": headlines, "report": report}
 
 
+def explain(previous: dict, streamers: dict, thresholds: dict, windows: dict, tst: dict, ratio: dict,
+            evidence: dict, clipped: dict, creators: dict, titles: dict) -> str:
+    """ONE plain line: what changed in this run and why."""
+    parts = []
+    old = previous.get("streamers") or {}
+    moves = sorted(((l, old.get(l, 1.0), f) for l, f in streamers.items() if abs(f - old.get(l, 1.0)) >= 0.1),
+                   key=lambda x: -abs(x[2] - x[1]))
+    for login, was, now_f in moves[:2]:
+        why = ""
+        if tst.get(login, {}).get("factor", 1.0) < 1.0:
+            d = tst[login]
+            why = f"{d['miss']} of {d['seen']} clips failed the frame check/taste"
+        else:
+            mine = [(k, e) for k, e in evidence.items() if login_for(k[0], clipped, creators) == login]
+            shared = [(k, e) for k, e in mine if e.get("shares") is not None and e.get("med_shares") is not None]
+            if shared:
+                k, e = max(shared, key=lambda x: x[1]["shares"] - x[1]["med_shares"])
+                why = (f"\"{(titles.get(k[0]) or k[0])[:36]}\" got {e['shares']:g} shares on {k[1]} "
+                       f"vs our median {e['med_shares']:g}")
+            elif mine:
+                why = f"{len(mine)} reads at {st.median(ratio[k][0] for k, _ in mine):.2f}× our median"
+        parts.append(f"{login} {'up' if now_f > was else 'down'} {was:.2f}→{now_f:.2f}×" + (f" ({why})" if why else ""))
+    prev_t = previous.get("thresholds") or {}
+    for plat, v in thresholds.items():
+        if v != prev_t.get(plat, 0):
+            parts.append(f"{plat} bar {v - prev_t.get(plat, 0):+d} (posts just over it underperformed)"
+                         if v > prev_t.get(plat, 0) else f"{plat} bar {v - prev_t.get(plat, 0):+d} (marginal posts did fine)")
+    prev_w = previous.get("windows") or {}
+    for plat, w in windows.items():
+        if w["source"] == "learned" and w["hours"] != (prev_w.get(plat) or {}).get("hours"):
+            parts.append(f"best {plat} hours now {','.join(f'{h}:00' for h in w['hours'])} {w['tz'].split('/')[-1]}")
+    if parts:
+        return ("learned: " + "; ".join(parts))[:220]
+    rich = sum(1 for e in evidence.values() if len(e["parts"]) > 1)
+    return (f"learned: nothing changed — {len(ratio)} post reads ({rich} with shares/watch time)"
+            + ("; record --shares/--watch-s with views to learn faster" if rich < len(ratio) / 2 else ""))[:220]
+
+
 def run(write: bool = True) -> dict:
     from .publish import creators
     try:
         previous = json.load(open(WEIGHTS))
     except (OSError, ValueError):
         previous = {}
-    res = learn(_rows(PERF), _rows(LEDGER), _rows(CLIPPED), creators(), previous)
+    try:
+        from .sentinel import load_queue
+        drafts = load_queue()
+    except Exception:
+        drafts = []
+    res = learn(_rows(PERF), _rows(LEDGER), _rows(CLIPPED), creators(), previous, drafts=drafts)
     print(f"LEARN — {sum(res['streamer_posts'].values())} post reads (24 h medians: "
           + ", ".join(f"{p} {d['median_views']:,.0f}" for p, d in res["platforms"].items()) + ")")
     for login, f in sorted(res["streamers"].items(), key=lambda x: -x[1]):

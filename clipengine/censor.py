@@ -83,3 +83,84 @@ def apply_fixes(words: list[dict], fixes: dict | None) -> list[dict]:
             else:
                 i += 1
     return out
+
+
+# ---- completeness: check what was actually rendered -----------------------------------------------
+
+def audit(mp4: str, listen: bool = True, model_name: str = "tiny") -> dict:
+    """Check a rendered clip against the censor list, in both places a word can slip through:
+      captions  every caption card (<clip>.transcript.json) must be clean
+      audio     the clip's own audio, transcribed again: a profane word heard outside every bleep
+                interval means the main transcript misheard it, so it was never bleeped.
+    -> {"ok", "captions": [words], "audio": [{"w", "start", "end"}] (clip seconds), "bleeps": [...]}"""
+    import json
+    import os
+    base = mp4.rsplit(".mp4", 1)[0]
+    try:
+        tr = json.load(open(base + ".transcript.json"))
+    except (OSError, ValueError):
+        tr = {"segments": [], "bleep_intervals": []}
+    bleeps = [list(b) for b in tr.get("bleep_intervals", [])]
+    caps = []
+    for seg in tr.get("segments", []):
+        for m in _WORD_RE.finditer(seg.get("text", "")):
+            if is_profane(m.group(0)) and m.group(0) not in caps:
+                caps.append(m.group(0))
+    heard = []
+    if listen and os.path.exists(mp4):
+        from . import audio as A
+        try:
+            x = A.decode_pcm(mp4)
+            for w in A.all_words(A.transcribe(x, model_name, prompt=None)):
+                m = _WORD_RE.search(w["w"])
+                if not m or not is_profane(m.group(0)):
+                    continue
+                if any(a - 0.2 <= w["start"] and w["end"] <= b + 0.2 for a, b in bleeps):
+                    continue
+                heard.append({"w": m.group(0), "start": round(w["start"], 2), "end": round(w["end"], 2)})
+        except Exception as exc:
+            return {"ok": not caps, "captions": caps, "audio": [], "bleeps": bleeps, "note": f"audio not checked: {exc}"}
+    return {"ok": not caps and not heard, "captions": caps, "audio": heard, "bleeps": bleeps}
+
+
+def bleep_file(mp4: str, intervals: list[list[float]], pad: float = 0.08) -> list[list[float]]:
+    """Silence extra intervals (clip seconds) in a rendered clip — audio re-encoded, video copied — and
+    record them in its transcript.json. Returns every bleep interval now in the clip."""
+    import json
+    import os
+    import subprocess
+    base = mp4.rsplit(".mp4", 1)[0]
+    iv = [[max(0.0, a - pad), b + pad] for a, b in intervals]
+    tmp = base + ".rebleep.mp4"
+    af = ",".join(f"volume=0:enable='between(t,{a:.2f},{b:.2f})'" for a, b in iv)
+    p = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp4, "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+                        "-af", af, "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", tmp],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError("re-bleep failed: " + p.stderr[-400:])
+    os.replace(tmp, mp4)
+    try:
+        tr = json.load(open(base + ".transcript.json"))
+    except (OSError, ValueError):
+        tr = {"segments": []}
+    allb = sorted([list(b) for b in tr.get("bleep_intervals", [])] + iv)
+    tr["bleep_intervals"] = allb
+    json.dump(tr, open(base + ".transcript.json", "w"), indent=2)
+    return allb
+
+
+def ensure_clean(mp4: str, rerender=None, listen: bool = True) -> dict:
+    """audit -> fix -> audit again. Audio gaps are bleeped in place; caption gaps re-render through
+    `rerender(extra_words)` when given. Returns the last audit plus what was fixed ("fixed")."""
+    rep = audit(mp4, listen)
+    fixed = []
+    if rep["captions"] and rerender:
+        rerender({w.lower() for w in rep["captions"]})
+        fixed.append("captions re-rendered: " + ", ".join(rep["captions"]))
+        rep = audit(mp4, listen)
+    if rep["audio"]:
+        bleep_file(mp4, [[w["start"], w["end"]] for w in rep["audio"]])
+        fixed.append("audio re-bleeped at " + ", ".join(f"{w['start']:.1f}s" for w in rep["audio"]))
+        rep = audit(mp4, listen)
+    rep["fixed"] = fixed
+    return rep

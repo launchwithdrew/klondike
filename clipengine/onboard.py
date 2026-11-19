@@ -68,6 +68,17 @@ def seeded_look(name: str) -> dict:
     }
 
 
+def facecam_look(look: dict) -> dict:
+    """The reference look for new channels: the streamer's webcam on top, gameplay below, the headline
+    card on the seam, the logo in a bottom corner (clear of the webcam). Clips of streamers with no
+    known webcam fall back to "stack" by themselves."""
+    look = {**look, "layout": {**look["layout"], "kind": "facecam", "split": 0.45},
+            "card": {**look["card"], "position": "seam"},
+            "logo": {**look["logo"], "corner": "bottom-left" if "left" in look["logo"]["corner"] else "bottom-right"},
+            "captions": {**look["captions"], "y": max(0.62, float(look["captions"]["y"]))}}
+    return look
+
+
 def _font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(B.font("InterDisplay-ExtraBold.ttf" if bold else "InterDisplay-Bold.ttf"), size)
 
@@ -176,6 +187,9 @@ def init(name: str | None = None, youtube: str | None = None, instagram: str | N
     name = (name or "My Clip Channel").strip()
     category = (category or "Just Chatting").strip()
     look = seeded_look(name)
+    from . import facecam as FC
+    if FC.available():
+        look = facecam_look(look)
     slugtag = "#" + "".join(ch for ch in name.lower() if ch.isalnum())
     pack = {"_about": "This channel's brand pack. Change anything here (or ask your Muse); run "
                       "`clipengine preview` to see it.",
@@ -234,10 +248,17 @@ def init(name: str | None = None, youtube: str | None = None, instagram: str | N
     return pack
 
 
-def _sample_source(path: str, seconds: float = 6.0) -> str:
-    """A neutral moving background to preview the look on (no copyrighted footage needed)."""
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
-                    f"gradients=size=1920x1080:rate=30:duration={seconds}:speed=0.02",
+SAMPLE_CAM = [40 / 1920, 60 / 1080, 480 / 1920, 360 / 1080]   # where the preview's stand-in webcam sits
+
+
+def _sample_source(path: str, seconds: float = 6.0, cam: bool = False) -> str:
+    """A neutral moving background to preview the look on (no copyrighted footage needed); with cam=True
+    a test pattern stands in for a streamer's webcam in the top-left corner (SAMPLE_CAM)."""
+    vid = f"gradients=size=1920x1080:rate=30:duration={seconds}:speed=0.02"
+    if cam:
+        vid += (f"[bg];testsrc2=size=480x360:rate=30:duration={seconds}[cam];"
+                "[bg][cam]overlay=40:60:shortest=1")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", vid,
                     "-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo", "-t", str(seconds),
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "30", "-bf", "0", "-c:a", "aac",
                     "-f", "mpegts", path], check=True)
@@ -248,11 +269,15 @@ def preview(clip: str | None = None, title: str = "Streamer found a SECRET room 
             quote: str = "no way this is real") -> dict:
     from . import render as V
     os.makedirs(BRAND_DIR, exist_ok=True)
-    src = clip or _sample_source(os.path.join(BRAND_DIR, ".preview_src.ts"))
+    cam = B.load()["layout"].get("kind") == "facecam"
+    src = clip or _sample_source(os.path.join(BRAND_DIR, ".preview_src.ts"), cam=cam)
     words = [{"w": f" {w}", "start": 0.8 + i * 0.45, "end": 1.15 + i * 0.45}
              for i, w in enumerate("no way bro look at this right now".split())]
     out = os.path.join(BRAND_DIR, "preview.mp4")
-    V.render(src, 0.0, 0.0, 5.0, words, out, layout="stack", title=title, quote=quote)
+    info = V.render(src, 0.0, 0.0, 5.0, words, out, layout="stack", title=title, quote=quote,
+                    facecam=SAMPLE_CAM if (cam and not clip) else None)
+    if (info.get("facecam") or {}).get("note"):
+        print("preview: " + info["facecam"]["note"])
     png = os.path.join(BRAND_DIR, "preview.png")
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", "2.2", "-i", out, "-frames:v", "1", png], check=True)
     if not clip:

@@ -44,7 +44,10 @@ def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: li
     said = scan_text(transcript)
     named = scan_text(" ".join(titles or []), headline)
     chat = scan_text(" ".join(chat_lines or []))
-    flagged = len(said) >= 2 or bool(named) or len(chat) >= 3
+    # chat jokes about everything, so one word is noise — but several people on it is the moment's topic
+    chat_msgs = sum(1 for c in chat_lines or [] if _RE.search(c or ""))
+    chat_hot = len(chat) >= 3 or chat_msgs >= max(3, 0.05 * len(chat_lines or []))
+    flagged = len(said) >= 2 or bool(named) or chat_hot
     why = []
     if said:
         why.append("said: " + ", ".join(said[:5]))
@@ -52,4 +55,31 @@ def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: li
         why.append("titled: " + ", ".join(named[:3]))
     if chat:
         why.append("chat: " + ", ".join(chat[:3]))
-    return {"flagged": flagged, "why": "; ".join(why), "hits": said + named + chat}
+    return {"flagged": flagged, "why": "; ".join(why), "hits": said + named + chat,
+            "chat_hits": chat, "chat_msgs": chat_msgs}
+
+
+_STOP = set("""a an the and or but so of to in on at for with by from up down out over is are was were be been it its
+this that these those he she they them his her their him i me my we our you your just like when what who how why
+got get gets gone goes go going after before into off than then very really gta gta6 6 vi""".split())
+
+
+def headline_support(title: str, transcript: str = "", titles: list[str] | None = None,
+                     names: list[str] | None = None) -> list[str]:
+    """Key words of our headline that appear in neither what was said nor the viewers' clip titles —
+    a nudge to re-check it says what is ON SCREEN (rules/headlines.md). Empty = every key word is backed.
+    Word stems match ("arrested" ~ "arrest"); emoji, numbers, stop words and names are skipped."""
+    norm = lambda t: re.findall(r"[a-z']+", (t or "").lower())
+    have = set(norm(transcript)) | set(norm(" ".join(titles or [])))
+    stems = {w[:5] for w in have if len(w) >= 4}
+    skip = {n.lower() for n in names or []}
+    missing = []
+    for w in norm(title):
+        w = w.strip("'")
+        if len(w) < 4 or w in _STOP or w in skip or w.endswith("'s") and w[:-2] in skip:
+            continue
+        if w in have or w[:5] in stems:
+            continue
+        if w not in missing:
+            missing.append(w)
+    return missing

@@ -16,6 +16,9 @@ Look is v1's locked spec, unchanged:
   watermark bottom-right, 260px, 65% opacity, 32px margin
   bleep     each censored word muted (+-0.05 s), "***" on screen
   output    1080x1920, H.264 CRF 20 veryfast, 30 fps, AAC 128k, +faststart
+
+Layouts: "single" (one crop), "stack" (zoomed action over the full frame) and "facecam" (the streamer's
+webcam on top, gameplay below; see facecam.py — falls back to "stack" when no webcam is known).
 """
 from __future__ import annotations
 
@@ -192,6 +195,35 @@ def header_filters(header: str) -> str:
 
 
 STACK_TOP = 1312          # default stack split (brand pack "layout.split" overrides): zoom panel height
+FACECAM_MAX = 0.45        # facecam layout: the webcam panel takes at most this share of the height
+
+
+def facecam_geometry(box: list[float], src_w: int, src_h: int, max_frac: float = FACECAM_MAX) -> dict:
+    """Pixel crops for the facecam layout. box = normalised [x, y, w, h] of the webcam in the source.
+    Top panel: the webcam crop scaled to 1080 wide, height from its aspect (capped at max_frac of 1920 —
+    a taller webcam is trimmed top and bottom equally). Bottom panel: a full-height centre crop of the
+    gameplay with the 1080 x rest aspect."""
+    x, y, w, h = (max(0.0, min(1.0, float(v))) for v in box)
+    cw = max(16, int(w * src_w) // 2 * 2)
+    ch = max(16, int(h * src_h) // 2 * 2)
+    cx = min(int(x * src_w), src_w - cw)
+    cy = min(int(y * src_h), src_h - ch)
+    cap = int(1920 * max_frac) // 2 * 2
+    top = int(round(1080 * ch / cw / 2)) * 2
+    if top > cap:                                 # too tall for the panel: trim, keep the middle
+        new_ch = int(cw * cap / 1080) // 2 * 2
+        cy += (ch - new_ch) // 2
+        ch, top = new_ch, cap
+    top = max(240, top)
+    bot = 1920 - top
+    gw = min(src_w, int(src_h * 1080 / bot) // 2 * 2)
+    gx = (src_w - gw) // 2
+    bx0, bx1 = int(x * src_w), int((x + w) * src_w)       # the whole webcam box, before any trim
+    if bx1 > gx and bx0 < gx + gw:                        # the webcam would show in the gameplay panel:
+        right = bx1 - gx if bx0 < src_w / 2 else -(gx + gw - bx0)    # slide away from it, up to 15%
+        if abs(right) <= 0.15 * src_w:
+            gx = max(0, min(src_w - gw, gx + right))
+    return {"cam": (cw, ch, cx, cy), "top": top, "bottom": bot, "game_w": gw, "game_x": gx // 2 * 2}
 
 
 def render(source: str, source_t0: float, start_s: float, end_s: float,
@@ -199,9 +231,15 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
            hook: str | None = None, hook_s: float = 2.0, watermark: str | None = WATERMARK,
            censor: bool = True, mute_audio: bool = False, layout: str = "single",
            title: str | None = None, quote: str | None = None, extra_censor: set[str] | None = None,
-           drop_captions: list[tuple[float, float]] | None = None) -> dict:
+           drop_captions: list[tuple[float, float]] | None = None, login: str | None = None,
+           facecam: list[float] | None = None) -> dict:
     """Render [start_s, end_s] (VOD seconds) of `source` (a .ts whose first
-    frame is VOD second source_t0). `words` are VOD-time word dicts."""
+    frame is VOD second source_t0). `words` are VOD-time word dicts.
+
+    layout "facecam" (or "stack" when the brand pack's layout.kind is "facecam"): the streamer's webcam
+    on top, gameplay below. `facecam` = normalised [x, y, w, h] of the webcam; when not given it comes
+    from the creator (`login`, or facecam.creator(...) set by publish) or from the clip itself, and with
+    no confident box the clip is cut in "stack" instead (the report says so)."""
     if crop not in CROPS:
         raise ValueError(f"crop must be one of {list(CROPS)}")
     base = out.rsplit(".mp4", 1)[0]
@@ -215,18 +253,42 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
     bp = B.load()
     if layout == "stack" and bp["layout"].get("kind") == "single":
         layout = "single"                                   # the channel's pack chose the full-frame look
+    if layout == "stack" and bp["layout"].get("kind") == "facecam":
+        layout = "facecam"
+    fc_info, geo = None, None
+    if layout == "facecam":
+        from . import facecam as FC
+        who = (login or FC.current_login() or "").lower() or None
+        if facecam:
+            fc_info = {"box": list(facecam), "confidence": 1.0, "source": "given"}
+        else:
+            fc_info = FC.for_clip(source, who, start=max(0.0, start_s - source_t0), end=end_s - source_t0)
+        mi = FC.media_info(source) if fc_info.get("box") else {}
+        if fc_info.get("box") and mi.get("width"):
+            split = float(bp["layout"].get("split", FACECAM_MAX))
+            geo = facecam_geometry(fc_info["box"], mi["width"], mi["height"], min(FACECAM_MAX, split))
+        else:
+            fc_info = {**fc_info, "note": "no facecam known with good confidence for "
+                       f"{who or 'this clip'} ({fc_info.get('why') or 'unreadable source'}) — rendered stack instead"}
+            layout = "stack"
     stack_top = int(round(1920 * float(bp["layout"].get("split", STACK_TOP / 1920)) / 2)) * 2
     caps = bp["captions"]
     cards = word_cards(clip_words, start_s, end_s, caps.get("uppercase", True))
     ass = base + ".ass"
-    write_ass(cards, ass, margin_v=int(round(1920 * (1 - float(caps.get("y", 0.56))))),
-              size=caps.get("size") or (72 if layout == "stack" else 84))
+    cap_y = float(caps.get("y", 0.56)) * 1920
+    if geo:
+        # captions belong on the gameplay panel, clear of the headline card on the seam
+        cap_y = min(1920 - 420, max(cap_y, geo["top"] + 330))
+    write_ass(cards, ass, margin_v=int(round(1920 - cap_y)),
+              size=caps.get("size") or (72 if layout in ("stack", "facecam") else 84))
     cap_font_dir = os.path.dirname(B.font(caps.get("font_file", "InterDisplay-Bold.ttf")))
     write_srt(cards, base + ".srt")
     rel_bleeps = [[round(max(0.0, a - start_s), 2), round(b - start_s, 2)] for a, b in bleeps]
     dur = end_s - start_s
 
     card_png = None
+    # where the headline card goes: kept with a pre-render so the card can be burned in later (burn_card)
+    slot = {"layout": layout, "seam": geo["top"] if geo else (stack_top if layout == "stack" else None)}
     if layout == "stack":
         # top: the action, zoomed (centre of the frame); bottom: the full frame
         # with the facecam and HUD; the title card sits on the seam
@@ -234,6 +296,12 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
         vf = (f"[0:v]split[s1][s2];[s1]crop={zw}:ih:(iw-{zw})/2:0,scale=1080:{stack_top},setsar=1[top];"
               f"[s2]scale=1080:{1920 - stack_top},setsar=1[bot];[top][bot]vstack=2,"
               f"subtitles='{ass}':fontsdir='{cap_font_dir}'")
+    elif geo:
+        # top: the streamer's webcam, full width; bottom: the gameplay, centre crop
+        cw, ch, cx, cy = geo["cam"]
+        vf = (f"[0:v]split[s1][s2];[s1]crop={cw}:{ch}:{cx}:{cy},scale=1080:{geo['top']},setsar=1[top];"
+              f"[s2]crop={geo['game_w']}:ih:{geo['game_x']}:0,scale=1080:{geo['bottom']},setsar=1[bot];"
+              f"[top][bot]vstack=2,subtitles='{ass}':fontsdir='{cap_font_dir}'")
     else:
         vf = f"[0:v]{CROPS[crop]},subtitles='{ass}':fontsdir='{cap_font_dir}'"
     if title and bp["card"].get("show", True):
@@ -241,13 +309,7 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
         t = C.censor_text(title) if censor else title
         q = (C.censor_text(quote) if censor else quote) if quote else None
         card_png, card_h, card_mid = make_card(t, q, base + ".card.png")
-        pos = bp["card"].get("position", "top")
-        if pos == "seam" and layout == "stack":
-            card_y = stack_top - card_mid
-        elif pos == "bottom":
-            card_y = 1920 - card_h - 380                    # above the platforms' caption/buttons area
-        else:
-            card_y = 150                                    # below the platforms' top bar
+        card_y = card_position(bp, slot, card_h, card_mid)
     if header:
         h = C.censor_text(header) if censor else header
         if censor and h != header:
@@ -291,7 +353,7 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
         cmd += ["-c:a", "aac", "-b:a", "128k"]
     # -t as an OUTPUT option: as an input option it is ignored for .ts
     # sources once a filter graph is attached (test caught 17.4 s for 10 s)
-    cmd += ["-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30",
+    cmd += ["-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", render_preset(), "-crf", "20", "-r", "30",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -303,8 +365,63 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
                   "bleep_intervals": rel_bleeps}
     json.dump(transcript, open(base + ".transcript.json", "w"), indent=2)
     return {"out": out, "cards": len(cards), "censored": sum("***" in c["text"] for c in cards),
-            "bleeps": rel_bleeps, "watermark": use_wm, "crop": crop if layout == "single" else "stack",
-            "title": title, "quote": quote}
+            "bleeps": rel_bleeps, "watermark": use_wm, "crop": crop if layout == "single" else layout,
+            "layout": layout, "facecam": fc_info, "title": title, "quote": quote, "card_slot": slot}
+
+
+def render_preset() -> str:
+    """x264 preset: veryfast, or the ops profile's (lite: ultrafast) — config/ops.json "render_preset" wins."""
+    try:
+        from . import ops as O
+        return O.config().get("render_preset") or "veryfast"
+    except Exception:
+        return "veryfast"
+
+
+def card_position(bp: dict, slot: dict, card_h: int, card_mid: int) -> int:
+    """y of the headline card: on the seam (facecam always; stack when the pack says "seam"), else top/bottom."""
+    pos = bp["card"].get("position", "top")
+    if slot.get("layout") == "facecam" and slot.get("seam"):
+        return slot["seam"] - card_mid
+    if pos == "seam" and slot.get("layout") == "stack" and slot.get("seam"):
+        return slot["seam"] - card_mid
+    if pos == "bottom":
+        return 1920 - card_h - 380                          # above the platforms' caption/buttons area
+    return 150                                              # below the platforms' top bar
+
+
+def burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: dict, trim_start: float = 0.0,
+              dur: float | None = None, censor: bool = True) -> dict:
+    """The last step of a pre-rendered draft: overlay the headline card on the finished clip (captions,
+    bleeps, logo already in it), optionally trimmed. One short encode; audio is copied when not trimmed."""
+    from . import brand as B
+    bp = B.load()
+    base = out.rsplit(".mp4", 1)[0]
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    if trim_start > 0:
+        cmd += ["-ss", f"{trim_start:.3f}"]
+    cmd += ["-i", pre]
+    card_png = None
+    if title and bp["card"].get("show", True):
+        from .card import make_card
+        t = C.censor_text(title) if censor else title
+        q = (C.censor_text(quote) if censor else quote) if quote else None
+        card_png, card_h, card_mid = make_card(t, q, base + ".card.png")
+        y = card_position(bp, slot, card_h, card_mid)
+        cmd += ["-loop", "1", "-t", f"{(dur or 180) + 2:.3f}", "-framerate", "30", "-i", card_png,
+                "-filter_complex", f"[0:v][1:v]overlay=0:{y}:shortest=1,format=yuv420p[vout]", "-map", "[vout]"]
+    else:
+        cmd += ["-map", "0:v:0"]
+    cmd += ["-map", "0:a:0?"]
+    cmd += ["-c:a", "copy"] if trim_start <= 0 else ["-c:a", "aac", "-b:a", "128k"]
+    if dur:
+        cmd += ["-t", f"{dur:.3f}"]
+    cmd += ["-c:v", "libx264", "-preset", render_preset(), "-crf", "20", "-r", "30", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", out]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError("ffmpeg (card) failed: " + p.stderr[-1500:])
+    return {"out": out, "card": bool(card_png), "title": title, "quote": quote}
 
 
 def ffprobe(path: str) -> dict:

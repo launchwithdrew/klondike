@@ -47,8 +47,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--type", help="header type from the closed list: " + ", ".join(H.TYPES))
     r.add_argument("--streamer", help="name in the header (default: per-creator short name)")
     r.add_argument("--hook", help="optional hook text, first 2 s (<= ~18 chars)")
-    r.add_argument("--layout", choices=["single", "stack"], default="single",
-                   help="stack: zoomed action on top, full frame + facecam below, title card on the seam")
+    r.add_argument("--layout", choices=["single", "stack", "facecam"], default="single",
+                   help="stack: zoomed action on top, full frame + facecam below, title card on the seam; "
+                        "facecam: the streamer's webcam on top, gameplay below (falls back to stack)")
     r.add_argument("--title", help="stack layout: the contextual headline, e.g. 'Streamer got CAUGHT by his in-game girlfriend 😭👀'")
     r.add_argument("--quote", help="stack layout: the streamer's own line, shown in the red tag")
     r.add_argument("--allow-flagged", action="store_true", help="render a moment flagged for sexual content (a person decided)")
@@ -80,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     lr.add_argument("--channel", required=True)
     lr.add_argument("--out", required=True)
     lr.add_argument("--buffer", default="2h")
+    lr.add_argument("--supervised", action="store_true", help="keep recording through drops (what `start` runs)")
     lc = sub.add_parser("live-clips", help="cut the most-viewed viewer-clipped moments out of a recording")
     lc.add_argument("--rec", required=True, help="the --out folder of `record`")
     lc.add_argument("--top", type=int, default=3)
@@ -91,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--title", required=True, help="the headline (rules/headlines.md)")
     pb.add_argument("--line", required=True, help="one true sentence for the caption; hashtags are added")
     pb.add_argument("--quote", help="the streamer's own words for the red tag")
+    pb.add_argument("--question", help="optional second caption line: a question for viewers (rules/headlines.md)")
     pb.add_argument("--slug", help="default: made from the creator + headline")
     pb.add_argument("--start", help="override window start (VOD time)")
     pb.add_argument("--end", help="override window end (VOD time)")
@@ -114,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         x.add_argument("--title", required=True)
         x.add_argument("--line", required=True)
         x.add_argument("--quote")
+        x.add_argument("--question", help="optional second caption line: a question for viewers")
         x.add_argument("--slug")
         x.add_argument("--frames-checked", action="store_true")
         x.add_argument("--post", action="store_true")
@@ -128,6 +132,26 @@ def main(argv: list[str] | None = None) -> int:
     sn.add_argument("--out", help="default runs/sentinel-<channel>")
     sn.add_argument("--buffer", type=float, default=1.0, help="hours of recording to keep")
     sn.add_argument("--no-draft", action="store_true", help="detect only; don't cut/transcribe drafts")
+    sn.add_argument("--no-record", action="store_true", help="the recorder runs as its own process (what `start` does)")
+    ap_ = sub.add_parser("autopilot", help="run `cycle` every few minutes in the background, no agent needed")
+    ap_.add_argument("action", choices=["start", "stop", "status", "run"])
+    ap_.add_argument("--every", type=float, help="minutes between cycles (default config/ops.json autopilot_every_min, 5)")
+    ap_.add_argument("--sessions", action="store_true", help="only inside the roster's usual stream hours (clipengine schedule)")
+    ap_.add_argument("--rounds", type=int, help=argparse.SUPPRESS)
+    at_ = sub.add_parser("attention", help="ONE line of what needs you now (nothing when nothing does)")
+    at_.add_argument("--seen", action="store_true", help="mark what it shows as read")
+    sc_ = sub.add_parser("schedule", help="each roster creator's usual stream hours and the next session (local time)")
+    sc_.add_argument("--cached", action="store_true", help="don't re-read their broadcasts")
+    cu_ = sub.add_parser("catchup", help="scan saved streams for a window nothing was running in; queue the best")
+    cu_.add_argument("--since", help="unix seconds")
+    cu_.add_argument("--spikes", help=argparse.SUPPRESS)          # tier-1 spikes to draft from saved streams
+    cu_.add_argument("--sweep", action="store_true", help="cheap: chat + viewer clips only, queue the strong new moments")
+    cu_.add_argument("--until", help="unix seconds (default now)")
+    cu_.add_argument("--channel", action="append", help="only these roster creators")
+    bk_ = sub.add_parser("backup", help="zip brand/, config/, data/, ledger.jsonl, local/patches")
+    bk_.add_argument("--to", help="folder for the zip (default runs/backups)")
+    rs_ = sub.add_parser("restore", help="put a backup zip back (backs up what's there first)")
+    rs_.add_argument("file")
     it = sub.add_parser("init", help="set up this channel: brand pack, profile kit, roster (unique look by default)")
     it.add_argument("--name"); it.add_argument("--youtube", help="@handle"); it.add_argument("--instagram")
     it.add_argument("--tiktok"); it.add_argument("--category", help='game or category, e.g. "Grand Theft Auto VI"')
@@ -159,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("stop", help="stop a sentinel (--all: every sentinel and the poster)")
     sp.add_argument("--channel")
     sp.add_argument("--all", action="store_true")
+    t1_ = sub.add_parser("tier1", help="the chat-only watcher on every live roster creator (cycle runs it)")
+    t1_.add_argument("--seconds", type=float, help=argparse.SUPPRESS)
     sub.add_parser("sentinels", help="one line per running sentinel (DOWN ones print the restart command)")
     qu = sub.add_parser("queue", help="sentinel drafts worth a look, best first (one line each)")
     qu.add_argument("--all", action="store_true", help="include skipped/unsafe/stale/low drafts")
@@ -167,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     pq.add_argument("--title", required=True)
     pq.add_argument("--line", required=True)
     pq.add_argument("--quote")
+    pq.add_argument("--question", help="optional second caption line: a question for viewers")
     pq.add_argument("--slug")
     pq.add_argument("--start", type=float, help="trim: seconds to drop from the start")
     pq.add_argument("--end", type=float, help="trim: seconds to drop from the end")
@@ -177,11 +204,28 @@ def main(argv: list[str] | None = None) -> int:
     pq.add_argument("--no-push", action="store_true")
     pq.add_argument("--fix", action="append", default=[], metavar='"heard=>said"')
     pq.add_argument("--bleep", action="append", default=[], metavar="WORD")
+    pr_ = sub.add_parser("prerender", help="final-render queued drafts (all but the headline card) so publish-queued takes seconds")
+    prg = pr_.add_mutually_exclusive_group(required=True)
+    prg.add_argument("--pending", action="store_true", help="every eligible draft without one (what cycle runs)")
+    prg.add_argument("--id", action="append", help="this draft (repeatable); re-renders it")
     sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
     pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
     vw = sub.add_parser("views", help="(post_with: agent) record a view count you read off a post")
     vw.add_argument("--slug", required=True); vw.add_argument("--platform", required=True); vw.add_argument("--views", type=int, required=True)
+    vw.add_argument("--watch-s", type=float, help="average watch time in seconds (from the post's analytics)")
+    vw.add_argument("--skip", type=float, help="skip / swipe-away rate, %%")
+    for k in ("shares", "saves", "follows", "likes", "comments"):
+        vw.add_argument(f"--{k}", type=int)
+    sub.add_parser("to-measure", help="posts due a 1 h / 24 h / 72 h analytics read, with links")
+    fo = sub.add_parser("followers", help="record an account's follower count (report: payout thresholds)")
+    fo.add_argument("--platform", required=True); fo.add_argument("--count", type=int, required=True)
+    sub.add_parser("to-submit", help="posted clips that match a clipping pool (config/campaigns.json), with links")
+    sb = sub.add_parser("submitted", help="record a clip submitted to a clipping pool")
+    sb.add_argument("--slug", required=True); sb.add_argument("--pool", required=True); sb.add_argument("--url", required=True)
+    sb.add_argument("--platform")
+    po = sub.add_parser("payout", help="record money a clipping pool paid")
+    po.add_argument("--pool", required=True); po.add_argument("--amount", type=float, required=True); po.add_argument("--slug")
     sk = sub.add_parser("skip", help="mark a sentinel draft as looked-at and not worth posting")
     sk.add_argument("--id", required=True)
     tn = sub.add_parser("train", help="train the sentinel on recent VODs, using viewer clips as labels")
@@ -192,6 +236,11 @@ def main(argv: list[str] | None = None) -> int:
     tn.add_argument("--out", help="write the model here instead of config/sentinel_model.json")
     ln = sub.add_parser("learn", help="turn view counts into streamer weights (data/weights.json) + a calibration report")
     ln.add_argument("--dry", action="store_true", help="report only, don't write data/weights.json")
+    fc = sub.add_parser("facecam", help="find a streamer's webcam box (for the facecam layout); saves a check image")
+    fcg = fc.add_mutually_exclusive_group(required=True)
+    fcg.add_argument("--rec", help="a `record` / sentinel folder")
+    fcg.add_argument("--channel", help="Twitch login: looks at the last minutes of the newest VOD")
+    fc.add_argument("--out", help="check image path")
     rd = sub.add_parser("radar", help="score every live stream in the category and list the hottest moments")
     rd.add_argument("--hours", type=float, help="trending window in hours (default from config/radar.json)")
     rd.add_argument("--out", help="also save the full result as JSON")
@@ -212,15 +261,57 @@ def main(argv: list[str] | None = None) -> int:
             caption_kw["rubric"] = checks
         except ValueError as exc:
             ap.error(str(exc))
+    if getattr(a, "question", None):
+        caption_kw["question"] = a.question
     if getattr(a, "bleep", None):
         caption_kw["extra_censor"] = {w.lower() for w in a.bleep}
+    if a.cmd in ("autopilot", "attention", "schedule", "catchup", "backup", "restore"):
+        from . import autopilot as AP
+        if a.cmd == "autopilot":
+            if a.action == "start":
+                print(AP.autopilot_start(a.every, a.sessions))
+            elif a.action == "stop":
+                print(AP.autopilot_stop())
+            elif a.action == "status":
+                print(AP.autopilot_status_line())
+            else:
+                from . import ops as O
+                AP.autopilot_run(a.every or O.config().get("autopilot_every_min", 5), a.sessions, a.rounds)
+        elif a.cmd == "attention":
+            from . import attention as AT
+            text = AT.line()
+            if text:
+                print(text)
+            if a.seen:
+                print(f"marked {AT.mark_seen()} item(s) read")
+        elif a.cmd == "schedule":
+            AP.show_schedule(refresh=not a.cached)
+        elif a.cmd == "catchup":
+            import time as _t
+            if a.spikes:
+                AP.catchup_spikes(json.load(open(a.spikes))["spikes"])
+            elif not a.since:
+                ap.error("catchup needs --since")
+            elif a.sweep:
+                AP.sweep(float(a.since), float(a.until) if a.until else _t.time(), a.channel)
+            else:
+                AP.catchup(float(a.since), float(a.until) if a.until else _t.time(), a.channel)
+        elif a.cmd == "backup":
+            AP.backup(a.to)
+        else:
+            AP.restore(a.file)
+        return 0
     if a.cmd == "publish":
         from . import publish as PB
+        from . import autopilot as AP
+        AP.refuse_never(json.load(open(os.path.join(a.scan, "scan.json")))["vod"].get("login", ""))
         PB.publish_scan(a.scan, a.pick, a.title, a.line, a.quote, a.slug, a.frames_checked, a.post,
                         push=not a.no_push, check_only=a.check, start=T.parse_time(a.start), end=T.parse_time(a.end), **caption_kw)
         return 0
     if a.cmd == "publish-live":
         from . import publish as PB
+        from . import autopilot as AP
+        AP.refuse_never(json.load(open(os.path.join(a.rec, "recording.json"))).get("login", ""))
         def wall(v):
             if ":" in v:
                 import datetime as dt
@@ -234,7 +325,12 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "sentinel":
         from . import sentinel as SN
         from . import live as L
-        SN.run(a.channel, a.out or os.path.join("runs", f"sentinel-{L.source_name(a.channel)}"), a.buffer, not a.no_draft)
+        SN.run(a.channel, a.out or os.path.join("runs", f"sentinel-{L.source_name(a.channel)}"), a.buffer, not a.no_draft,
+               record=not a.no_record)
+        return 0
+    if a.cmd == "facecam":
+        from . import facecam as FC
+        FC.cli(rec=a.rec, channel=a.channel, out=a.out)
         return 0
     if a.cmd == "init":
         from . import onboard as OB
@@ -287,19 +383,39 @@ def main(argv: list[str] | None = None) -> int:
             print("stop --channel LOGIN, or stop --all")
             return 2
         return 0
-    if a.cmd in ("to-post", "posted", "views"):
+    if a.cmd in ("to-post", "posted", "views", "to-measure", "followers"):
         from . import handpost as HP
         if a.cmd == "to-post":
             HP.show()
         elif a.cmd == "posted":
             print(HP.mark(a.slug, a.platform, a.url))
+        elif a.cmd == "to-measure":
+            HP.show_measure()
+        elif a.cmd == "followers":
+            print(HP.followers(a.platform, a.count))
         else:
-            print(HP.views(a.slug, a.platform, a.views))
+            print(HP.views(a.slug, a.platform, a.views, watch_s=a.watch_s, skip=a.skip, shares=a.shares,
+                           saves=a.saves, follows=a.follows, likes=a.likes, comments=a.comments))
+        return 0
+    if a.cmd in ("to-submit", "submitted", "payout"):
+        from . import campaigns as CP
+        if a.cmd == "to-submit":
+            CP.show()
+        elif a.cmd == "submitted":
+            print(CP.submitted(a.slug, a.pool, a.url, a.platform))
+        else:
+            print(CP.payout(a.pool, a.amount, a.slug))
+        return 0
+    if a.cmd == "tier1":
+        from . import tier1 as TR
+        TR.run(a.seconds)
         return 0
     if a.cmd == "sentinels":
-        from . import sentinel as SN
-        if not SN.health():
-            print("no sentinels running")
+        from . import autopilot as AP
+        from . import tier1 as TR
+        TR.show()
+        if not AP.show_sentinels():
+            print("tier 2  no sentinels running")
         return 0
     if a.cmd == "queue":
         from . import sentinel as SN
@@ -313,14 +429,38 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(f"no queued draft {a.id}")
         if a.cmd == "skip":
             SN.set_status(e, "skipped")
+            print(f"skipped {e['id']}")
             return 0
         from . import publish as PB
-        rep = PB.publish_window(e["rec"], e["start"] + (a.start or 0), e["stop"] - (a.end or 0), a.title, a.line,
+        from . import autopilot as AP
+        AP.refuse_never(e.get("login", ""))
+        if e.get("scan"):                       # a catch-up draft from a saved stream: the normal VOD path
+            kw = AP.publish_window_args(e, a.start, a.end)
+            rep = PB.publish_scan(kw.pop("scan_dir"), kw.pop("pick"), a.title, a.line, a.quote, a.slug, a.frames_checked,
+                                  a.post, push=not a.no_push, check_only=a.check, **kw, **caption_kw)
+            if a.frames_checked and not a.check and str(rep.get("status", "")).startswith("DROPPED"):
+                SN.set_status(e, "published", slug=rep.get("slug"))
+            return 0
+        s_, e_ = e["start"] + (a.start or 0), e["stop"] - (a.end or 0)
+        cut = SN.check_trim(e, s_, e_)           # a trim must not cut the payoff
+        if cut:
+            raise SystemExit("PUBLISH REFUSED: " + cut)
+        words = SN.draft_words(e, s_, e_)
+        from . import prerender as PR
+        pre = PR.usable(e, s_, e_, caption_kw.get("fixes"), caption_kw.get("extra_censor"))
+        rep = PB.publish_window(e["rec"], s_, e_, a.title, a.line,
                                 a.quote, a.slug, a.frames_checked, a.post, push=not a.no_push, check_only=a.check,
                                 chat_score=SN.chat_score_from_p(e["p"]) if e.get("p") is not None else None,
-                                **caption_kw)
+                                words=words, drop_captions=SN.game_spans(words) or None,   # captions: people, not the game
+                                pre=pre, **caption_kw)
         if a.frames_checked and not a.check and str(rep.get("status", "")).startswith("DROPPED"):
             SN.set_status(e, "published", slug=rep.get("slug"))
+        return 0
+    if a.cmd == "prerender":
+        from . import prerender as PR
+        out = PR.run_pending(ids=a.id) if a.id else PR.run_pending()
+        if not out:
+            print("prerender: nothing pending")
         return 0
     if a.cmd == "train":
         from . import train as TR
@@ -351,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd == "record":
         from . import live as L
-        L.record(a.channel, a.out, T.parse_time(a.buffer))
+        (L.record_supervised if a.supervised else L.record)(a.channel, a.out, T.parse_time(a.buffer))
         return 0
     if a.cmd == "live-clips":
         from . import live as L
@@ -387,10 +527,12 @@ def main(argv: list[str] | None = None) -> int:
             header = H.build(name, a.type)
             print(f"header (DRAFT until a person approves it): {header}")
         wm = None if a.no_watermark else (a.watermark or P.V.WATERMARK)
-        rep = P.render_pick(a.scan, a.pick, header=header, hook=a.hook, crop=a.crop,
-                            start=T.parse_time(a.start), end=T.parse_time(a.end),
-                            retime=not a.no_retime, watermark=wm, mute_audio=a.mute_audio, cut=a.cut,
-                            layout=a.layout, title=a.title, quote=a.quote, allow_flagged=a.allow_flagged)
+        from . import facecam as FC
+        with FC.creator(res["vod"].get("login")):
+            rep = P.render_pick(a.scan, a.pick, header=header, hook=a.hook, crop=a.crop,
+                              start=T.parse_time(a.start), end=T.parse_time(a.end),
+                              retime=not a.no_retime, watermark=wm, mute_audio=a.mute_audio, cut=a.cut,
+                              layout=a.layout, title=a.title, quote=a.quote, allow_flagged=a.allow_flagged)
         print(json.dumps({k: rep[k] for k in ("out", "cards", "censored", "bleeps_verified_silent",
                                                "timing_matched", "timing_s", "status")}, indent=2))
         return 0

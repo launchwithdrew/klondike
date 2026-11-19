@@ -45,6 +45,13 @@ DEFAULTS = {
     "penalties": {"poll": 0.5, "music": 0.5, "lyrics": 0.5, "dead_open": 0.8, "silent": 0.85, "thin": 0.7,
                   "cutscene": 0.5, "static": 0.6, "dark": 0.5},
     "tiers": {"banger": 75, "solid": 60},
+    # judge like an editor (defaults in code; config/grading.json may override)
+    "game_dialogue_cap": 30,        # engine ceiling for game dialogue no viewer / streamer reaction carries: best 58
+    "carry_crowd": 0.5,             # ... unless the crowd part is at least this
+    "carry_reaction": 0.6,          # ... or the streamer's own reaction (laugh / volume burst) is
+    "thin_share": 0.25,             # streamer speech under this share of the clip = thin: reactions decide
+    "thin_boost": 1.5,              # chat + crowd weight when speech is thin
+    "target_len": [15, 35],         # draft length (s): setup before the payoff + reaction after
 }
 
 
@@ -71,6 +78,8 @@ def _penalty(flags: list[str], cfg: dict) -> tuple[float, list[str]]:
         for key, needle in (("poll", "chat was asked"), ("music", "music"), ("lyrics", "lyrics"),
                             ("dead_open", "dead open"), ("silent", "silent stretch"), ("thin", "thin speech"),
                             ("cutscene", "cutscene"), ("static", "static ("), ("dark", "dark (")):
+            if key not in pen:
+                continue
             if needle in fl:
                 p *= pen[key]
                 why.append(f"{key} ×{pen[key]}")
@@ -80,9 +89,12 @@ def _penalty(flags: list[str], cfg: dict) -> tuple[float, list[str]]:
 
 def engine_score(sig: dict, cfg: dict | None = None) -> dict:
     """sig: crowd_vpm, crowd_views, chat_score, audio_factor (None = not available),
-    streamer_factor (None = unknown → neutral), age_h, flags, unsafe, hard_fail, published."""
+    streamer_factor (None = unknown → neutral), age_h, flags, unsafe, hard_fail, published,
+    and (judge like an editor) speech = {streamer_s, dur, game_share, game_dialogue}, reaction 0–1
+    (+ reaction_why), wrong_game. Returns score, parts and `why` — the reasons, in words."""
     cfg = cfg or config()
-    w = cfg["weights"]
+    w = dict(cfg["weights"])
+    notes: list[str] = []
     parts: dict[str, float | None] = {
         "crowd": None if sig.get("crowd_vpm") is None and sig.get("crowd_views") is None else
         max(_unit_log(sig.get("crowd_vpm") or 0, cfg["crowd_vpm_cap"]),
@@ -92,15 +104,53 @@ def engine_score(sig: dict, cfg: dict | None = None) -> dict:
         "streamer": 0.5 if sig.get("streamer_factor") is None else max(0.0, min(1.0, (sig["streamer_factor"] - 0.5) / 1.5)),
         "freshness": 0.5 ** (max(0.0, sig.get("age_h") or 0.0) / cfg["freshness_half_life_h"]),
     }
+    flags = list(sig.get("flags") or [])
+    sp = sig.get("speech") or {}
+    react = sig.get("reaction")
+    thin = bool(sp) and sp.get("streamer_s", 0) < cfg["thin_share"] * max(1.0, sp.get("dur") or 1.0)
+    if thin and (react is not None or parts["crowd"] is not None or parts["chat"] is not None):
+        # little streamer speech: what they DID (laugh, scream) and how viewers reacted decide
+        if react is not None and parts["audio"] is not None and react > parts["audio"]:
+            parts["audio"] = react
+        for k in ("chat", "crowd"):
+            w[k] = w[k] * cfg["thin_boost"]
+        notes.append(f"speech thin ({sp.get('streamer_s', 0):.0f}s streamer) → reactions weighted up"
+                     + (f" ({sig.get('reaction_why')})" if sig.get("reaction_why") else ""))
+        if react is not None and react >= 0.5:
+            flags = [f for f in flags if "thin speech" not in f.lower()]
     used = {k: v for k, v in parts.items() if v is not None}
     total_w = sum(w[k] for k in used) or 1
     base = 100 * sum(w[k] * v for k, v in used.items()) / total_w
-    mult, why = _penalty(sig.get("flags") or [], cfg)
-    for hard, label in (("unsafe", "unsafe"), ("hard_fail", "hard fail"), ("published", "already published")):
+    mult, why = _penalty(flags, cfg)
+    score = base * mult
+    if sp.get("game_dialogue") or any("game dialogue" in f.lower() for f in flags):
+        carried = (parts["crowd"] or 0) >= cfg["carry_crowd"] or (react or 0) >= cfg["carry_reaction"]
+        if carried:
+            notes.append("game dialogue, carried by " + ("viewers" if (parts["crowd"] or 0) >= cfg["carry_crowd"]
+                                                         else "the streamer's reaction"))
+        elif score > cfg["game_dialogue_cap"]:
+            score = cfg["game_dialogue_cap"]
+            why.append(f"game dialogue: capped at {cfg['game_dialogue_cap']} (no viewer or streamer reaction carries it)")
+    for hard, label in (("unsafe", "unsafe"), ("hard_fail", "hard fail"), ("published", "already published"),
+                        ("wrong_game", "wrong game")):
         if sig.get(hard):
-            mult, why = 0.0, why + [f"{label}: {sig[hard]}"]
-    return {"score": round(base * mult, 1), "base": round(base, 1),
-            "parts": {k: (None if v is None else round(v, 2)) for k, v in parts.items()}, "penalties": why}
+            score, why = 0.0, why + [f"{label}: {sig[hard]}"]
+    return {"score": round(score, 1), "base": round(base, 1),
+            "parts": {k: (None if v is None else round(v, 2)) for k, v in parts.items()},
+            "penalties": why, "why": notes + why}
+
+
+def parts_line(eng: dict, sig: dict | None = None) -> str:
+    """The score's work in one short string: «sp 4s ch .91 au .30 re .70 cr –»."""
+    f = lambda v: "–" if v is None else f"{v:.2f}".lstrip("0")
+    p = eng.get("parts") or {}
+    sig = sig or {}
+    sp = (sig.get("speech") or {}).get("streamer_s")
+    out = ([f"sp {sp:.0f}s"] if sp is not None else []) + [f"ch {f(p.get('chat'))}", f"au {f(p.get('audio'))}"]
+    if sig.get("reaction") is not None:
+        out.append(f"re {f(sig['reaction'])}")
+    out.append(f"cr {f(p.get('crowd'))}")
+    return " ".join(out)
 
 
 def rubric_score(passed: list[str] | None) -> float | None:
@@ -155,7 +205,10 @@ def signals_from_candidate(c: dict, vod: dict, now: dt.datetime | None = None) -
             "chat_score": c.get("chat_score"), "audio_factor": c.get("audio_factor"),
             "streamer_factor": _factor(vod.get("login")), "age_h": age_h,
             "flags": c.get("flags") or [], "unsafe": safety.get("why") if safety.get("flagged") else "",
-            "hard_fail": c.get("hard_fail") or ""}
+            "hard_fail": c.get("hard_fail") or "", "titles": (crowd or {}).get("titles") or [],
+            "speech": c.get("speech"), "reaction": c.get("reaction") if isinstance(c.get("reaction"), (int, float)) else None,   # a scan's is a chat label
+            "reaction_why": c.get("reaction_why"),
+            "wrong_game": c.get("wrong_game") or ""}
 
 
 def signals_from_live(rec_dir: str, login: str, start_ts: float, end_ts: float,
@@ -165,17 +218,36 @@ def signals_from_live(rec_dir: str, login: str, start_ts: float, end_ts: float,
     import time
     now = now or time.time()
     crowd_vpm = crowd_views = None
+    titles: list[str] = []
     try:
         for m in L.live_moments(rec_dir):
             if min(end_ts, m["end"]) - max(start_ts, m["start"]) > 3:
                 crowd_views = (crowd_views or 0) + m["views"]
                 age_min = max(1.0, (now - m["end"]) / 60)
                 crowd_vpm = (crowd_vpm or 0) + m["views"] / age_min
+                titles += m.get("titles") or []
     except Exception:
         pass
-    speech = sum(w["end"] - w["start"] for w in (words or []))
     dur = max(1.0, end_ts - start_ts)
-    audio = None if words is None else 0.4 + 0.9 * min(1.0, speech / (0.5 * dur))
-    flags = ["thin speech"] if words is not None and speech < 0.2 * dur else []
-    return {"crowd_vpm": crowd_vpm, "crowd_views": crowd_views, "chat_score": None, "audio_factor": audio,
-            "streamer_factor": _factor(login), "age_h": max(0.0, (now - end_ts) / 3600), "flags": flags}
+    sig = {"crowd_vpm": crowd_vpm, "crowd_views": crowd_views, "chat_score": None, "audio_factor": None,
+           "streamer_factor": _factor(login), "age_h": max(0.0, (now - end_ts) / 3600), "flags": [],
+           "titles": titles}
+    if words is not None:
+        sig.update(speech_signals(words, dur))
+    return sig
+
+
+def speech_signals(words: list[dict], dur: float) -> dict:
+    """audio_factor, flags and the speech summary from STREAMER speech only (speaker.py tags; untagged
+    words count as the streamer). Game dialogue is not the streamer talking."""
+    from . import speaker as SP
+    from .audio import speech_in
+    mine = SP.streamer_words(words)
+    speech = speech_in(mine, -1e18, 1e18)[1] if mine else 0.0
+    summ = SP.summary(words)
+    flags = ["thin speech"] if speech < 0.2 * dur else []
+    if summ["game_dialogue"]:
+        flags.append(f"game dialogue ({int(summ['game_share'] * 100)}% of speech)")
+    return {"audio_factor": 0.4 + 0.9 * min(1.0, speech / (0.5 * dur)), "flags": flags,
+            "speech": {"streamer_s": round(speech, 1), "dur": round(dur, 1), "game_share": summ["game_share"],
+                       "game_dialogue": summ["game_dialogue"]}}

@@ -44,12 +44,28 @@ Give the user `brand/kit/` (profile picture, banner, bios) and walk them through
 streamers, keeps the poster running, collects views hourly, learns daily, frees disk space, and shows
 the **queue** — the only part that needs you.
 
+## Let it run by itself
+```bash
+.venv/bin/python -m clipengine autopilot start            # cycle every 5 min in the background (no tokens)
+.venv/bin/python -m clipengine attention                  # ONE line of what needs you, or nothing
+```
+`autopilot start --sessions` runs only inside the streamers' usual hours (`clipengine schedule` shows them);
+`autopilot status` / `stop`. `attention` lists overdue posts first, then clips due, failures (a sentinel died,
+a recording hole, a draft failed), new drafts and the daily report; `attention --seen` marks it read. To get it
+on the user's phone, add to `config/ops.json`:
+`"notify_cmd": "curl -s -d \"$CLIPENGINE_ATTENTION\" ntfy.sh/<a-long-random-topic>"` (they subscribe to that
+topic in the ntfy app), or `"notify_url"` for a webhook that takes `{"text": ...}`. If nothing ran for a while,
+the next cycle scans the saved streams of that time and queues their best moments, so nothing is lost.
+A streamer who doesn't allow clipping: `"policy": "never"` in `config/creators.json`.
+Backups: `clipengine backup` (brand, config, data, ledger) and `clipengine restore FILE`.
+
 ## The queue: your one judgment call
 Each line is a moment a sentinel caught, already cut, transcribed, safety-checked and scored. For each:
 1. Look at its contact sheet image once.
 2. Worth posting? Write a headline (rules in `brand/voice.md`), then:
 ```bash
-.venv/bin/python -m clipengine publish-queued --id ID --title "..." --quote "streamer's words" --line "one true sentence"
+.venv/bin/python -m clipengine publish-queued --id ID --title "..." --quote "streamer's words" --line "one true sentence" \
+  --question "an optional question for viewers?"
 ```
 3. It renders and prints the score and captions. If they're right, run the same command again with
    `--frames-checked --rubric hook,context,payoff,share --post`, listing only the checks that are TRUE:
@@ -72,6 +88,7 @@ checks the machine. If neither solves it: `docs/troubleshooting.md`, then `docs/
 | Fixing a bug in the engine yourself | `docs/fixing-bugs.md` |
 | Changing the look, streamers or category | `docs/customizing.md` |
 | Telling the user how it's going | `clipengine report` |
+| Reading analytics, clipping pools, events, payout thresholds | `docs/earning.md` (`to-measure`, `to-submit`) |
 | Getting the newest version | automatic: `cycle` installs each new release (tested here first) |
 | Sharing anonymous results to improve the detector | `docs/insights.md` (opt-in) |
 

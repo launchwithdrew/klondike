@@ -9,7 +9,14 @@ pack (unique by default); `clipengine preview` shows it before anything posts.
   accounts    youtube {handle, channelId?} · instagram {username} · tiktok {username}
   hashtags    list; "{creator}" is replaced by the streamer's tag (config/creators.json)
   layout      kind: "stack" (zoomed action over the full frame) | "single" (full frame on blur)
-              split: fraction of the height the top panel takes in "stack"
+              | "facecam" (the streamer's webcam on top, gameplay below; falls back to "stack" when no
+              webcam is known for the streamer — see clipengine/facecam.py)
+              split: fraction of the height the top panel takes in "stack"; in "facecam" the most the
+              webcam panel may take (capped at 0.45; its real height comes from the webcam's shape)
+  max_hashtags how many hashtags a caption carries (default 3): the streamer's tag first, then the
+              pack's others in order
+  caption_style "line+question" (default: the one true line, then the operator's --question if given)
+              | "line" (the line only; --question is ignored)
   card        headline card: show, position (seam | top | bottom), fill, text, font, size,
               radius, margin (side margin), max_lines
   quote       the streamer's-words tag: show, place (above | below), fill, text, font, size, radius
@@ -42,6 +49,8 @@ DEFAULTS: dict = {
                  "y": 0.56, "uppercase": True},
     "logo": {"file": "brand/kit/logo.png", "corner": "bottom-right", "width": 220, "opacity": 0.7, "margin": 32},
     "voice": "rules/headlines.md",
+    "max_hashtags": 3,
+    "caption_style": "line+question",
 }
 
 
@@ -96,5 +105,27 @@ def ass_color(color: str) -> str:
 
 
 def hashtags(tag: str) -> str:
-    """The pack's hashtags with {creator} → the streamer's tag."""
-    return " ".join(h.replace("{creator}", tag) for h in load()["hashtags"] if h.replace("{creator}", tag).strip())
+    """The pack's hashtags with {creator} → the streamer's tag: the streamer's tag first, then the others
+    in the pack's order, at most `max_hashtags` (top clip pages use only a few)."""
+    b = load()
+    tags = [h.replace("{creator}", tag).strip() for h in b["hashtags"]]
+    first = [t for t, h in zip(tags, b["hashtags"]) if "{creator}" in h and t]
+    out: list[str] = []
+    for t in first + [t for t, h in zip(tags, b["hashtags"]) if "{creator}" not in h]:
+        if t and t.lower() not in (o.lower() for o in out):
+            out.append(t)
+    try:
+        n = int(b.get("max_hashtags", 3))
+    except (TypeError, ValueError):
+        n = 3
+    return " ".join(out[:max(0, n)])
+
+
+def caption(line: str, tag: str, question: str | None = None) -> str:
+    """The post caption: one true line, then (caption_style "line+question") the question, then the
+    hashtags."""
+    text = (line or "").strip()
+    if question and question.strip() and load().get("caption_style", "line+question") == "line+question":
+        text += "\n" + question.strip()
+    tags = hashtags(tag)
+    return f"{text} {tags}".strip() if tags else text

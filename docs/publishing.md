@@ -26,4 +26,9 @@ true sentence; hashtags are added from the brand pack.
 apply; a clip that misses a gap is scheduled and the poster posts it when the slot opens. New accounts
 warm up: 1 post a day per platform at first, full speed by day 10.
 
+**How drafts are judged:** payoff-first (setup 3–15 s + payoff + reaction ≤ 8 s, 15–35 s), only the
+streamer's speech scores (game dialogue is tagged by voice + subtitles and can't post on its own), drops
+keep their reason in `queue --all`. Publish re-checks the render against the censor list and warns when
+the headline's words aren't in the transcript or viewer titles.
+
 **Never re-post:** the ledger refuses a slug or title that is already live on a platform.

@@ -127,6 +127,14 @@ def _unit_log(x: float, cap: float) -> float:
     return max(0.0, min(1.0, math.log10(1 + x) / math.log10(1 + cap)))
 
 
+def _event_boost(login: str, now: dt.datetime) -> float:
+    try:
+        from .events import priority_boost
+        return priority_boost(login, now.timestamp())
+    except Exception:
+        return 0.0
+
+
 def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learned: dict,
                     cfg: dict, now: dt.datetime) -> list[dict]:
     """Opportunity score per live streamer (pure: no network)."""
@@ -145,6 +153,7 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
         f = factors.get(s["login"])
         hist = 0.5 if f is None else max(0.0, min(1.0, (float(f) - 0.5) / 1.5))
         pri = {1: 1.0, 2: 0.5}.get(r.get("priority"), 0.0)
+        pri = min(1.0, pri + _event_boost(s["login"], now))       # a creator in a live event (config/events.json)
         parts = {
             "audience": w["audience"] * _unit_log(s["viewers"], cfg["audience_cap"]),
             "heat": w["heat"] * _unit_log(heat.get(s["login"], 0.0), cfg["heat_cap_vpm"]),
@@ -154,8 +163,9 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
         score = round(sum(parts.values()), 1)
         rows.append({**s, "score": score, "parts": {k: round(v, 1) for k, v in parts.items()},
                      "heat_vpm": round(heat.get(s["login"], 0.0), 1), "on_roster": bool(r),
-                     "vods": r.get("vods")})
-    return sorted(rows, key=lambda r: -r["score"])
+                     "vods": r.get("vods"), "policy": str(r.get("policy") or "allowed").lower()})
+    # creators who don't allow clipping (config/creators.json "policy": "never") are listed last
+    return sorted(rows, key=lambda r: (r["policy"] == "never", -r["score"]))
 
 
 def trending_moments(clips: list[dict], cfg: dict, now: dt.datetime,
@@ -199,11 +209,14 @@ def trending_moments(clips: list[dict], cfg: dict, now: dt.datetime,
             a, b = max(0, int(m["start"]) - 60), int(m["end"]) + 60
             m["cut"] = f"scan --vod {m['video']} --from {a} --to {b} --top 4 --probe 3 --out runs/{m['login']}-{a}"
         else:
-            m["cut"] = f"no VOD — only in a recording: record --channel {m['login']} (cut with publish-live if it was running)"
+            m["cut"] = None                    # nothing to run: no saved stream to cut from
+            m["note"] = "no saved stream — only a sentinel's recording can cut it (publish-live if one was running)"
     return sorted(moments, key=lambda m: (bool(m["unsafe"]) or bool(m["published"]), -m["vpm"]))
 
 
 def _action(row: dict, cfg: dict) -> str:
+    if row.get("policy") == "never":
+        return "never"
     if row["score"] < cfg["act_score"]:
         return "watch"
     if row["vods"] is True:
@@ -228,7 +241,15 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
     for r in rows[:show]:
         r["action"] = _action(r, cfg)
     moments = trending_moments(clips, cfg, now, load_clipped())
-    res = {"at": now.isoformat(), "game": cfg["game"], "streamers": rows, "moments": moments}
+    roster = creators()
+    never = {l for l, c in roster.items() if str(c.get("policy") or "").lower() == "never"}
+    if never:
+        for m in moments:
+            if m["login"] in never and not m["unsafe"]:
+                m["unsafe"] = "doesn't allow clipping (policy: never)"
+        moments.sort(key=lambda m: (bool(m["unsafe"]) or bool(m["published"]), -m["vpm"]))
+    res = {"at": now.isoformat(), "game": cfg["game"], "streamers": rows, "moments": moments,
+           "live_count": len(streams), "live_logins": [s["login"] for s in streams]}
     if quiet:
         return res
 
@@ -246,7 +267,7 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
         print(f"  {m['vpm']:7.1f}/min {m['views']:>7,} views  {m['login']:<16} {m['age_min']:>4}m ago  "
               f"{UT.quote(m['titles'][0], 48)}{flag}")
         if not flag:
-            print(f"           -> python -m clipengine {m['cut']}")
+            print(f"           -> python -m clipengine {m['cut']}" if m.get("cut") else f"           ({m.get('note', '')})")
     if out:
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         json.dump(res, open(out, "w"), indent=1)

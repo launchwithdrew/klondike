@@ -47,10 +47,38 @@ def creators() -> dict:
         return {}
 
 
+def _tag(login: str) -> str:
+    return creators().get(login.lower(), {}).get("tag") or f"#{re.sub(r'[^a-z0-9]', '', login.lower())}"
+
+
 def hashtags(login: str) -> str:
-    tag = creators().get(login.lower(), {}).get("tag") or f"#{re.sub(r'[^a-z0-9]', '', login.lower())}"
     from . import brand as B
-    return B.hashtags(tag)
+    return B.hashtags(_tag(login))
+
+
+def caption(line: str, login: str, question: str | None = None) -> str:
+    """What goes under the post: the one true line, the optional question, a few hashtags (brand pack:
+    caption_style, max_hashtags)."""
+    from . import brand as B
+    return B.caption(line, _tag(login), question)
+
+
+def check_question(question: str | None) -> list[str]:
+    if not question or not question.strip():
+        return []
+    q = question.strip()
+    problems = []
+    if "\n" in q:
+        problems.append("question must be one line")
+    if len(q) > 120:
+        problems.append(f"question is {len(q)} chars (max 120)")
+    if not q.endswith("?"):
+        problems.append("question must end with '?'")
+    if BANNED_TITLE.search(q):
+        problems.append(f"question uses '{BANNED_TITLE.search(q).group(0)}' — say it another way")
+    if SF.screen(headline=q)["flagged"]:
+        problems.append("question has sexual terms")
+    return problems
 
 
 def load_clipped() -> list[dict]:
@@ -130,15 +158,17 @@ def record_clipped(entry: dict, push: bool) -> None:
 def publish_scan(scan_dir: str, pick: int, title: str, line: str, quote: str | None = None,
                  slug: str | None = None, frames_checked: bool = False, post: bool = False,
                  push: bool = True, check_only: bool = False, rubric: list[str] | None = None,
-                 **render_kw) -> dict:
+                 question: str | None = None, **render_kw) -> dict:
     from . import pipeline as P
+    from . import facecam as FC
     res = json.load(open(os.path.join(scan_dir, "scan.json")))
     vod = res["vod"]
     c = next(x for x in res["candidates"] if x["rank"] == pick)
-    problems = check_title(title)
+    problems = check_title(title) + check_question(question)
     if problems:
         raise SystemExit("PUBLISH REFUSED: " + "; ".join(problems))
-    rep = P.render_pick(scan_dir, pick, layout="stack", title=title, quote=quote, **render_kw)
+    with FC.creator(vod.get("login")):          # the facecam layout looks up this streamer's webcam
+        rep = P.render_pick(scan_dir, pick, layout="stack", title=title, quote=quote, **render_kw)
     s, e = rep["window"]
     hit = already_clipped(vod["id"], s, e)
     if hit:
@@ -146,19 +176,21 @@ def publish_scan(scan_dir: str, pick: int, title: str, line: str, quote: str | N
     moment = dt.datetime.fromisoformat(vod["created_at"].replace("Z", "+00:00")) + dt.timedelta(seconds=c["peak_s"])
     sig = G.signals_from_candidate(c, vod)
     return _finish(rep, vod["login"], vod["id"], s, e, moment, title, line, quote, slug, frames_checked, post, push,
-                   check_only, sig, rubric)
+                   check_only, sig, rubric, question)
 
 
 def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, line: str, quote: str | None = None,
                    slug: str | None = None, frames_checked: bool = False, post: bool = False,
                    push: bool = True, check_only: bool = False, rubric: list[str] | None = None,
-                   chat_score: float | None = None, **kw) -> dict:
+                   chat_score: float | None = None, question: str | None = None, pre: dict | None = None,
+                   **kw) -> dict:
     """For a live recording (streams with no VOD): wall-clock window. A sentinel draft passes the chat
     strength its detector measured live (`chat_score`) — a recording keeps no chat of its own."""
     from . import live as L
     from . import render as V
+    from . import facecam as FC
     login = json.load(open(os.path.join(rec_dir, "recording.json")))["login"]
-    problems = check_title(title)
+    problems = check_title(title) + check_question(question)
     if problems:
         raise SystemExit("PUBLISH REFUSED: " + "; ".join(problems))
     hit = already_clipped(login, start_ts, end_ts)
@@ -166,28 +198,87 @@ def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, lin
         raise SystemExit(f"PUBLISH REFUSED: this moment was already published as '{hit['slug']}'")
     os.makedirs(os.path.join(rec_dir, "renders"), exist_ok=True)
     out = os.path.join(rec_dir, "renders", f"{login}_{int(start_ts)}.mp4")
-    info = L.render_window(rec_dir, start_ts, end_ts, out, title, quote, watermark=V.WATERMARK, **kw)
+    if pre:                                     # pre-rendered draft: only the headline card is burned in
+        info = from_prerender(pre, out, start_ts, end_ts, title, quote)
+    else:
+        with FC.creator(login):                 # the facecam layout looks up this streamer's webcam
+            info = L.render_window(rec_dir, start_ts, end_ts, out, title, quote, watermark=V.WATERMARK, **kw)
     moment = dt.datetime.fromtimestamp((start_ts + end_ts) / 2, dt.timezone.utc)
     rep = {**info, "window": [start_ts, end_ts], "frames": V.frames(out, [1, (end_ts - start_ts) / 2, end_ts - start_ts - 1],
                                                                      os.path.join(rec_dir, "renders", "frames"))}
     tr = json.load(open(out.rsplit(".mp4", 1)[0] + ".transcript.json"))
-    words = [w for seg in tr.get("segments", []) for w in seg.get("words", [])
-             if start_ts <= w.get("start", 0) <= end_ts]
+    if kw.get("words"):                  # the draft's own words: wall-clock times and speaker tags
+        words = [w for w in kw["words"] if start_ts <= w["start"] < end_ts]
+    else:                                # caption cards are clip seconds: back to wall clock
+        words = [{**w, "start": w["start"] + start_ts, "end": w["end"] + start_ts}
+                 for seg in tr.get("segments", []) for w in seg.get("words", []) if w.get("start", 0) < end_ts - start_ts]
     sig = G.signals_from_live(rec_dir, login, start_ts, end_ts, words)
+    sig["words_all"] = words
     if chat_score is not None:
         sig["chat_score"] = chat_score
     return _finish(rep, login, login, start_ts, end_ts, moment, title, line, quote, slug, frames_checked, post, push,
-                   check_only, sig, rubric)
+                   check_only, sig, rubric, question)
+
+
+def from_prerender(pre: dict, out: str, start_ts: float, end_ts: float, title: str, quote: str | None) -> dict:
+    """Finish a pre-rendered draft: burn the card (and a trim) into it; its transcript follows the trim."""
+    import sys as _sys
+    from . import render as V
+    trim = max(0.0, start_ts - pre["start"])
+    dur = end_ts - start_ts
+    print(f"[render] pre-rendered draft: burning the headline card{f' (trim {trim:.1f} s)' if trim else ''}…",
+          file=_sys.stderr, flush=True)
+    V.burn_card(pre["mp4"], out, title, quote, pre.get("slot") or {}, trim_start=trim, dur=dur)
+    tr = json.load(open(pre["mp4"].rsplit(".mp4", 1)[0] + ".transcript.json"))
+    shift = lambda a, b: (round(a - trim, 2), round(b - trim, 2))
+    segs = []
+    for seg in tr.get("segments", []):
+        if seg["end"] - trim <= 0 or seg["start"] - trim >= dur:
+            continue
+        a, b = shift(seg["start"], seg["end"])
+        segs.append({**seg, "start": max(0.0, a), "end": min(dur, b),
+                     "words": [{**w, "start": max(0.0, w["start"] - trim), "end": min(dur, w["end"] - trim)}
+                               for w in seg.get("words", [])]})
+    bleeps = [[max(0.0, a - trim), min(dur, b - trim)] for a, b in tr.get("bleep_intervals", [])
+              if b - trim > 0 and a - trim < dur]
+    json.dump({"clip_start_vod_s": start_ts, "clip_end_vod_s": end_ts, "segments": segs, "bleep_intervals": bleeps},
+              open(out.rsplit(".mp4", 1)[0] + ".transcript.json", "w"), indent=2)
+    return {"out": out, "cards": len(segs), "bleeps": bleeps, "watermark": pre.get("watermark", True),
+            "layout": pre.get("layout"), "facecam": pre.get("facecam"), "title": title, "quote": quote,
+            "prerendered": True, "pre_audit": pre.get("audit"), "pre_vision": pre.get("vision")}
 
 
 def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_checked, post, push, check_only,
-            sig: dict | None = None, rubric: list[str] | None = None):
+            sig: dict | None = None, rubric: list[str] | None = None, question: str | None = None):
     # transcript-level screen on what is actually in the cut
     tr = json.load(open(rep["out"].rsplit(".mp4", 1)[0] + ".transcript.json"))
-    said = " ".join(seg["text"] for seg in tr["segments"])
+    # what is in OUR cut (card times are clip seconds): a --start trim drops the words before it
+    said = " ".join(seg["text"] for seg in tr["segments"] if 0 <= seg.get("start", 0) < (e - s))
     sf = SF.screen(said, headline=(title or "") + " " + (quote or ""))
     report = {"out": rep["out"], "frames": rep.get("frames"), "safety": sf, "moment_at": moment.isoformat(),
+              "layout": rep.get("layout"), **({"facecam_note": rep["facecam"]["note"]}
+                                                if (rep.get("facecam") or {}).get("note") else {}),
+              "caption": caption(line, login, question),
               "length_s": round(e - s, 1), "captions_preview": UT.quote(said, 400)}
+    # judge like an editor: the censor checked on the render itself, the headline checked against the moment
+    from . import censor as CN
+    if rep.get("prerendered") and (rep.get("pre_audit") or {}).get("ok"):
+        report["prerendered"] = True                 # audited when it was pre-rendered; the card adds no audio
+        if (rep.get("pre_audit") or {}).get("fixed"):
+            report["censor"] = "; ".join(rep["pre_audit"]["fixed"])
+    elif os.environ.get("CLIPENGINE_NO_AUDIT") != "1":
+        aud = CN.ensure_clean(rep["out"])
+        if aud.get("fixed"):
+            report["censor"] = "; ".join(aud["fixed"])
+        if not aud["ok"]:
+            raise SystemExit("PUBLISH REFUSED: the render still has an uncensored word "
+                             f"({', '.join(aud['captions'] + [w['w'] for w in aud['audio']])}) — re-run with --bleep WORD")
+    spoken = " ".join(w.get("w", "") for w in (sig or {}).get("words_all", [])) or said
+    missing = SF.headline_support(title, spoken, (sig or {}).get("titles"),
+                                  names=[login, creators().get(login.lower(), {}).get("name", "")])
+    if missing:
+        report["warnings"] = [f"headline words not in the transcript or viewer titles: {', '.join(missing[:5])} — "
+                              "make sure the cut SHOWS it (rules/headlines.md)"]
     if sf["flagged"]:
         report["status"] = "REFUSED — sexual content: " + sf["why"]
         print(json.dumps(report, indent=2))
@@ -196,7 +287,7 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
         raise SystemExit("PUBLISH REFUSED: no logo — copy assets/watermark.png into the repo (setup/setup.sh checks this)")
     # vision: cutscene / menu / loading screen, from the frames themselves
     from . import vision as VI
-    vis = VI.check(rep["out"])
+    vis = rep.get("pre_vision") or VI.check(rep["out"])      # a pre-render was checked when it was made
     report["vision"] = {k: vis[k] for k in ("cuts_per_min", "static", "dark", "flags")}
     sig = {**(sig or {}), "flags": list((sig or {}).get("flags") or []) + vis["flags"]}
     # banger score: engine signals now, operator rubric once the frames are checked
@@ -218,7 +309,9 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
     if rub is None:
         raise SystemExit("PUBLISH REFUSED: with --frames-checked, also pass --rubric with the checks that pass "
                          "(hook,context,payoff,share) — or --rubric none")
-    decision = GT.decide(final["score"], moment.timestamp(), login=login)
+    decision = GT.decide(final["score"], moment.timestamp(), login=login,
+                         clip={"title": title, "length_s": e - s, "layout": rep.get("layout") or "stack",
+                               "caption_style": "line+question" if (question or "").strip() else "line"})
     report["gate"] = {p: {**d, "at": None if d["at"] is None else
                           dt.datetime.fromtimestamp(d["at"], dt.timezone.utc).isoformat()} for p, d in decision.items()}
     platforms = [p for p, d in decision.items() if d["action"] in ("now", "scheduled")]
@@ -228,7 +321,7 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
         print(json.dumps(report, indent=2))
         return report
     slug = slug or _slugify(login, title)
-    description = f"{line.strip()} {hashtags(login)}"
+    description = caption(line, login, question)
     drop(rep["out"], slug, title, description, moment.isoformat(), post, push, check_only,
          platforms=platforms, schedule=schedule,
          grade={"score": final["score"], "tier": final["tier"], "engine": eng["score"], "rubric": rubric,
@@ -238,6 +331,9 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
                         "moment_at": moment.isoformat(), "title": title, "grade": final["score"],
                         "engine": eng["score"], "rubric": rubric, "platforms": platforms,
                         "explore": [p for p, d in decision.items() if d.get("explore")],
+                        "layout": rep.get("layout") or "stack",
+                        "caption_style": "line+question" if (question or "").strip() else "line",
+                        "parts": eng.get("parts"),
                         "at": dt.datetime.now(dt.timezone.utc).isoformat()}, push)
     report.update({"status": ("CHECKED (not dropped)" if check_only else ("DROPPED + POSTED" if post else "DROPPED"))
                    + f" — banger {final['score']} ({final['tier']}): {GT.summary(decision)}",

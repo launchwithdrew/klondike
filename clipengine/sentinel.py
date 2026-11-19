@@ -45,6 +45,7 @@ WINDOW_S = 10.0          # chat window judged at each step
 STEP_S = 5.0
 HISTORY_S = 1800.0       # the streamer's own baseline: last 30 minutes
 MIN_HISTORY = 24         # windows needed before judging (2 min)
+CROWD_DRAFT_MIN_VIEWS = 10  # a viewer clip with this many views is drafted even without a live spike
 REACTION_DELAY_S = 7.0   # chat reacts this long after the moment (stream delay + typing)
 PRE_ROLL_S = 22.0        # setup before the reaction
 POST_ROLL_S = 6.0
@@ -322,30 +323,28 @@ class _Silent:
         return 0
 
 
-def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_name: str = "small") -> None:
+def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_name: str | None = None,
+        record: bool = True) -> None:
     """`login`: a Twitch login, or a YouTube source ("yt:@handle" / URL) — YouTube is audio-only."""
     from . import live as L
+    from . import ops as O
+    model_name = model_name or O.whisper_model()          # the lite profile drafts with Whisper tiny
     source = login if L.is_youtube(login) else login.lower()
     youtube = L.is_youtube(source)
+    kick = source.startswith("kick:")
     login = L.source_name(source)
     os.makedirs(out, exist_ok=True)
     m = model()
-    def supervised_record():
-        # the stream can drop, go offline, or land on a host this machine can't reach: keep trying
-        delay = 15
-        while True:
-            try:
-                L.record(source, out, buffer_h * 3600)
-                delay = 15
-            except Exception as exc:
-                print(f"[sentinel] recorder stopped ({str(exc)[:100]}) — retrying in {delay}s", flush=True)
-            time.sleep(delay)
-            delay = min(300, delay * 2)
-
-    rec = threading.Thread(target=supervised_record, daemon=True)
-    rec.start()
-    if youtube:
-        chat, crowd = _Silent(), _Silent()
+    if record:      # record=False: `cycle`/`start` run the recorder as its own process, which outlives sentinel restarts
+        threading.Thread(target=L.record_supervised, args=(source, out, buffer_h * 3600), daemon=True).start()
+    if youtube:                                      # live chat when it can be read; audio-only otherwise
+        from . import youtube as YT
+        chat, crowd = YT.YouTubeChat(source), _Silent()
+        chat.start()
+    elif kick:                                       # Kick: its Pusher chat behind the same interface
+        from . import kick as K
+        chat, crowd = K.KickChat(source), _Silent()
+        chat.start()
     else:
         chat, crowd = Chat(login), Crowd(login)
         chat.start(); crowd.start()
@@ -353,6 +352,17 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
     past: list[dict] = []
     hdb: list[float] = []
     keep = int(HISTORY_S / STEP_S)
+    if not youtube and not kick:
+        try:
+            filled = warm_history(login, hist, keep)
+            if filled:
+                print(f"[sentinel] {login}: warm start — {filled * STEP_S / 60:.0f} min of chat history from the "
+                      "stream's replay", flush=True)
+        except Exception as exc:
+            print(f"[sentinel] {login}: no warm start ({str(exc)[:80]}) — building the baseline live", flush=True)
+    p_hist: collections.deque = collections.deque(maxlen=int(3600 / STEP_S))   # (t, p) for crowd drafts
+    drafted: list[tuple] = []
+    crowd_checked = 0.0
     audio_seen: dict[str, float] = {}
     cur, last_end, fired = None, 0.0, 0
     status_path = os.path.join(out, "sentinel.json")
@@ -377,11 +387,31 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
         raw = window_raw(chat.window(now - WINDOW_S, now))
         f = with_lags(features(raw, hist, audio_z, crowd.count(now - 120, now)), past)
         past = (past + [f])[-max(LAGS):]
-        if youtube:                                  # no chat: a sustained loudness surge decides
+        if youtube:                                  # a sustained loudness surge, and the chat model once chat is in
             p = 1 / (1 + math.exp(-(-4.0 + 1.6 * audio_z))) if len(hdb) > 30 else 0.0
+            if chat.connected and len(hist.get("users", [])) >= MIN_HISTORY and sum(hist.get("msgs", [])[-24:]) > 0:
+                p = max(p, prob(f, m))
         else:
             p = prob(f, m) if len(hist.get("users", [])) >= MIN_HISTORY else 0.0
         _push(hist, raw, keep)
+        p_hist.append((now, p))
+        # moments viewers already clipped while we were recording: draft them now, no live spike needed
+        if draft and not youtube and not kick and crowd.new and now - crowd_checked >= 60:
+            crowd_checked = now
+            try:
+                for cm in L.live_moments(out):
+                    w = (cm["start"] - 3, cm["end"] + 3)
+                    if cm["views"] < CROWD_DRAFT_MIN_VIEWS or _overlaps(w, drafted) or (cur and w[1] >= cur["fire"] - 60):
+                        continue
+                    drafted.append(w)
+                    pm = max([q for tq, q in p_hist if w[0] - 10 <= tq <= w[1] + REACTION_DELAY_S] or [0.0])
+                    moment = {"start": w[0], "stop": w[1], "p": round(max(pm, 0.5), 3), "fire": cm["end"],
+                              "crowd_end": cm["end"], "features": None, "crowd_new": cm["clips"], "chat": chat.window(w[0], w[1] + 20),
+                              "source": "viewer clips"}
+                    print(f"[sentinel] {login}: viewers clipped a moment ({cm['views']} views) — drafting it", flush=True)
+                    threading.Thread(target=_draft_safe, args=(out, login, moment, model_name), daemon=True).start()
+            except Exception as exc:
+                print(f"[sentinel] crowd draft check failed ({str(exc)[:80]})", flush=True)
         if cur is None:
             if p >= m["trigger"] and now - last_end >= COOLDOWN_S:
                 cur = {"fire": now, "peak": now, "p": p, "end": now, "chat": chat.window(now - 20, now),
@@ -396,17 +426,69 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
             if (p < m["release"] and now - cur["end"] >= 2 * STEP_S) or now - cur["fire"] >= MAX_LEN_S:
                 start = cur["fire"] - REACTION_DELAY_S - PRE_ROLL_S
                 stop = min(cur["end"] - REACTION_DELAY_S + POST_ROLL_S, start + MAX_LEN_S)
-                moment = {"start": start, "stop": stop, "p": round(cur["p"], 3), "fire": cur["fire"], "features": cur.get("features"),
+                moment = {"start": start, "stop": stop, "p": round(cur["p"], 3), "fire": cur["fire"], "peak": cur["peak"],
+                          "features": cur.get("features"),
                           "crowd_new": crowd.count(start, now + 60), "chat": cur["chat"]}
                 last_end, cur, fired = now, None, fired + 1
+                drafted.append((start, stop))
                 if draft:
                     threading.Thread(target=_draft_safe, args=(out, login, moment, model_name), daemon=True).start()
         if now - last_beat >= 30:
             last_beat = now
-            json.dump({"login": login, "pid": os.getpid(), "beat": now, "chat_connected": chat.connected,
+            json.dump({"login": login, "pid": os.getpid(), "beat": now,
+                       "chat_connected": bool(chat.connected or getattr(chat, "fallback", False)),
+                       "chat_mode": ("audio-only" if getattr(chat, "fallback", False) else "live chat") if youtube else "chat",
                        "chat_per_min": round(sum(hist.get("msgs", [])[-12:]) * (60 / (12 * WINDOW_S)), 1),
                        "recorded_min": round(len(L.load_index(out)) * 2 / 60, 1) if os.path.exists(os.path.join(out, "index.jsonl")) else 0,
-                       "moments": fired, "p": round(p, 3)}, open(status_path, "w"))
+                       "moments": fired, "p": round(p, 3), "rec": _rec_health(out)}, open(status_path, "w"))
+
+
+def _rec_health(out: str) -> dict | None:
+    """Recording since the last cycle: segments, MB, gaps > 3 s (with the last one's cause)."""
+    try:
+        from . import autopilot as AP
+        since = (json.load(open(os.path.join(REPO, "runs", ".cycle.json"))).get("cycle_at") or 0) \
+            if os.path.exists(os.path.join(REPO, "runs", ".cycle.json")) else 0
+        return AP.recorder_stats(out, since or time.time() - 600)
+    except Exception:
+        return None
+
+
+def warm_history(login: str, hist: dict, keep: int, minutes: float = 30.0) -> int:
+    """Fill the chat baseline from the last `minutes` of the stream's own replay (a streamer whose VOD is
+    being written while they're live), so a new sentinel judges spikes against real history from its first
+    minute instead of a noisy two-minute baseline. Returns how many windows it filled (0 = no replay)."""
+    from . import twitch as T
+    v = T.latest_vod(login)
+    if not v.get("live") or v.get("length_s", 0) < 300:
+        return 0
+    end = max(0.0, v["length_s"] - 30)                   # the replay lags the live edge a little
+    start = max(0.0, end - minutes * 60)
+    msgs = sorted(T.download_chat(v["id"], start, end), key=lambda m: m["t"])
+    if len(msgs) < 50:
+        return 0
+    n, i, j, t = 0, 0, 0, start + WINDOW_S
+    while t <= end:
+        while j < len(msgs) and msgs[j]["t"] < t:
+            j += 1
+        while i < j and msgs[i]["t"] < t - WINDOW_S:
+            i += 1
+        _push(hist, window_raw(msgs[i:j]), keep)
+        n += 1
+        t += STEP_S
+    return n
+
+
+def _overlaps(a: tuple, drafted: list, frac: float = 0.5) -> bool:
+    for b in drafted:
+        inter = min(a[1], b[1]) - max(a[0], b[0])
+        if inter > frac * min(a[1] - a[0], b[1] - b[0]):
+            return True
+    return False
+
+
+def draft_id(login: str, start: float) -> str:
+    return f"{login}-{dt.datetime.fromtimestamp(start, dt.timezone.utc):%H%M%S}"
 
 
 def _draft_safe(out, login, moment, model_name):
@@ -414,6 +496,69 @@ def _draft_safe(out, login, moment, model_name):
         draft_moment(out, login, moment, model_name)
     except Exception as exc:
         print(f"[sentinel] draft failed: {exc}", flush=True)
+        try:                                       # dropped, with its reason: the queue keeps a path back
+            log_dropped(out, login, moment, f"draft failed: {str(exc)[:120]}")
+        except Exception:
+            pass
+        try:
+            from . import attention as AT
+            at = dt.datetime.fromtimestamp(moment.get("fire") or time.time(), dt.timezone.utc)
+            AT.event("failure", f"{login}: a moment at {at:%H:%M:%S} UTC couldn't be drafted ({str(exc)[:90]})",
+                     key=f"draft:{login}:{int(moment.get('fire') or 0)}")
+        except Exception:
+            pass
+
+
+def log_dropped(out: str, login: str, moment: dict, reason: str, **extra) -> dict:
+    """A moment that won't be drafted still gets ONE queue line: status "dropped" and why."""
+    entry = {"id": draft_id(login, moment["start"]), "login": login, "rec": out, "start": round(moment["start"], 1),
+             "stop": round(moment["stop"], 1), "at": dt.datetime.fromtimestamp(moment.get("fire") or moment["start"],
+                                                                                dt.timezone.utc).isoformat(),
+             "p": moment.get("p"), "engine": 0, "best": 0, "flags": [], "unsafe": "", "chat": "", "said": "",
+             "sheet": None, "status": "dropped", "reason": reason, "via": moment.get("source", "live spike"), **extra}
+    with open(os.path.join(out, "queue.jsonl"), "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    print(f"[sentinel] dropped {entry['id']}: {reason}", flush=True)
+    return entry
+
+
+def draft_words(entry: dict, start: float, stop: float) -> list[dict] | None:
+    """The words the draft already transcribed, when they cover [start, stop] — so publishing doesn't
+    transcribe the same moment again (the slow part). None = transcribe as usual."""
+    try:
+        d = json.load(open(entry["words"]))
+    except (KeyError, OSError, ValueError, TypeError):
+        return None
+    if d.get("start", 1e18) > start + 0.5 or d.get("stop", -1) < stop - 0.5:
+        return None
+    return [w for w in d.get("words", []) if start - 3 <= w["start"] <= stop + 3]
+
+
+def game_spans(words: list[dict] | None) -> list[tuple[float, float]]:
+    """Stretches the game is talking (speaker tags): captions skip them — the game burns in its own
+    subtitles, and a character's line is not our streamer's. Audio (and bleeps) are untouched."""
+    out: list[tuple[float, float]] = []
+    for w in words or []:
+        if w.get("spk") == "game":
+            if out and w["start"] - out[-1][1] < 0.8:
+                out[-1] = (out[-1][0], w["end"] + 0.05)
+            else:
+                out.append((w["start"] - 0.05, w["end"] + 0.05))
+    return [(round(a, 2), round(b, 2)) for a, b in out]
+
+
+def check_trim(entry: dict, start: float, stop: float) -> str | None:
+    """A plain refusal when a trim would cut the moment itself (the payoff and 1 s of reaction)."""
+    pay = entry.get("payoff")
+    if pay is None:
+        return None
+    if start > pay - 1.0:
+        return (f"that --start cuts the payoff (it happens {pay - entry['start']:.1f} s into the draft) — "
+                f"use --start {max(0.0, pay - entry['start'] - 3):.0f} or less")
+    if stop < pay + 1.0:
+        return (f"that --end cuts the payoff (it happens {entry['stop'] - pay:.1f} s before the draft's end) — "
+                f"use --end {max(0.0, entry['stop'] - pay - 2):.0f} or less")
+    return None
 
 
 def chat_score_from_p(p: float) -> float:
@@ -421,57 +566,278 @@ def chat_score_from_p(p: float) -> float:
     return -6 * math.log(1 - min(0.99, max(0.0, float(p or 0))))
 
 
-def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", wait_s: float = 90) -> dict:
-    """Cut + check one moment from the recording and append ONE line to queue.jsonl."""
+# ---- the moment window: payoff first ------------------------------------------------------------
+
+SETUP_S = (3.0, 15.0)     # before the payoff, starting on a sentence boundary
+REACT_MAX_S = 8.0         # after it
+
+
+def estimate_payoff(moment: dict) -> float:
+    """Where the moment itself happened (stream time), before listening: viewers click right after the
+    moment (a viewer clip ends ~3 s after it); chat reacts REACTION_DELAY_S after it."""
+    if moment.get("crowd_end"):
+        return moment["crowd_end"] - 3.0
+    return (moment.get("fire") or moment["stop"]) - REACTION_DELAY_S
+
+
+def boundaries(words: list[dict], lo: float, hi: float, step: float = 0.25) -> list[tuple[float, float]]:
+    """(time, quality) for cut points in [lo, hi]: never inside a word. 1.0 = after a sentence end or
+    in silence (gap >= 0.7 s), 0.5 = a pause inside speech (>= 0.3 s), 0.1 = between words."""
+    out = []
+    ws = sorted(words, key=lambda w: w["start"])
+    t = lo
+    while t <= hi + 1e-6:
+        inside = any(w["start"] - 0.08 < t < w["end"] + 0.08 for w in ws)
+        if not inside:
+            prev = max((w for w in ws if w["end"] <= t), key=lambda w: w["end"], default=None)
+            nxt = min((w for w in ws if w["start"] >= t), key=lambda w: w["start"], default=None)
+            gap = (nxt["start"] if nxt else 1e9) - (prev["end"] if prev else -1e9)
+            q = 1.0 if gap >= 0.7 or (prev and prev["w"].strip().endswith((".", "?", "!"))) else \
+                0.5 if gap >= 0.3 else 0.1
+            out.append((round(t, 2), q))
+        t += step
+    return out
+
+
+def payoff_window(words: list[dict], payoff: float, lo: float, hi: float,
+                  target: tuple[float, float] | None = None) -> dict:
+    """Setup (3–15 s, from a sentence boundary) + payoff + reaction (<= 8 s, to a sentence boundary),
+    inside [lo, hi] (what is recorded), aiming at `target` length (grading "target_len", 15–35 s).
+    Never cuts a word; prefers sentence ends. Returns {start, stop, payoff, setup, react, clean}."""
+    from . import grade as G
+    tlo, thi = target or tuple(G.config().get("target_len", [15, 35]))
+    starts = boundaries(words, max(lo, payoff - SETUP_S[1]), max(lo, payoff - SETUP_S[0]))
+    stops = boundaries(words, min(hi, payoff + 1.0), min(hi, payoff + REACT_MAX_S))
+    clean = True
+    if not starts:                                       # one sentence runs through the whole setup range
+        starts = boundaries(words, max(lo, payoff - 25), max(lo, payoff - SETUP_S[0])) or \
+            [(max(lo, payoff - SETUP_S[1]), 0.0)]
+        clean = starts[0][1] > 0
+    if not stops:                                        # still talking 8 s later: finish the sentence (<= 14 s)
+        stops = boundaries(words, min(hi, payoff + REACT_MAX_S), min(hi, payoff + 14)) or \
+            [(min(hi, payoff + REACT_MAX_S), 0.0)]
+        clean = clean and stops[0][1] > 0
+    # the streamer's reaction: their words right after the payoff, up to the first real pause after +8 s
+    reacting = [w for w in words if payoff - 0.5 <= w["start"] <= payoff + 12 and w.get("spk", "streamer") != "game"]
+    if reacting and any(w["start"] <= payoff + REACT_MAX_S < w["end"] + 0.7 for w in reacting):
+        stops += [x for x in boundaries(words, payoff + REACT_MAX_S, min(hi, payoff + 12)) if x[1] >= 0.5]
+    best = None
+    for s, qs in starts:
+        for e, qe in stops:
+            L = e - s
+            fit = 0.0 if tlo <= L <= thi else -0.4 * (tlo - L if L < tlo else L - thi)
+            cover = (sum(1 for w in reacting if w["end"] <= e) / len(reacting)) if reacting else 0.0
+            score = 2 * qs + 2 * qe + fit - 0.05 * abs((payoff - s) - 8) + 3 * cover - 0.1 * max(0, e - payoff - REACT_MAX_S)
+            if best is None or score > best[0]:
+                best = (score, s, e, qs, qe)
+    _, s, e, qs, qe = best
+    return {"start": s, "stop": e, "payoff": round(payoff, 2), "setup": round(payoff - s, 1),
+            "react": round(e - payoff, 1), "clean": clean and qs >= 0.5 and qe >= 0.5}
+
+
+def covered(rec_dir: str, a: float, b: float, payoff: float) -> tuple[float, float] | None:
+    """The stretch of [a, b] around the payoff the recording really has (ad breaks / restarts leave
+    holes): None when the payoff itself is in a hole."""
+    from . import live as L
+    holes = [(g["t"], g["t"] + g["d"]) for g in L.gaps_in(rec_dir, a, b)]
+    idx = [r for r in L.load_index(rec_dir) if r["t"] + r["d"] > a and r["t"] < b]
+    prev = a
+    for r in idx:                                        # holes the index shows (no gap line written)
+        if r["t"] > prev + 3.0:
+            holes.append((prev, r["t"]))
+        prev = max(prev, r["t"] + r["d"])
+    if prev < b - 1.0:
+        holes.append((prev, b))
+    s, e = a, b
+    for h0, h1 in holes:
+        if h0 - 1.0 <= payoff <= h1 + 1.0:
+            return None
+        if h1 <= payoff:
+            s = max(s, h1)
+        else:
+            e = min(e, h0)
+    return (s, e)
+
+
+_GAME_CACHE: dict = {}
+
+
+def stream_game(login: str) -> str | None:
+    """The game the stream shows right now (Twitch category) — the live 'game at fire time'."""
+    hit = _GAME_CACHE.get(login)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    try:
+        from . import twitch as T
+        u = T.gql('query($l:String!){user(login:$l){stream{game{displayName}}}}', {"l": login}).get("user") or {}
+        g = ((u.get("stream") or {}).get("game") or {}).get("displayName")
+    except Exception:
+        g = None
+    _GAME_CACHE[login] = (time.time(), g)
+    return g
+
+
+def target_game() -> str:
+    try:
+        return json.load(open(os.path.join(REPO, "config", "radar.json"))).get("game") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+def wrong_game(game: str | None) -> str:
+    """'' when the moment is from the category we clip (or unknown); else the game it really is."""
+    want = target_game()
+    if not game or not want:
+        return ""
+    return "" if game.strip().lower() == want.strip().lower() else game
+
+
+def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", wait_s: float = 90,
+                 _recut: str | None = None) -> dict:
+    """Judge one moment like an editor and append ONE line to queue.jsonl:
+    find the payoff, cut setup + payoff + reaction on sentence boundaries, tag who is talking (streamer /
+    other / game), score from the streamer's speech and reactions, re-cut once if the cut is fixable,
+    and log a drop with its reason instead of losing it."""
     from . import audio as A
     from . import live as L
     from . import grade as G
     from . import safety as SF
+    from . import speaker as SPK
     from . import vision as VI
+    from . import gate as GT
     if not os.path.exists(os.path.join(out, "index.jsonl")):
         print(f"[sentinel] {login}: moment at {dt.datetime.fromtimestamp(moment['fire'], dt.timezone.utc):%H:%M:%S} "
               "UTC not drafted — nothing recorded yet (the recorder can't reach the stream; see its retries above)",
               flush=True)
-        return {}
+        return log_dropped(out, login, moment, "nothing recorded yet")
+    game = moment.get("game") or stream_game(login)
+    bad_game = wrong_game(game)
+    payoff = estimate_payoff(moment)
+    a, b = payoff - SETUP_S[1] - 10, payoff + REACT_MAX_S + 6
     t_wait = time.time() + wait_s
-    while time.time() < t_wait:                      # wait for the recording to cover the end
+    while time.time() < t_wait:                      # wait for the recording to cover the reaction
         idx = L.load_index(out)
-        if idx and idx[-1]["t"] + idx[-1]["d"] >= moment["stop"]:
+        if idx and idx[-1]["t"] + idx[-1]["d"] >= b:
             break
         time.sleep(3)
+    cov = covered(out, a, b, payoff)
+    if cov is None or cov[1] - cov[0] < 8:
+        return log_dropped(out, login, moment, "recording gap (ad break) over the moment", payoff=round(payoff, 1))
+    a, b = cov
     ddir = os.path.join(out, "drafts")
     os.makedirs(ddir, exist_ok=True)
-    mid = f"{login}-{dt.datetime.fromtimestamp(moment['start'], dt.timezone.utc):%H%M%S}"
+    mid = draft_id(login, moment["start"])
     src = os.path.join(ddir, mid + ".ts")
-    first = L.cut_source(out, moment["start"], moment["stop"], src)
+    first = L.cut_source(out, a, b, src)
     x = A.decode_pcm(src, 0, None)
     words = A.real_words(A.transcribe(x, model_name, offset=first))
-    words = [w for w in words if moment["start"] <= w["start"] <= moment["stop"]]
-    said = " ".join(w["w"].strip() for w in words)
+    words = [w for w in words if a <= w["start"] <= b]
+    # who is talking: the session's voice profile + what the screen shows (subtitles, cutscene editing)
+    tl = VI.timeline(src)
+    hint = VI.game_hint_fn(tl, first)
+    try:
+        prof = SPK.recording_profile(out)
+    except Exception as exc:
+        print(f"[sentinel] voice profile unavailable ({str(exc)[:80]})", flush=True)
+        prof = None
+    SPK.tag_words(words, x, first, prof, hint)
+    json.dump({"start": a, "stop": b, "model": model_name, "words": words},
+              open(os.path.join(ddir, mid + ".words.json"), "w"))            # publish reuses it: no second transcription
+    # the payoff: the streamer's reaction onset near where chat / viewers place the moment
+    re0 = A.reaction(x, first, words, payoff, before=8.0, after=4.0)
+    how = "viewer clip end" if moment.get("crowd_end") else "chat reaction − delay"
+    if re0["onset"] is not None and re0["score"] >= 0.25 and not moment.get("crowd_end"):
+        payoff, how = re0["onset"] - 0.5, "streamer reaction onset"
+    win = payoff_window(words, payoff, a, b)
+    recut = _recut
+    # hold & re-cut once: a dead first 2 s, or the payoff jammed against an edge
+    first_word = next((w["start"] for w in words if w["start"] >= win["start"]), None)
+    if not recut and first_word is not None and first_word - win["start"] > 2.0 and payoff - first_word >= SETUP_S[0]:
+        win = payoff_window(words, payoff, max(a, first_word - 0.4), b)
+        recut = "dead open → started on the first word"
+    if not recut and win["react"] < 2.0 and b < payoff + REACT_MAX_S:
+        recut = "payoff at the edge → waited for the reaction"
+        if True:
+            t_wait = time.time() + 45
+            while time.time() < t_wait:
+                idx = L.load_index(out)
+                if idx and idx[-1]["t"] + idx[-1]["d"] >= payoff + REACT_MAX_S + 2:
+                    break
+                time.sleep(3)
+            os.remove(src)
+            return draft_moment(out, login, {**moment, "game": game}, model_name, wait_s=0, _recut=recut)
+    s, e = win["start"], win["stop"]
+    in_win = [w for w in words if s <= w["start"] < e]
+    rx = A.reaction(x, first, in_win, payoff, before=2.0, after=min(REACT_MAX_S, e - payoff))
+    human = [w for w in in_win if w.get("spk", "streamer") != "game"]
+    said = " ".join(w["w"].strip() for w in human)
     chat_lines = [c["text"] for c in moment.get("chat", [])]
     sf = SF.screen(said, chat_lines=chat_lines)
-    vis = VI.check(src)
-    sig = G.signals_from_live(out, login, moment["start"], moment["stop"], words)
+    vis = VI.check(src, s - first, e - s)
+    sig = G.signals_from_live(out, login, s, e, in_win)
     sig["chat_score"] = chat_score_from_p(moment["p"])
     if moment.get("crowd_new"):                     # viewers already clipping it: strong early crowd signal
         sig["crowd_vpm"] = (sig.get("crowd_vpm") or 0) + 5 * moment["crowd_new"]
-    sig["flags"] = (sig.get("flags") or []) + vis["flags"]
+    sig["reaction"], sig["reaction_why"] = rx["score"], rx["why"]
+    misheard = A.misheard_names(in_win)
+    sig["flags"] = (sig.get("flags") or []) + vis["flags"] + \
+        ([f"recording from {game}, not {target_game()}"] if bad_game else []) + \
+        ([f"names? {', '.join(f'{h}→{r}' for h, r in misheard)}"] if misheard else []) + \
+        ([] if win["clean"] else ["cut mid-sentence (no pause near the payoff)"])
     sig["unsafe"] = sf["why"] if sf["flagged"] else ""
+    sig["wrong_game"] = bad_game
     eng = G.engine_score(sig)
     best = G.banger(eng["score"], None)["best_possible"]
     sheet = os.path.join(ddir, mid + ".jpg")
-    VI.contact_sheet(src, sheet)
+    VI.contact_sheet(src, sheet, start=s - first, dur=e - s)
     os.remove(src)
     top = collections.Counter(w for c in chat_lines for w in S.tokens(c) if len(w) > 1 or w in "💀😭").most_common(4)
-    entry = {"id": mid, "login": login, "rec": out, "start": round(moment["start"], 1), "stop": round(moment["stop"], 1),
+    after = [w for w in human if w.get("spk", "streamer") == "streamer" and w["start"] >= payoff - 1]
+    quote = " ".join(w["w"].strip() for w in after[:9])
+    floor = min(r["min_score"] for r in GT.config()["platforms"].values())
+    reason = ("wrong game: " + bad_game if bad_game else "unsafe: " + sig["unsafe"] if sig["unsafe"] else
+              f"best {best} under every platform's bar ({floor}): " + "; ".join(eng["why"][:2])
+              if best < floor else "")
+    spk = SPK.summary(in_win, prof)
+    entry = {"id": mid, "login": login, "rec": out, "start": round(s, 2), "stop": round(e, 2),
+             "payoff": round(payoff, 2), "payoff_how": how, "src": [round(a, 1), round(b, 1)],
              "at": dt.datetime.fromtimestamp(moment["fire"], dt.timezone.utc).isoformat(), "p": moment["p"],
-             "engine": eng["score"], "best": best, "flags": sig["flags"], "unsafe": sig["unsafe"],
-             "chat": " ".join(f"{w}×{n}" for w, n in top), "said": said[:140], "sheet": sheet, "status": "new",
-             "features": moment.get("features")}
+             "engine": eng["score"], "best": best, "parts": G.parts_line(eng, sig), "why": eng["why"],
+             "flags": sig["flags"], "unsafe": sig["unsafe"], "chat_unsafe": sf.get("chat_hits", []),
+             "chat": " ".join(f"{w}×{n}" for w, n in top), "said": said[:140], "quote_hint": quote[:60],
+             "speakers": {k: spk[k] for k in ("streamer_s", "other_s", "game_s", "game_share", "backend")},
+             "game": game, "sheet": sheet, "status": "dropped" if reason else "new", "reason": reason or None,
+             "recut": recut, "features": moment.get("features"), "via": moment.get("source", "live spike"),
+             "words": os.path.join(ddir, mid + ".words.json")}
     with open(os.path.join(out, "queue.jsonl"), "a") as fh:
         fh.write(json.dumps(entry) + "\n")
-    print(f"[sentinel] queued {mid}: engine {eng['score']} (best {best}) {sf['why'] or ''}", flush=True)
+    print(f"[sentinel] {'dropped' if reason else 'queued'} {mid}: {e - s:.0f}s, payoff +{payoff - s:.0f}s ({how}), "
+          f"engine {eng['score']} (best {best}) [{entry['parts']}] {reason or sf['why'] or ''}", flush=True)
+    if not reason and prerender_on():
+        _prerender_safe(entry)
     return entry
+
+
+def prerender_on() -> bool:
+    try:
+        from . import ops as O
+        return O.config().get("prerender", True) is not False
+    except Exception:
+        return True
+
+
+def _prerender_safe(entry: dict) -> None:
+    """The draft's final render (all but the headline card), so publishing it takes seconds."""
+    try:
+        from . import prerender as PR
+        if PR.eligible(entry):
+            m = PR.prerender(entry)
+            if m:
+                print(f"[sentinel] pre-rendered {entry['id']} in {m['secs']} s — publish-queued only burns the card",
+                      flush=True)
+    except Exception as exc:
+        print(f"[sentinel] pre-render of {entry['id']} failed ({str(exc)[:100]}) — publish renders it in full",
+              flush=True)
 
 
 # ---- operator commands --------------------------------------------------------------------------
@@ -495,6 +861,12 @@ def load_queue(root: str = os.path.join(REPO, "runs")) -> list[dict]:
     return rows
 
 
+def note(entry: dict, **extra) -> None:
+    """Add facts to a queued draft without changing its status (e.g. its pre-render)."""
+    with open(os.path.join(entry["rec"], "queue.jsonl"), "a") as fh:
+        fh.write(json.dumps({"id": entry["id"], **extra}) + "\n")
+
+
 def set_status(entry: dict, status: str, **extra) -> None:
     with open(os.path.join(entry["rec"], "queue.jsonl"), "a") as fh:
         fh.write(json.dumps({"id": entry["id"], "status": status, **extra}) + "\n")
@@ -514,11 +886,18 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
         rows.append({**r, "age_min": round(age_h * 60)})
     rows.sort(key=lambda r: -r.get("best", 0))
     for r in rows:
-        mark = f" ⛔{r['unsafe']}" if r.get("unsafe") else ""
-        print(f"{r['id']:<22} best {r.get('best', 0):>4.0f}  {r['age_min']:>3}m ago  chat: {UT.quote(r.get('chat', ''), 40):<42} "
-              f"said: {UT.quote(r.get('said', ''), 70)}{mark}")
-        print(f"{'':<22} sheet {os.path.relpath(r['sheet'], REPO) if r.get('sheet') else '-'}"
-              f"{'  flags: ' + ', '.join(r['flags']) if r.get('flags') else ''}")
+        mark = f" ⛔{UT.quote(r['unsafe'], 30)}" if r.get("unsafe") else \
+            f" ⚠chat: {UT.quote(', '.join(r['chat_unsafe'][:2]), 20)}" if r.get("chat_unsafe") else ""
+        if r.get("status") not in (None, "new"):
+            mark += f" [{r['status']}{': ' + UT.quote(r['reason'], 50) if r.get('reason') else ''}]"
+        print(f"{r['id']:<22} best {r.get('best', 0):>4.0f}  {r['age_min']:>3}m ago  chat: {UT.quote(r.get('chat', ''), 30):<32} "
+              f"said: {UT.quote(r.get('said', ''), 60)}{mark}")
+        work = r.get("parts") or ""
+        if r.get("payoff") is not None:
+            work = f"{r['stop'] - r['start']:.0f}s payoff +{r['payoff'] - r['start']:.0f}s · " + work
+        flags = ", ".join(r.get("flags") or [])
+        line2 = (f"{'':<22} {work}{' | ' + flags if flags else ''}")[:140]
+        print(f"{line2}  sheet {os.path.relpath(r['sheet'], REPO) if r.get('sheet') else '-'}")
     return rows
 
 
@@ -532,16 +911,28 @@ def health(root: str = os.path.join(REPO, "runs")) -> list[dict]:
         except (OSError, ValueError):
             continue
         age = time.time() - s.get("beat", 0)
-        alive = age < 120
-        out.append({**s, "alive": alive, "dir": os.path.dirname(sp)})
-        pidf = os.path.join(os.path.dirname(sp), "sentinel.pid")
+        d = os.path.dirname(sp)
+        pidf = os.path.join(d, "sentinel.pid")
+        try:
+            pid = int(open(pidf).read().split()[0])
+            os.kill(pid, 0)
+            running = True
+        except (OSError, ValueError, IndexError):
+            running = False
+        stopped = os.path.exists(os.path.join(d, "STOPPED"))
+        alive = age < 120 and running and not stopped       # a fresh heartbeat alone isn't proof: the pid must run
+        out.append({**s, "alive": alive, "stopped": stopped, "dir": d})
         just_started = os.path.exists(pidf) and time.time() - os.path.getmtime(pidf) < 120
-        if alive and not s.get("chat_connected") and just_started:
+        if stopped:
+            why = (open(os.path.join(d, "STOPPED")).read().strip() or "stopped")[:40]
+            print(f"stop  {s['login']:<16} {why} — not running (cycle starts it again when it's wanted)")
+        elif alive and not s.get("chat_connected") and just_started:
             print(f"start {s['login']:<16} connecting to chat — check again next cycle")
         elif not alive or not s.get("chat_connected"):
             print(f"DOWN  {s['login']:<16} last beat {age / 60:.0f} min ago — restart: "
                   f".venv/bin/python -m clipengine start --channel {s['login']}  (or just run `cycle`)")
         else:
-            print(f"ok    {s['login']:<16} chat {s.get('chat_per_min', 0):>6.0f}/min  recorded {s.get('recorded_min', 0):>5.0f} min  "
+            mode = " (audio only)" if s.get("chat_mode") == "audio-only" else ""
+            print(f"ok    {s['login']:<16} chat {s.get('chat_per_min', 0):>6.0f}/min{mode}  recorded {s.get('recorded_min', 0):>5.0f} min  "
                   f"moments {s.get('moments', 0)}")
     return out

@@ -75,16 +75,102 @@ def model(name: str):
     return _MODELS[name]
 
 
-def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0) -> dict:
+# ---- vocabulary: names Whisper should spell right ---------------------------------------------------
+GAME_TERMS = {   # by category (config/radar.json "game"); config/grading.json "vocabulary" can add more
+    "Grand Theft Auto VI": ["GTA 6", "Jason", "Lucia", "Leonida", "Vice City", "Grassrivers", "Port Gellhorn",
+                            "Ambrosia", "Mount Kalaga", "Leonida Keys", "Rockstar", "Cal Hampton", "Boobie Ike",
+                            "Dre'Quan", "Real Dimez", "Brian Heder", "Raul Bautista"],
+}
+SLANG = ["bro", "chat", "W", "L", "rizz", "aura", "gyatt", "ohio", "sigma", "glazing", "crashout",
+         "lock in", "no cap", "on God", "bussin", "deadass", "opps", "NPC", "speedrun", "goated"]
+
+
+def vocabulary() -> dict:
+    """{"names": roster display names, "game": game terms, "slang": [...]} — defaults in code."""
+    import json as _json
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    names, game, slang = [], [], list(SLANG)
+    try:
+        cr = _json.load(open(os.path.join(repo, "config", "creators.json"))).get("creators", {})
+        names = sorted({c.get("name") for c in cr.values() if c.get("name")})
+    except (OSError, ValueError):
+        pass
+    try:
+        cat = _json.load(open(os.path.join(repo, "config", "radar.json"))).get("game", "")
+    except (OSError, ValueError):
+        cat = ""
+    game = list(GAME_TERMS.get(cat, []))
+    try:
+        extra = _json.load(open(os.path.join(repo, "config", "grading.json"))).get("vocabulary") or {}
+        game += [x for x in extra.get("game_terms", []) if x not in game]
+        slang += [x for x in extra.get("slang", []) if x not in slang]
+        names += [x for x in extra.get("names", []) if x not in names]
+    except (OSError, ValueError):
+        pass
+    return {"names": names, "game": game, "slang": slang}
+
+
+def vocab_prompt(max_chars: int = 600) -> str:
+    """Whisper's initial prompt: spellings it should prefer (it biases, it does not force)."""
+    v = vocabulary()
+    text = ", ".join(v["game"] + v["names"] + v["slang"])
+    return text[:max_chars].rsplit(",", 1)[0] + "." if len(text) > max_chars else text + "."
+
+
+def misheard_names(words: list[dict], vocab: dict | None = None, cutoff: float = 0.72) -> list[tuple[str, str]]:
+    """Capitalised words in a transcript that look like a known name but aren't it: [("Lucy a", "Lucia")].
+    Shown on the draft so the operator can pass --fix "heard=>said"."""
+    import difflib
+    v = vocab or vocabulary()
+    known = [n for n in v["names"] + v["game"] if len(n) >= 4]
+    exact = {re.sub(r"[^a-z0-9 ]", "", n.lower()) for n in known}
+    toks = [w["w"].strip() for w in words]
+    out: list[tuple[str, str]] = []
+    for i, t in enumerate(toks):
+        core = re.sub(r"[^\w' ]", "", t)
+        if not core or not core[0].isupper() or len(core) < 3:
+            continue
+        if core.lower() in exact:
+            continue                                   # said right ("Lucia a new haircut")
+        nxt = re.sub(r"[^\w' ]", "", toks[i + 1]) if i + 1 < len(toks) else ""
+        if nxt and (t.endswith((".", "?", "!", ",")) or not (nxt[0].isupper() or len(nxt) <= 2)):
+            nxt = ""                                   # two-word names: "Vice Sitty", "Lucy a"
+        for span in ((core + " " + nxt) if nxt else "", core):
+            k = span.lower().strip()
+            if not k:
+                continue
+            if k in exact or (" " not in k and any(k in e.split() for e in exact)):
+                break
+            m = difflib.get_close_matches(k, list(exact), n=1, cutoff=0.85 if len(k) <= 5 else cutoff)
+            if m:
+                right = next(n for n in known if re.sub(r"[^a-z0-9 ]", "", n.lower()) == m[0])
+                if (span, right) not in out and span.lower() != right.lower():
+                    out.append((span, right))
+                break
+    return out[:4]
+
+
+def _prompt_echo(text: str, prompt: str) -> bool:
+    """Whisper sometimes reads its prompt back over music/silence: 4+ prompt terms in a row."""
+    terms = [t.strip().lower() for t in prompt.rstrip(".").split(",") if t.strip()]
+    low = text.lower()
+    return sum(1 for t in terms if len(t) > 3 and t in low) >= 4
+
+
+def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:
     """faster-whisper on a PCM array. Times are shifted by `offset` so they
     can be expressed in VOD seconds. Same JSON shape as v1 caption.py
     (segments[].words[].w/start/end) so caption_logic and HyperFrames keep
     working."""
+    if prompt == "":
+        prompt = vocab_prompt()
     segs, info = model(model_name).transcribe(
         x, language="en", word_timestamps=True, vad_filter=True,
-        condition_on_previous_text=False)
+        condition_on_previous_text=False, initial_prompt=prompt or None)
     out = []
     for s in segs:
+        if prompt and _prompt_echo(s.text, prompt):
+            continue
         words = [{"w": w.word, "start": round(w.start + offset, 2),
                   "end": round(w.end + offset, 2), "p": round(w.probability, 2)}
                  for w in (s.words or [])]
@@ -324,3 +410,44 @@ def assess(p: Probe, win: dict, peak_s: float | None = None) -> dict:
     if not hard and win["speech_s"] >= 20:
         factor = max(factor, 0.5)
     return {"audio_factor": round(factor, 3), "hard_fail": hard, "flags": flags}
+
+
+# --------------------------------------------------------------------------
+# Reactions: what the streamer DID when there is little to read
+# --------------------------------------------------------------------------
+_LAUGH = re.compile(r"\b(ha(ha)+|he(he)+|lol|lmao+|(laugh\w*))\b|\[laugh|\(laugh", re.I)
+
+
+def reaction(x: np.ndarray, t0: float, words: list[dict], at: float, before: float = 6.0,
+             after: float = 6.0) -> dict:
+    """{"score": 0–1, "why": "...", "onset": time | None} around `at` (stream time; x starts at t0):
+    a volume burst (loudest second vs the clip's median) and laughter in the streamer's words."""
+    sec = frame_db(x, 1.0)
+    vol, onset = 0.0, None
+    act = sec[sec > MUTE_DB]
+    if len(act) > 5:
+        med = float(np.median(act))
+        lo, hi = max(0, int(at - before - t0)), min(len(sec), int(at + after - t0))
+        if hi > lo:
+            j = lo + int(np.argmax(sec[lo:hi]))
+            jump = float(sec[j] - med)
+            vol = max(0.0, min(1.0, (jump - 4.0) / 8.0))
+            # onset: the first second of the burst (louder than the one before by 4 dB+)
+            k = j
+            while k > lo and sec[k - 1] > sec[j] - 4:
+                k -= 1
+            onset = t0 + k
+    near = [w for w in words if at - before <= w["start"] <= at + after and w.get("spk", "streamer") == "streamer"]
+    # loud is only the streamer's reaction when the streamer is the one making noise (a cutscene's
+    # gunshot or score is loud too): their voice within a second of the burst, when speakers are tagged
+    if vol and onset is not None and any("spk" in w for w in words) and \
+            not any(onset - 1.0 <= w["start"] <= onset + 2.0 for w in near):
+        vol = 0.0
+    n_laugh = sum(1 for w in near if _LAUGH.search(w["w"]))
+    laugh = 0.0 if not n_laugh else (1.0 if n_laugh >= 2 else 0.6)
+    why = []
+    if vol >= 0.25:
+        why.append(f"volume +{4 + vol * 8:.0f} dB")
+    if laugh:
+        why.append("laughing")
+    return {"score": round(max(vol, laugh), 2), "why": ", ".join(why), "onset": onset}

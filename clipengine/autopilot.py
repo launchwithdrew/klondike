@@ -1,0 +1,806 @@
+"""Reliability — never lose a moment to plumbing.
+
+  autopilot   a detached background loop that runs `cycle` every N minutes (config/ops.json
+              "autopilot_every_min", default 5) with no agent tokens. `--sessions`: only inside the
+              roster's usual stream hours (see schedule). Pid in runs/autopilot.pid, log in
+              runs/autopilot.log, state in runs/autopilot.json. It re-execs itself when the engine's code
+              changes (cycle pulls main), so it always runs the newest version.
+  schedule    each roster creator's usual go-live hours, learned from their recent broadcasts (Twitch
+              videos: createdAt + lengthSeconds) plus the live sessions cycle has seen itself, and the
+              next session window in local time.
+  catch-up    when a cycle runs after a gap (> 15 min since the last), the saved streams (VODs) of the
+              roster creators are scanned for the minutes nothing was running (chat replay + viewer clips,
+              the normal scan), and the best moments are added to the queue as drafts that
+              `publish-queued` publishes through the normal VOD path.
+  recorder    per-sentinel recording health (segments, bytes, holes > 3 s with their likely cause).
+  buffer      the default recording buffer sized from free disk (1–6 h; config/ops.json buffer_h wins).
+  policy      config/creators.json per creator "policy": "allowed" (default) | "pools" | "never".
+  backup      zip brand/, config/, data/, ledger.jsonl, local/patches; restore one.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import glob
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+
+from . import attention as AT
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNS = os.path.join(REPO, "runs")
+PID = os.path.join(RUNS, "autopilot.pid")
+LOG = os.path.join(RUNS, "autopilot.log")
+APSTATE = os.path.join(RUNS, "autopilot.json")
+SCHEDULE = os.path.join(RUNS, "schedule.json")
+CATCHUP_PID = os.path.join(RUNS, "catchup.pid")
+
+CATCHUP_GAP_S = 15 * 60          # a cycle after this long without one scans what was missed
+GAP_S = 3.0                      # a recording jump longer than this is a gap
+HOLE_ALERT_S = 10.0              # ... and longer than this goes to the attention line
+SESSION_SHARE = 0.25             # an hour of the day is "usual" when they were live in it on ≥ 25 % of days
+LEAD_MIN = 15                    # start this long before a usual session
+GB_PER_H = 2.5                   # what one sentinel's recording costs per hour (source quality)
+
+
+def _alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _read_pid(path: str) -> int | None:
+    try:
+        return int(open(path).read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _json(path: str, default=None):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+# ---- policy -----------------------------------------------------------------------------------------
+
+def policy(login: str, roster: dict | None = None) -> str:
+    """"allowed" (default), "pools" (clipping allowed through the creator's clip pool / program — treated as
+    allowed by the engine; the agent follows the pool's rules), or "never" (the creator does not allow
+    clipping: no sentinel, listed last in the radar, publish refuses)."""
+    if roster is None:
+        from .publish import creators
+        roster = creators()
+    p = str((roster.get((login or "").lower()) or {}).get("policy") or "allowed").lower()
+    return p if p in ("allowed", "pools", "never") else "allowed"
+
+
+def refuse_never(login: str, roster: dict | None = None) -> None:
+    if policy(login, roster) == "never":
+        raise SystemExit(f"PUBLISH REFUSED: {login} does not allow clipping (config/creators.json policy: never)")
+
+
+# ---- buffer by disk ---------------------------------------------------------------------------------
+
+def buffer_hours(cfg: dict, free_gb: float, explicit: float | None = None) -> float:
+    """Hours of recording each sentinel keeps: config/ops.json buffer_h when it is set there, otherwise
+    sized so max_sentinels recordings fit above min_free_gb — between 1 and 6 hours."""
+    if explicit is not None:
+        return float(explicit)
+    per = (free_gb - cfg.get("min_free_gb", 15)) / max(1, cfg.get("max_sentinels", 5))
+    top = float(cfg.get("buffer_max_h", 6.0))                   # the lite profile keeps a shorter buffer
+    return round(max(1.0, min(top, per / cfg.get("record_gb_per_h", GB_PER_H))), 1)
+
+
+def explicit_buffer() -> float | None:
+    """buffer_h only when the operator wrote it in config/ops.json (the built-in default doesn't count)."""
+    v = _json(os.path.join(REPO, "config", "ops.json")).get("buffer_h")
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def protected_windows(rec_dir: str) -> list[tuple[float, float]]:
+    """Wall-clock windows a queued draft (status new) still needs from this recording."""
+    latest: dict[str, dict] = {}
+    try:
+        for line in open(os.path.join(rec_dir, "queue.jsonl")):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            latest[r["id"]] = {**latest.get(r["id"], {}), **r}
+    except OSError:
+        return []
+    return [(r["start"] - 10, r["stop"] + 10) for r in latest.values()
+            if r.get("status") == "new" and "start" in r and "stop" in r and not r.get("scan")]
+
+
+def is_protected(t: float, d: float, windows: list[tuple[float, float]]) -> bool:
+    return any(t < b and t + d > a for a, b in windows)
+
+
+# ---- recorder health --------------------------------------------------------------------------------
+
+def gap_cause(fresh_start: bool, ads: int, reconnects: int, failed: int, prev_age_s: float = 0) -> str:
+    """The likely reason the recording jumped (pure: the recorder counts what happened since its last
+    saved segment)."""
+    if fresh_start:
+        return ("the stream was offline (or nothing was recording)" if prev_age_s > 1800 else
+                "the recorder was restarted (sentinel restart or crash)")
+    if ads:
+        return "Twitch ad break (the stream is replaced by ads for viewers too)"
+    if failed:
+        return "segment downloads failed (network to the video host)"
+    if reconnects:
+        return "the stream dropped and the recorder reconnected"
+    return "the stream's own timeline jumped (the streamer's connection)"
+
+
+def recorder_stats(rec_dir: str, since: float, now: float | None = None) -> dict:
+    """Segments, megabytes and gaps (> 3 s) recorded since `since` (the last cycle)."""
+    now = now or time.time()
+    segs = []
+    try:
+        for line in open(os.path.join(rec_dir, "index.jsonl")):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if "f" in r and r.get("t", 0) + r.get("d", 0) >= since:
+                segs.append(r)
+    except OSError:
+        pass
+    segs.sort(key=lambda r: r["t"])
+    size = 0
+    for r in segs:
+        try:
+            size += os.path.getsize(os.path.join(rec_dir, "segments", r["f"]))
+        except OSError:
+            pass
+    gaps = [g for g in _gaps(rec_dir) if g["t"] + g["len"] >= since]
+    return {"since": round(since), "segments": len(segs), "mb": round(size / 1e6, 1),
+            "gaps": len(gaps), "gap_s": round(sum(g["len"] for g in gaps), 1),
+            "last_gap": gaps[-1] if gaps else None,
+            "last_segment_age_s": round(now - (segs[-1]["t"] + segs[-1]["d"]), 1) if segs else None}
+
+
+def _gaps(rec_dir: str) -> list[dict]:
+    """The holes the recorder wrote into index.jsonl, as {"t", "len", "cause"}."""
+    out = []
+    try:
+        for line in open(os.path.join(rec_dir, "index.jsonl")):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if "gap" in r:
+                out.append({"t": r["t"], "len": r["d"], "cause": r["gap"]})
+    except OSError:
+        pass
+    return out
+
+
+def holes_since(rec_dir: str, since: float) -> list[dict]:
+    """Holes long enough to lose a moment (> 10 s), not counting ad breaks (unavoidable: the stream itself
+    shows ads), that started after `since`."""
+    return [g for g in _gaps(rec_dir) if g["t"] > since and g["len"] > HOLE_ALERT_S
+            and not str(g.get("cause", "")).startswith("Twitch ad break")]
+
+
+def _hm(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%H:%M:%S UTC")
+
+
+def show_sentinels() -> list[dict]:
+    """`clipengine sentinels`: the health lines (tier 2: full sentinels), plus one recording line each."""
+    from . import sentinel as SN
+    if any(os.path.isdir(d) for d in glob.glob(os.path.join(RUNS, "sentinel-*"))):
+        print("tier 2  full sentinels (recording + audio + viewer clips):")
+    rows = SN.health()
+    since = _json(os.path.join(RUNS, ".cycle.json")).get("cycle_at") or time.time() - 600
+    for s in rows:
+        st = recorder_stats(s["dir"], since)
+        g = st["last_gap"]
+        print(f"      {s.get('login', '?'):<16} recording since last cycle: {st['segments']} segments, {st['mb']:.0f} MB, "
+              f"{st['gaps']} gap(s)" + (f" ({st['gap_s']:.0f} s)" if st['gaps'] else "")
+              + (f" — last {g['len']:.0f} s at {_hm(g['t'])}: {g.get('cause', '?')}" if g else ""))
+    return rows
+
+
+# ---- schedule ---------------------------------------------------------------------------------------
+
+_VIDEOS = """query($login: String!) { user(login: $login) { stream { createdAt }
+  videos(first: 30, type: ARCHIVE, sort: TIME) { edges { node { createdAt lengthSeconds } } } } }"""
+
+
+def _epoch(iso: str) -> float:
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def usual_hours(sessions: list[tuple[float, float]], tz=None, now: float | None = None,
+                share: float = SESSION_SHARE) -> dict:
+    """From past sessions [(start, end) epoch], the hours of the local day they are usually live
+    (pure). Returns {"days": n, "sessions": k, "share": {hour: fraction of days}, "windows": [[h0, h1, f]]}
+    — a window runs from hour h0 to h1 (exclusive, may wrap past midnight), f = its average share."""
+    now = now or time.time()
+    tz = tz or dt.datetime.now().astimezone().tzinfo
+    if not sessions:
+        return {"days": 0, "sessions": 0, "share": {}, "windows": []}
+    first = min(s for s, _ in sessions)
+    days = max(1, min(30, round((now - first) / 86400 + 0.5)))
+    hits: dict[int, set] = {h: set() for h in range(24)}
+    for s, e in sessions:
+        t = s - s % 3600
+        while t < e:
+            if t + 3600 > s:
+                d = dt.datetime.fromtimestamp(t, tz)
+                hits[d.hour].add(d.date())
+            t += 3600
+    sh = {h: min(1.0, len(v) / days) for h, v in hits.items()}
+    on = [h for h in range(24) if sh[h] >= share]
+    windows: list[list] = []
+    if on and len(on) == 24:
+        windows = [[0, 24, round(sum(sh.values()) / 24, 2)]]
+    elif on:
+        start = next(h for h in on if (h - 1) % 24 not in on)
+        h, run = start, []
+        for _ in range(24):
+            if h in on:
+                run.append(h)
+            elif run:
+                windows.append([run[0], (run[-1] + 1) % 24 or 24, round(sum(sh[x] for x in run) / len(run), 2)])
+                run = []
+            h = (h + 1) % 24
+        if run:
+            windows.append([run[0], (run[-1] + 1) % 24 or 24, round(sum(sh[x] for x in run) / len(run), 2)])
+    return {"days": days, "sessions": len(sessions), "share": {h: round(v, 2) for h, v in sh.items() if v},
+            "windows": windows}
+
+
+def _in_window(hour_f: float, w: list) -> bool:
+    a, b = w[0], w[1]
+    return a <= hour_f < b if a < b else (hour_f >= a or hour_f < b)
+
+
+def next_start(w: list, now: float, tz=None) -> float:
+    """Epoch of the next time window w starts (now, if we're inside it)."""
+    tz = tz or dt.datetime.now().astimezone().tzinfo
+    d = dt.datetime.fromtimestamp(now, tz)
+    if _in_window(d.hour + d.minute / 60, w):
+        return now
+    cand = d.replace(hour=w[0] % 24, minute=0, second=0, microsecond=0)
+    if cand.timestamp() <= now:
+        cand += dt.timedelta(days=1)
+    return cand.timestamp()
+
+
+def in_session(sched: dict, now: float | None = None, tz=None, lead_min: float = LEAD_MIN,
+               tail_min: float = 30) -> bool:
+    """Inside any roster creator's usual hours (from `lead_min` before to `tail_min` after). With nothing
+    learned yet, always True: unknown hours must never mean "don't run"."""
+    now = now or time.time()
+    tz = tz or dt.datetime.now().astimezone().tzinfo
+    windows = [w for c in (sched.get("creators") or {}).values() for w in c.get("windows", [])]
+    if not windows:
+        return True
+    for off in (0, lead_min * 60, -tail_min * 60):
+        d = dt.datetime.fromtimestamp(now + off, tz)
+        if any(_in_window(d.hour + d.minute / 60, w) for w in windows):
+            return True
+    return False
+
+
+def learn_schedule(now: float | None = None, write: bool = True) -> dict:
+    from . import twitch as T
+    from .publish import creators
+    now = now or time.time()
+    roster = creators()
+    seen = _json(os.path.join(RUNS, ".cycle.json")).get("seen_live") or {}
+    out = {"at": now, "creators": {}}
+    for login, c in roster.items():
+        if policy(login, roster) == "never" or login.startswith("yt"):
+            continue
+        sessions = []
+        try:
+            u = T.gql(_VIDEOS, {"login": login}).get("user") or {}
+            for e in ((u.get("videos") or {}).get("edges") or []):
+                n = e["node"]
+                s = _epoch(n["createdAt"])
+                if now - s < 30 * 86400:
+                    sessions.append((s, s + float(n.get("lengthSeconds") or 0)))
+            if u.get("stream") and u["stream"].get("createdAt") and not sessions:
+                sessions.append((_epoch(u["stream"]["createdAt"]), now))
+        except Exception as exc:
+            out["creators"][login] = {"error": str(exc)[:80], "windows": []}
+            continue
+        for s, e in seen.get(login, []):              # sessions cycle saw itself (live-only creators)
+            if not any(a - 600 <= s <= b for a, b in sessions):
+                sessions.append((s, e))
+        out["creators"][login] = {"name": c.get("name", login), **usual_hours(sessions, now=now)}
+    if write:
+        os.makedirs(RUNS, exist_ok=True)
+        json.dump(out, open(SCHEDULE, "w"), indent=1)
+    return out
+
+
+def load_schedule(max_age_h: float = 12) -> dict:
+    s = _json(SCHEDULE)
+    if s and time.time() - s.get("at", 0) < max_age_h * 3600:
+        return s
+    try:
+        return learn_schedule()
+    except Exception:
+        return s or {}
+
+
+def show_schedule(refresh: bool = True) -> dict:
+    s = learn_schedule() if refresh else load_schedule()
+    now = time.time()
+    tz = dt.datetime.now().astimezone().tzinfo
+    rows = []
+    for login, c in (s.get("creators") or {}).items():
+        if c.get("error"):
+            rows.append((1e18, f"{login:<16} couldn't read their broadcasts ({c['error']})"))
+            continue
+        if not c.get("windows"):
+            rows.append((1e18 - 1, f"{login:<16} no usual hours yet ({c.get('sessions', 0)} broadcasts in "
+                                    f"{c.get('days', 0)} days)"))
+            continue
+        nxt = min(c["windows"], key=lambda w: next_start(w, now, tz))
+        at = next_start(nxt, now, tz)
+        hours = ", ".join(f"{w[0]:02d}:00–{w[1] % 24:02d}:00 ({w[2] * 100:.0f}% of days)" for w in c["windows"])
+        when = "NOW (usual hours)" if at <= now else \
+            f"next {dt.datetime.fromtimestamp(at, tz):%a %H:%M} — start by {dt.datetime.fromtimestamp(at - LEAD_MIN * 60, tz):%H:%M}"
+        rows.append((at, f"{login:<16} usually live {hours} · {when}"))
+    tzname = dt.datetime.now().astimezone().strftime("%Z")
+    print(f"SCHEDULE (local time, {tzname}) — learned from the last 30 days of broadcasts")
+    for _, r in sorted(rows):
+        print("  " + r)
+    if not rows:
+        print("  no roster creators (config/creators.json)")
+    print("  autopilot only inside these hours: clipengine autopilot start --sessions")
+    return s
+
+
+# ---- catch-up ---------------------------------------------------------------------------------------
+
+def catchup_targets(roster: dict, sentinel_cover: dict | None = None) -> list[str]:
+    """Roster creators whose saved streams can be scanned (VODs on, clipping allowed)."""
+    return [l for l, c in roster.items() if c.get("vods") is not False and policy(l, roster) != "never"
+            and not l.startswith("yt")]
+
+
+def maybe_catchup(state: dict, now: float, cfg: dict) -> str | None:
+    """cycle: after a gap, start a background catch-up scan of the missed window (one line, or None)."""
+    last = state.get("cycle_at")
+    if not last or now - last <= cfg.get("catchup_gap_min", CATCHUP_GAP_S / 60) * 60:
+        return None
+    if _alive(_read_pid(CATCHUP_PID)):
+        return "catch-up: still scanning the last gap"
+    from .ops import _detach
+    since = max(last, now - cfg.get("catchup_max_h", 6) * 3600)
+    pid = _detach([sys.executable, "-m", "clipengine", "catchup", "--since", str(int(since - 120)),
+                   "--until", str(int(now))], os.path.join(RUNS, "catchup.log"))
+    os.makedirs(RUNS, exist_ok=True)
+    open(CATCHUP_PID, "w").write(str(pid))
+    return (f"catch-up: nothing ran for {(now - last) / 60:.0f} min — scanning the saved streams of that time "
+            "in the background; moments land in the queue")
+
+
+def vods_overlapping(login: str, since: float, until: float) -> list[dict]:
+    from . import twitch as T
+    u = T.gql(T._CHANNEL_VIDEOS, {"login": login}).get("user") or {}
+    out = []
+    for e in ((u.get("videos") or {}).get("edges") or []):
+        n = e["node"]
+        s = _epoch(n["createdAt"])
+        e_ = s + float(n.get("lengthSeconds") or 0)
+        if e_ > since and s < until:
+            out.append({"id": n["id"], "created": s, "length_s": float(n.get("lengthSeconds") or 0),
+                        "a": max(0.0, since - s), "b": min(e_, until) - s})
+    return out
+
+
+def _queue_rows(root: str = RUNS) -> list[dict]:
+    from .sentinel import load_queue
+    try:
+        return load_queue(root)
+    except Exception:
+        return []
+
+
+def _overlaps_any(login: str, s: float, e: float, rows: list[dict]) -> bool:
+    for r in rows:
+        if r.get("login") == login and "start" in r and "stop" in r:
+            inter = min(e, r["stop"]) - max(s, r["start"])
+            if inter > 0.5 * min(e - s, r["stop"] - r["start"]):
+                return True
+    return False
+
+
+def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, now: float | None = None) -> dict | None:
+    """A probed scan candidate as a queue line `publish-queued` can publish (pure but for the grade config)."""
+    from . import grade as G
+    if not c.get("probed") or c.get("hard_fail"):
+        return None
+    created = _epoch(vod["created_at"])
+    w = c.get("window") or {"start_s": c["clip_start_s"], "end_s": c["clip_end_s"]}
+    sig = G.signals_from_candidate(c, vod, dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc))
+    eng = G.engine_score(sig)
+    best = G.banger(eng["score"], None)["best_possible"]
+    s, e = created + w["start_s"], created + w["end_s"]
+    crowd = c.get("crowd") or {}
+    return {"id": f"{login}-v{dt.datetime.fromtimestamp(s, dt.timezone.utc):%H%M%S}", "login": login,
+            "rec": os.path.dirname(scan_dir), "start": round(s, 1), "stop": round(e, 1),
+            "at": dt.datetime.fromtimestamp(created + c["peak_s"], dt.timezone.utc).isoformat(), "p": None,
+            "engine": eng["score"], "best": best, "flags": c.get("flags") or [], "unsafe": sig.get("unsafe") or "",
+            "chat": c.get("top_text", "") or (f"🔥 {crowd.get('views')} viewer-clip views" if crowd else ""),
+            "said": (c.get("transcript_text") or "")[:140], "sheet": None, "status": "new",
+            "via": "catch-up (saved stream)" + (" 🔥" if crowd else ""),
+            "scan": scan_dir, "pick": c["rank"], "vod": vod["id"],
+            "vod_start": w["start_s"], "vod_stop": w["end_s"], "thumbs": c.get("thumbs") or []}
+
+
+def _sheet(thumbs: list[str], out: str) -> str | None:
+    """Join the scan's thumbnails into one contact sheet (what `queue` points the agent at)."""
+    try:
+        from PIL import Image
+        import base64
+        import io
+        ims = []
+        for t in thumbs:                              # the scan keeps thumbnails as data: URIs
+            if t and t.startswith("data:image"):
+                ims.append(Image.open(io.BytesIO(base64.b64decode(t.split(",", 1)[1]))).convert("RGB"))
+            elif t and os.path.isfile(t):
+                ims.append(Image.open(t).convert("RGB"))
+        if not ims:
+            return None
+        h = 270
+        ims = [im.resize((max(1, int(im.width * h / im.height)), h)) for im in ims]
+        sheet = Image.new("RGB", (sum(i.width for i in ims), h))
+        x = 0
+        for im in ims:
+            sheet.paste(im, (x, 0))
+            x += im.width
+        sheet.save(out, quality=85)
+        return out
+    except Exception:
+        return None
+
+
+def catchup(since: float, until: float, logins: list[str] | None = None, keep: int = 3, probe: int = 6,
+            via: str | None = None) -> list[dict]:
+    """Scan the saved streams of [since, until] and queue the best moments. Returns the queued entries."""
+    from . import pipeline as P
+    from .publish import creators
+    roster = creators()
+    targets = logins or catchup_targets(roster)
+    queued = []
+    print(f"[catchup] {_hm(since)} → {_hm(until)}: {', '.join(targets) or 'no roster creators'}", flush=True)
+    for login in targets:
+        try:
+            vods = vods_overlapping(login, since, until)
+        except Exception as exc:
+            AT.event("failure", f"catch-up couldn't list {login}'s broadcasts ({str(exc)[:60]})",
+                     key=f"catchup:{login}:{int(since)}")
+            continue
+        for v in vods:
+            if v["b"] - v["a"] < 60:
+                continue
+            d = os.path.join(RUNS, f"catchup-{login}")
+            scan_dir = os.path.join(d, f"scan-{v['id']}-{int(v['a'])}")
+            try:
+                res = P.scan(v["id"], scan_dir, v["a"], v["b"], top=12, probe=probe)
+            except Exception as exc:
+                msg = str(exc)
+                if "no chat" not in msg:
+                    AT.event("failure", f"catch-up scan of {login} failed ({msg[:60]})", key=f"catchup:{login}:{v['id']}")
+                print(f"[catchup] {login} {v['id']}: {msg[:100]}", flush=True)
+                continue
+            rows = _queue_rows()
+            entries = []
+            for c in res["candidates"]:
+                q = queue_entry_from_candidate(c, res["vod"], scan_dir, login)
+                if q and not q["unsafe"] and not _overlaps_any(login, q["start"], q["stop"], rows + entries):
+                    entries.append(q)
+            entries.sort(key=lambda q: -q["best"])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "queue.jsonl"), "a") as fh:
+                for q in entries[:keep]:
+                    if via:
+                        q["via"] = via + (" 🔥" if q["via"].endswith("🔥") else "")
+                    q["sheet"] = _sheet(q.pop("thumbs"), os.path.join(scan_dir, f"sheet-{q['pick']}.jpg"))
+                    fh.write(json.dumps(q) + "\n")
+                    queued.append(q)
+                    print(f"[catchup] queued {q['id']}: best {q['best']} {q['via']}", flush=True)
+    print(f"[catchup] done: {len(queued)} moment(s) queued", flush=True)
+    return queued
+
+
+# ---- the sweep: every 30 min, what the watchers missed ------------------------------------------------
+
+SWEEP_EVERY_MIN = 30
+SWEEP_LAG_S = 5 * 60              # the VOD's chat replay trails live by a few minutes
+
+
+def maybe_sweep(state: dict, now: float, cfg: dict) -> str | None:
+    """cycle: every `sweep_every_min` (30), scan the roster's recent saved streams in the background —
+    chat + viewer clips only, no download — for moments the watchers missed. Off with "sweep": false."""
+    if cfg.get("sweep") is False:
+        return None
+    every = float(cfg.get("sweep_every_min", SWEEP_EVERY_MIN)) * 60
+    if now - state.get("sweep_at", 0) < every:
+        return None
+    if _alive(_read_pid(CATCHUP_PID)):
+        return None                                   # one catch-up at a time: next cycle
+    if not state.get("any_live", True) and state.get("sweep_until"):
+        since_live = max((s[1] for v in (state.get("seen_live") or {}).values() for s in v), default=0)
+        if since_live < state["sweep_until"]:
+            state["sweep_at"] = now                   # nobody streamed since the last sweep
+            return None
+    from .ops import _detach
+    until = now - SWEEP_LAG_S
+    since = max(state.get("sweep_until") or until - every - 600, until - 3 * 3600)
+    if until - since < 120:
+        return None
+    pid = _detach([sys.executable, "-m", "clipengine", "catchup", "--sweep", "--since", str(int(since)),
+                   "--until", str(int(until))], os.path.join(RUNS, "catchup.log"))
+    os.makedirs(RUNS, exist_ok=True)
+    open(CATCHUP_PID, "w").write(str(pid))
+    state["sweep_at"], state["sweep_until"] = now, until
+    return None                                       # silent: what it finds lands in the queue
+
+
+def light_moments(msgs: list[dict], crowd: list[dict], length: float = 62.0) -> list[dict]:
+    """Moments in a VOD stretch from chat + viewer clips alone (pure): [{peak_s, start_s, end_s,
+    chat_score, crowd}] — no audio, no video."""
+    from . import rank as R
+    cands, rows = R.find_candidates(msgs, top=12, length=length) if msgs else ([], [])
+    out = [{"peak_s": c["peak_s"], "start_s": c["clip_start_s"], "end_s": c["clip_end_s"],
+            "chat_score": c["chat_score"], "crowd": None} for c in cands]
+    for m in crowd:
+        hit = next((c for c in out if m["start"] - 20 <= c["peak_s"] <= m["end"] + 30), None)
+        if hit:
+            hit["crowd"] = m
+            continue
+        peak = m["end"] - 3
+        out.append({"peak_s": peak, "start_s": max(0.0, peak - 30), "end_s": peak + 32, "chat_score": 0.0, "crowd": m})
+    return out
+
+
+def sweep_pick(cands: list[dict], vod_id: str, created: float, login: str, rows: list[dict], cfg: dict,
+               clipped=None) -> list[dict]:
+    """The strong ones not drafted or published yet, strongest first (pure but for `clipped`)."""
+    from .publish import already_clipped
+    clipped = clipped or already_clipped
+    min_views = float(cfg.get("sweep_min_views", 25))
+    min_chat = float(cfg.get("sweep_min_chat", 6.0))
+    out = []
+    for c in cands:
+        views = (c.get("crowd") or {}).get("views", 0)
+        if views < min_views and c["chat_score"] < min_chat:
+            continue
+        ws, we = created + c["start_s"], created + c["end_s"]
+        if _overlaps_any(login, ws, we, rows) or clipped(vod_id, c["start_s"], c["end_s"]) or clipped(login, ws, we):
+            continue
+        out.append({**c, "wall": [ws, we], "strength": c["chat_score"] + (6.0 * math.log10(1 + views))})
+    out.sort(key=lambda c: -c["strength"])
+    return out[: int(cfg.get("sweep_keep", 2))]
+
+
+def sweep(since: float, until: float, logins: list[str] | None = None) -> list[dict]:
+    """Scan the roster's saved streams of [since, until] cheaply (chat + viewer clips) and queue the strong
+    moments nobody drafted, through the catch-up path. Returns the queued entries."""
+    from . import twitch as T
+    from .ops import config
+    from .publish import creators
+    cfg = config()
+    roster = creators()
+    targets = logins or catchup_targets(roster)
+    queued = []
+    print(f"[sweep] {_hm(since)} → {_hm(until)}: {len(targets)} creator(s)", flush=True)
+    for login in targets:
+        try:
+            vods = vods_overlapping(login, since, until)
+        except Exception as exc:
+            print(f"[sweep] {login}: couldn't list broadcasts ({str(exc)[:80]})", flush=True)
+            continue
+        for v in vods:
+            if v["b"] - v["a"] < 60:
+                continue
+            try:
+                vod = T.Vod.fetch(v["id"])
+                msgs = T.download_chat(v["id"], v["a"], v["b"])
+                try:
+                    crowd = T.crowd_moments(vod, v["a"], v["b"])
+                except Exception:
+                    crowd = []
+            except Exception as exc:
+                print(f"[sweep] {login} {v['id']}: {str(exc)[:100]}", flush=True)
+                continue
+            picks = sweep_pick(light_moments(msgs, crowd), v["id"], v["created"], login, _queue_rows(), cfg)
+            print(f"[sweep] {login} {v['id']}: {len(msgs)} messages, {len(crowd)} viewer-clipped moment(s) → "
+                  f"{len(picks)} strong and new", flush=True)
+            for c in picks:
+                queued += catchup(c["wall"][0] - 30, c["wall"][1] + 30, [login], keep=1, probe=2,
+                                  via="catch-up (sweep)")
+    print(f"[sweep] done: {len(queued)} moment(s) queued", flush=True)
+    return queued
+
+
+def catchup_spikes(spikes: list[dict], pad_before: float = 60.0, pad_after: float = 60.0) -> list[dict]:
+    """Tier-1 chat spikes no sentinel covered: draft each from the saved stream, the best moment in its window."""
+    out = []
+    for sp in spikes:
+        print(f"[catchup] tier-1 spike on {sp['login']} at {_hm(sp['fire'])} (p {sp.get('p', 0):.2f})", flush=True)
+        out += catchup(sp["start"] - pad_before, sp["stop"] + pad_after, [sp["login"]], keep=1, probe=3,
+                       via="catch-up (tier-1 chat spike)")
+    return out
+
+
+def publish_window_args(entry: dict, trim_start: float | None, trim_end: float | None) -> dict:
+    """publish-queued for a catch-up (VOD) draft: the scan + pick, with the trims as VOD times (pure)."""
+    a = entry["vod_start"] + (trim_start or 0)
+    b = entry["vod_stop"] - (trim_end or 0)
+    kw = {"scan_dir": entry["scan"], "pick": entry["pick"]}
+    if trim_start or trim_end:
+        kw.update(start=a, end=b)
+    return kw
+
+
+# ---- autopilot --------------------------------------------------------------------------------------
+
+def _code_stamp() -> float:
+    return max((os.path.getmtime(f) for f in glob.glob(os.path.join(REPO, "clipengine", "*.py"))), default=0)
+
+
+def autopilot_status() -> dict:
+    st = _json(APSTATE)
+    pid = _read_pid(PID)
+    st["running"] = _alive(pid)
+    st["pid"] = pid
+    return st
+
+
+def autopilot_start(every_min: float | None = None, sessions: bool = False) -> str:
+    from .ops import config, _detach
+    st = autopilot_status()
+    if st["running"]:
+        return f"autopilot already running (pid {st['pid']}) — `clipengine autopilot stop` first to change it"
+    every = float(every_min or config().get("autopilot_every_min", 5))
+    cmd = [sys.executable, "-m", "clipengine", "autopilot", "run", "--every", str(every)] + (["--sessions"] if sessions else [])
+    pid = _detach(cmd, LOG)
+    os.makedirs(RUNS, exist_ok=True)
+    open(PID, "w").write(str(pid))
+    return (f"autopilot started (pid {pid}): cycle every {every:g} min"
+            + (" inside the usual stream hours (clipengine schedule)" if sessions else "")
+            + f" — log {os.path.relpath(LOG, REPO)}; `clipengine attention` says what needs you")
+
+
+def autopilot_stop() -> str:
+    pid = _read_pid(PID)
+    if not _alive(pid):
+        return "autopilot was not running"
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(40):
+        if not _alive(pid):
+            break
+        time.sleep(0.25)
+    try:
+        os.remove(PID)
+    except OSError:
+        pass
+    return "autopilot stopped (sentinels keep running; `clipengine stop --all` stops them too)"
+
+
+def autopilot_status_line() -> str:
+    st = autopilot_status()
+    if not st["running"]:
+        return "autopilot: not running — start it: clipengine autopilot start"
+    last = st.get("last_cycle_at")
+    ago = f"last cycle {(time.time() - last) / 60:.0f} min ago (exit {st.get('last_rc')})" if last else "no cycle yet"
+    mode = " · stream hours only" if st.get("sessions") else ""
+    idle = " · waiting for stream hours" if st.get("idle") else ""
+    return f"autopilot: running (pid {st['pid']}) every {st.get('every', '?'):g} min{mode} · {ago}{idle}"
+
+
+def _write_ap(**kw) -> None:
+    st = {**_json(APSTATE), **kw}
+    os.makedirs(RUNS, exist_ok=True)
+    json.dump(st, open(APSTATE, "w"), indent=1)
+
+
+def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None = None,
+                  cycle_cmd: list[str] | None = None) -> None:
+    """The loop itself (runs detached). Each round runs `cycle` as a child process, so a crash in one cycle
+    never stops the loop, and re-execs itself when the engine's code changed."""
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    stamp = _code_stamp()
+    cmd = cycle_cmd or [sys.executable, "-m", "clipengine", "cycle"]
+    _write_ap(pid=os.getpid(), every=every_min, sessions=sessions, started_at=time.time())
+    n = 0
+    print(f"[autopilot] {dt.datetime.now():%H:%M:%S} every {every_min:g} min{' (stream hours only)' if sessions else ''}",
+          flush=True)
+    while not stop["now"] and (rounds is None or n < rounds):
+        t0 = time.time()
+        if sessions and not in_session(load_schedule()) and not _json(os.path.join(RUNS, ".cycle.json")).get("any_live"):
+            _write_ap(idle=True, checked_at=t0)
+        else:
+            _write_ap(idle=False)
+            try:
+                r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1800)
+                out, rc = (r.stdout + r.stderr).strip(), r.returncode
+            except subprocess.TimeoutExpired:
+                out, rc = "cycle took over 30 min — stopped it", -1
+                AT.event("failure", "a cycle hung for 30 min and was stopped", key=f"cycle-hang:{int(t0)}")
+            print(f"[autopilot] {dt.datetime.now():%H:%M:%S} cycle exit {rc}\n" + "\n".join(
+                "  " + l for l in out.splitlines()[-12:]), flush=True)
+            if rc not in (0,):
+                AT.event("failure", f"cycle failed (exit {rc}): {(out.splitlines() or [''])[-1][:80]}",
+                         key=f"cycle-fail:{int(t0) // 3600}")
+            _write_ap(last_cycle_at=t0, last_rc=rc)
+        n += 1
+        if _code_stamp() != stamp and rounds is None:   # cycle pulled new engine code: run it
+            print("[autopilot] engine updated — restarting on the new version", flush=True)
+            os.execv(sys.executable, [sys.executable, "-m", "clipengine", "autopilot", "run", "--every",
+                                      str(every_min)] + (["--sessions"] if sessions else []))
+        while not stop["now"] and time.time() < t0 + every_min * 60 and (rounds is None or n < rounds):
+            time.sleep(1)
+    print("[autopilot] stopped", flush=True)
+
+
+# ---- backups ----------------------------------------------------------------------------------------
+
+BACKUP_PATHS = ("brand", "config", "data", "ledger.jsonl", os.path.join("local", "patches"))
+
+
+def backup(to: str | None = None, root: str = REPO, now: float | None = None) -> str:
+    import zipfile
+    to = to or os.path.join(root, "runs", "backups")
+    os.makedirs(to, exist_ok=True)
+    name = os.path.join(to, f"backup-{dt.datetime.fromtimestamp(now or time.time()):%Y%m%d-%H%M%S}.zip")
+    n = 0
+    with zipfile.ZipFile(name, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in BACKUP_PATHS:
+            full = os.path.join(root, p)
+            files = [full] if os.path.isfile(full) else sorted(
+                f for f in glob.glob(os.path.join(full, "**", "*"), recursive=True) if os.path.isfile(f))
+            for f in files:
+                if "__pycache__" in f or f.endswith(".pyc"):
+                    continue
+                z.write(f, os.path.relpath(f, root))
+                n += 1
+    print(f"backup: {n} files → {name}")
+    return name
+
+
+def restore(path: str, root: str = REPO) -> list[str]:
+    """Put a backup back. Only the backed-up places are written; a backup of what's there now is made first."""
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        bad = [n for n in names if os.path.isabs(n) or ".." in n.replace("\\", "/").split("/")
+               or not any(n == p or n.startswith(p.rstrip("/") + "/") for p in BACKUP_PATHS)]
+        if bad:
+            raise SystemExit(f"RESTORE REFUSED: {path} has files outside the backed-up folders ({bad[0]})")
+        before = backup(os.path.join(root, "runs", "backups"), root=root)
+        for n in names:
+            dest = os.path.join(root, n)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(n) as src, open(dest, "wb") as fh:
+                fh.write(src.read())
+    print(f"restore: {len(names)} files from {path} (what was there before: {before})")
+    return names
