@@ -764,7 +764,8 @@ def test_public_init_needs_the_users_yes_to_the_risks(tmp_path, monkeypatch, cap
     with pytest.raises(SystemExit):
         OB.init("Night Owl", category="Grand Theft Auto VI", suggest=False)
     out = capsys.readouterr().out
-    assert "against the platforms' terms" in out and "copyright" in out and "--accept-risks" in out
+    assert "clipping accounts" in out.replace("accounts made for clipping", "clipping accounts") and "other creators' streams" in out
+    assert "--accept-risks" in out and "limited" in out                     # honest, just not alarming
 
 
 def test_insights_never_leave_the_machine(tmp_path, monkeypatch):
@@ -835,7 +836,7 @@ def test_readme_front_door_tells_an_agent_what_to_do_and_what_stays_private():
     t = open(readme if os.path.exists(readme) else os.path.join(ROOT, "README.md")).read()   # private repo / public build
     door = t[t.index("If you are an AI agent"):t.index("## Quick reference")]
     for must in ("get their yes", "git clone https://github.com/launchwithdrew/klondike", "never fork", "AGENTS.md",
-                 "sends nothing", "can't push", "stop --all", "four risks"):
+                 "sends nothing", "can't push", "stop --all", "four good-to-know"):
         assert must in door, must
     assert len(door.split()) < 400                                   # cheap for the agent that reads it
 

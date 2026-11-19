@@ -148,17 +148,16 @@ def _suggest_roster(category: str, n_big: int = 3, n_rising: int = 3) -> list[di
     return big + rising
 
 
-RISKS = """Before setting up, tell your user these four things and get a clear yes:
-  1. Posting is done by driving a signed-in Chrome, and stream data is read from Twitch's website —
-     both are against the platforms' terms. Accounts can be limited or banned; warm-up and daily caps
-     lower that risk but can't remove it. Use accounts made for clipping, not personal ones.
-  2. Clips are of other people's streams. Platforms can remove them or give copyright strikes, and a
-     streamer can ask you to stop — if one does, stop clipping them (remove them from config/creators.json).
-  3. The sign-ins live on this computer (chrome-profile/). Anyone who can use this computer can use
-     those accounts. Keep the computer locked and don't share it.
-  4. Engine updates come from the maintainers' repository and run on this computer. Updates are
-     tested here before they're kept, and roll back if they fail.
-Then: clipengine init ... --accept-risks"""
+RISKS = """Four quick things to know (the same for any clipping channel). Share them with your user in a
+friendly sentence or two — they're good to know, not alarms — and ask if they're good to go:
+  1. Use accounts made for clipping, not personal ones. Platforms limit automated posting, so Klondike
+     posts like a careful person: a slow start on new accounts, a few posts a day, winners only. An
+     account can still get limited now and then, which is why it should be a clipping account.
+  2. Clips come from other creators' streams, like every clip channel. If a streamer asks you to stop,
+     take them off the list (config/creators.json).
+  3. The sign-ins stay on this computer, so keep it locked.
+  4. Updates are tested on this computer before they're kept, and undo themselves if anything fails.
+When they say yes: clipengine init ... --accept-risks"""
 
 
 def init(name: str | None = None, youtube: str | None = None, instagram: str | None = None,
@@ -168,7 +167,7 @@ def init(name: str | None = None, youtube: str | None = None, instagram: str | N
     from . import repo as RP
     if RP.public() and not accept_risks:
         print(RISKS)
-        raise SystemExit("not set up yet — needs the user's yes to the four points above (--accept-risks)")
+        raise SystemExit("not set up yet — share the four points above, then re-run with --accept-risks after a yes")
     if os.path.exists(B.path()) and not force:
         raise SystemExit(f"{os.path.relpath(B.path(), REPO)} already exists — this channel is set up. "
                          "Use --force to start over (your current pack is kept as brand/brand.json.bak).")

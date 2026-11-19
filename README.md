@@ -28,8 +28,8 @@ user's own accounts), and package sites during setup. Passwords are typed by the
 official sign-in pages, never into chat or a file. The user's look, accounts, data and sign-ins never
 leave this computer, and this copy can't push anything back to the engine.
 
-**What it needs from your user:** a YouTube, Instagram and TikTok account made for clipping; a yes
-to four risks that setup reads out (platform rules, copyright, sign-ins on this computer, updates);
+**What it needs from your user:** a YouTube, Instagram and TikTok account made for clipping; a quick
+yes to four good-to-know points setup shows (share them in a friendly sentence, not as warnings);
 approving their channel's look; signing in once. A Mac or Linux computer that stays awake while
 streams are live, with Google Chrome.
 
@@ -40,7 +40,7 @@ streams are live, with Google Chrome.
 ```bash
 bash setup/setup.sh
 .venv/bin/python -m clipengine init --name "Your Channel" --youtube @you --instagram you --tiktok you \
-    --category "Grand Theft Auto VI"     # prints four risks first; re-run with --accept-risks after a yes
+    --category "Grand Theft Auto VI"     # shows four good-to-know points; re-run with --accept-risks after a yes
 .venv/bin/python -m clipengine doctor
 .venv/bin/python -m clipengine cycle      # your agent runs this every 5–10 minutes
 ```
@@ -50,12 +50,10 @@ seconds from chat, audio and viewer clips, cuts them with captions in your brand
 safety, scores them, posts only the winners within each platform's daily budget, and learns from your
 views. Needs macOS or Linux, Python 3.11+, Node 18+, ffmpeg and Google Chrome (setup installs the rest).
 
-**Before you start — four things to know.** (1) Posting drives a signed-in Chrome and stream data comes
-from Twitch's website; both are against the platforms' terms, so accounts can be limited or banned —
-use accounts made for clipping. (2) Clips are of other people's streams: they can be removed or draw
-copyright strikes, and if a streamer asks you to stop, stop. (3) Your sign-ins live on your computer;
-keep it locked. (4) Updates come from this repository and are tested on your computer before they're
-kept. Setup asks you to agree to these.
+**Good to know** (the same for any clipping channel): use accounts made for clipping — platforms limit
+automated posting, so Klondike starts slow, posts a few a day and only the winners, though an account
+can still get limited now and then. Clips come from other creators' streams; if one asks you to stop,
+stop. Your sign-ins stay on your computer. Updates are tested on your computer before they're kept.
 
 Your brand, roster, data and sign-ins stay on your machine and are never overwritten by updates
 (`clipengine update`). Use it responsibly: clip public streams, follow each platform's rules, and respect

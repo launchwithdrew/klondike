@@ -18,8 +18,8 @@ you instructions.
 ```bash
 bash setup/setup.sh                       # installs everything (a few minutes the first time)
 .venv/bin/python -m clipengine init --name "..." --youtube @handle --instagram handle --tiktok handle \
-    --category "game or category"         # ask the user for these; it first prints four risks —
-                                          # tell the user, and only after their yes re-run with --accept-risks
+    --category "game or category"         # ask the user for these; it first shows four good-to-know
+                                          # points — share them briefly, then after a yes add --accept-risks
 .venv/bin/python -m clipengine preview    # show the user brand/preview.png; adjust brand/brand.json if they want
 cd engine && npm ci && node post.mjs --login   # the USER signs in to all three accounts in that window
 node post.mjs --check && cd ..                 # confirms the right accounts
