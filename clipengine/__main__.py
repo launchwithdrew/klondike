@@ -177,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
     pq.add_argument("--no-push", action="store_true")
     pq.add_argument("--fix", action="append", default=[], metavar='"heard=>said"')
     pq.add_argument("--bleep", action="append", default=[], metavar="WORD")
+    sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
+    pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
+    pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
+    vw = sub.add_parser("views", help="(post_with: agent) record a view count you read off a post")
+    vw.add_argument("--slug", required=True); vw.add_argument("--platform", required=True); vw.add_argument("--views", type=int, required=True)
     sk = sub.add_parser("skip", help="mark a sentinel draft as looked-at and not worth posting")
     sk.add_argument("--id", required=True)
     tn = sub.add_parser("train", help="train the sentinel on recent VODs, using viewer clips as labels")
@@ -281,6 +286,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("stop --channel LOGIN, or stop --all")
             return 2
+        return 0
+    if a.cmd in ("to-post", "posted", "views"):
+        from . import handpost as HP
+        if a.cmd == "to-post":
+            HP.show()
+        elif a.cmd == "posted":
+            print(HP.mark(a.slug, a.platform, a.url))
+        else:
+            print(HP.views(a.slug, a.platform, a.views))
         return 0
     if a.cmd == "sentinels":
         from . import sentinel as SN

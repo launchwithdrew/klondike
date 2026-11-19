@@ -102,6 +102,20 @@ def source_name(source: str) -> str:
 
 
 _SEG_ANY = re.compile(r"#EXTINF:([\d.]+),[^\n]*\n(\S+)")
+_MAP_RE = re.compile(r'#EXT-X-MAP:URI="([^"]+)"')
+
+
+def init_segment(playlist: str, playlist_url: str, cache: dict) -> bytes:
+    """fMP4 streams (#EXT-X-MAP) put the codec setup in one init segment; every media segment needs it
+    in front to be playable on its own. Returns b"" for plain MPEG-TS playlists."""
+    m = _MAP_RE.search(playlist)
+    if not m:
+        return b""
+    uri = urllib.parse.urljoin(playlist_url, m.group(1))
+    if uri not in cache:
+        cache.clear()                                   # a new playlist session brings a new init
+        cache[uri] = T.http(uri, attempts=3, timeout=20)
+    return cache[uri]
 
 
 def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float | None = None) -> None:
@@ -120,6 +134,7 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
               open(os.path.join(out_dir, "recording.json"), "w"))
     seen: set[str] = set()
     failed_hosts: set[str] = set()
+    inits: dict[str, bytes] = {}
     url = resolve()
     t_start, n_ads, n_segs = time.time(), 0, 0
     t_resolved = time.time()
@@ -146,6 +161,12 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
             except Exception:
                 pass
         ad_ranges = "stitched-ad" in pl or "twitch-stitched-ad" in pl
+        try:
+            init = init_segment(pl, url, inits)
+        except Exception as exc:
+            print(f"[live] init segment fetch failed ({str(exc)[:80]}) — retrying", flush=True)
+            time.sleep(2.0)
+            continue
         segs = [(m.group(1), float(m.group(2)), m.group(3), m.group(4)) for m in SEG_RE.finditer(pl)]
         if youtube and not segs:                       # no PROGRAM-DATE-TIME: time new segments by arrival
             fresh = [(None, float(m.group(1)), "live", m.group(2)) for m in _SEG_ANY.finditer(pl)
@@ -175,7 +196,7 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
                           "if this repeats, that host is blocked from this machine", flush=True)
                 continue
             with open(path, "wb") as fh:
-                fh.write(data)
+                fh.write(init + data)                     # fMP4: each saved segment carries its init
             with open(index, "a") as fh:
                 fh.write(json.dumps({"t": t0, "d": dur, "f": os.path.basename(path)}) + "\n")
             n_segs += 1

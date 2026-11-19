@@ -969,3 +969,67 @@ def test_update_restarts_running_sentinels_on_new_code(monkeypatch):
     monkeypatch.setattr(O, "start", lambda src: (log.append(("start", src)), f"+{src} started")[1])
     assert O.restart_sentinels() == ["+a restarted on the new version"]
     assert log == [("stop", "d1"), ("start", "a")]                     # a stopped sentinel stays stopped
+
+
+def test_fmp4_segments_get_their_init_and_cut_cleanly(tmp_path, monkeypatch):
+    # newer Twitch streams send fMP4: media segments are unplayable without the #EXT-X-MAP init segment
+    import json as _json
+    from clipengine import live as L, render as V
+    hls = tmp_path / "hls"; hls.mkdir()
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30", "-f", "lavfi",
+                    "-i", "sine=frequency=500:sample_rate=48000", "-t", "12", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-g", "60", "-bf", "0", "-c:a", "aac", "-f", "hls", "-hls_time", "2", "-hls_segment_type", "fmp4",
+                    "-hls_fmp4_init_filename", "init.mp4", "-hls_list_size", "0", str(hls / "pl.m3u8")], check=True)
+    pl = (hls / "pl.m3u8").read_text()
+    monkeypatch.setattr(L.T, "http", lambda url, **k: (hls / url.rsplit("/", 1)[-1]).read_bytes())
+    cache = {}
+    init = L.init_segment(pl, "https://cdn.example/x/pl.m3u8", cache)
+    assert init and init == (hls / "init.mp4").read_bytes() and len(cache) == 1
+    assert L.init_segment("#EXTM3U\n#EXTINF:2.0,live\nseg.ts\n", "https://cdn.example/x/pl.m3u8", {}) == b""
+    rec = tmp_path / "rec"; (rec / "segments").mkdir(parents=True)
+    t0 = 1_800_000_000.0
+    segs = [l for l in pl.splitlines() if l.endswith(".m4s")]
+    with open(rec / "index.jsonl", "w") as fh:
+        for i, s in enumerate(segs):
+            (rec / "segments" / f"{i}.ts").write_bytes(init + (hls / s).read_bytes())     # what the recorder saves
+            fh.write(_json.dumps({"t": t0 + 2 * i, "d": 2.0, "f": f"{i}.ts"}) + "\n")
+    (rec / "recording.json").write_text(_json.dumps({"login": "x"}))
+    src, out = str(tmp_path / "src.ts"), str(tmp_path / "out.mp4")
+    first = L.cut_source(str(rec), t0 + 1, t0 + 9, src)
+    V.render(src, first, t0 + 3, t0 + 9, [], out, crop="blur", layout="stack", title="T", quote="q")
+    assert abs(L.media_duration(out) - 6.0) < 0.5
+
+
+def test_http_falls_back_to_curl_when_reads_keep_getting_cut(monkeypatch):
+    from http.client import IncompleteRead
+    from clipengine import twitch as T
+    monkeypatch.setattr(T.urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(IncompleteRead(b"", 9)))
+    monkeypatch.setattr(T.time, "sleep", lambda s: None)
+    monkeypatch.setattr(T, "_curl", lambda url, data, headers, timeout: b"whole")
+    assert T.http("https://example.invalid/", attempts=2) == b"whole"
+
+
+def test_agent_posting_lists_due_clips_and_records_posts(tmp_path, monkeypatch):
+    import json as _json
+    from clipengine import handpost as HP
+    monkeypatch.setattr(HP, "REPO", str(tmp_path))
+    d = tmp_path / "outbox" / "kai_moment"; d.mkdir(parents=True)
+    (d / "clip.mp4").write_bytes(b"video")
+    later = "2999-01-01T00:00:00Z"
+    (d / "post.json").write_text(_json.dumps({"slug": "kai_moment", "title": "Kai did a THING 😭", "description": "One line. #gta6",
+                                              "platforms": ["youtube", "instagram", "tiktok"], "schedule": {"tiktok": later}}))
+    it = HP.due()[0]
+    assert it["now"] == ["youtube", "instagram"] and it["later"] == {"tiktok": later}
+    assert it["captions"]["instagram"]["caption"] == "Kai did a THING 😭\nOne line. #gta6"
+    assert it["captions"]["tiktok"]["caption"] == "Kai did a THING 😭 One line. #gta6"
+    assert "still to post" in HP.mark("kai_moment", "youtube", "https://youtube.com/shorts/x")
+    assert "already recorded" in HP.mark("kai_moment", "youtube", "https://youtube.com/shorts/x")
+    HP.mark("kai_moment", "instagram", "https://instagram.com/reel/y")
+    assert HP.due()[0]["now"] == []                                   # tiktok waits for its slot
+    msg = HP.mark("kai_moment", "tiktok", "https://tiktok.com/@a/video/z")
+    assert "moved to posted" in msg and (tmp_path / "posted" / "kai_moment" / "clip.mp4").exists()
+    rows = [_json.loads(l) for l in open(tmp_path / "ledger.jsonl")]
+    assert [r["platform"] for r in rows] == ["youtube", "instagram", "tiktok"] and all(r["posted_by"] == "agent" for r in rows)
+    with pytest.raises(SystemExit):
+        HP.mark("kai_moment", "twitter", "https://x")
+    assert "1,234 views" in HP.views("kai_moment", "tiktok", 1234)

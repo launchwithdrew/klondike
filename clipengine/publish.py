@@ -107,7 +107,11 @@ def drop(file: str, slug: str, title: str, description: str, moment_at: str, pos
         cmd.append("--no-push")
     subprocess.run(cmd, check=True)
     if post and not check_only:
-        subprocess.run(["node", os.path.join(REPO, "engine", "post.mjs"), "--once"], check=True)
+        from . import handpost as HP
+        if HP.enabled():
+            print(f"ready for you to post: clipengine to-post  (then clipengine posted --slug {slug} --platform … --url …)")
+        else:
+            subprocess.run(["node", os.path.join(REPO, "engine", "post.mjs"), "--once"], check=True)
 
 
 def record_clipped(entry: dict, push: bool) -> None:

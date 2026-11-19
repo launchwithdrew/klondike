@@ -266,7 +266,12 @@ def cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False)
         + (f"  [{'; '.join(notes)}]" if notes else ""))
 
     # 2. poster
-    if _posting_machine():
+    from . import handpost as HP
+    if HP.enabled():
+        n = sum(1 for it in HP.due() if it["now"])
+        lines.append(f"poster: you post with your own browser — {n} clip(s) due: clipengine to-post" if n
+                     else "poster: you post with your own browser — nothing due")
+    elif _posting_machine():
         if not _poster_running():
             _detach(["node", os.path.join(REPO, "engine", "post.mjs"), "--watch"],
                     os.path.join(REPO, "logs", "poster.log"), cwd=os.path.join(REPO, "engine"))
@@ -281,7 +286,7 @@ def cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False)
 
     # 3. hourly stats, daily learn
     now = time.time()
-    if _posting_machine() and now - state.get("stats_at", 0) >= cfg["stats_every_min"] * 60:
+    if _posting_machine() and not HP.enabled() and now - state.get("stats_at", 0) >= cfg["stats_every_min"] * 60:
         r = subprocess.run(["node", os.path.join(REPO, "engine", "stats.mjs")], capture_output=True, text=True,
                            cwd=os.path.join(REPO, "engine"), timeout=600)
         state["stats_at"] = now
@@ -364,7 +369,10 @@ def doctor(accounts: bool = False) -> bool:
           "clipengine init makes one (brand/kit/logo.png), or set logo.file in brand/brand.json")
     check("fonts", os.path.exists(os.path.join(REPO, "assets", "fonts", "NotoColorEmoji.ttf")), "git pull (assets/ is in the repo)")
     cdp = config().get("browser_cdp_url")
-    if cdp:
+    from . import handpost as _HP
+    if _HP.enabled():
+        check("posting: by your own browser (post_with: agent) — clipengine to-post", True)
+    elif cdp:
         import urllib.request
         try:
             urllib.request.urlopen(cdp.rstrip("/") + "/json/version", timeout=5).read()
@@ -377,7 +385,7 @@ def doctor(accounts: bool = False) -> bool:
         check("posting machine (signed-in chrome-profile/)", _posting_machine(),
               "the channel owner signs in once: cd engine && node post.mjs --login (or use your own browser: "
               "docs/troubleshooting.md)")
-    if accounts and _posting_machine():
+    if accounts and _posting_machine() and not _HP.enabled():
         r = subprocess.run(["node", "post.mjs", "--check"], cwd=os.path.join(REPO, "engine"), capture_output=True,
                            text=True, timeout=180)
         try:

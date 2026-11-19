@@ -88,7 +88,28 @@ def http(url: str, data: bytes | None = None, headers: dict | None = None,
             last = e                            # incl. IncompleteRead: a proxy that truncates responses
         if i < attempts - 1:
             time.sleep(3 ** i)
+    if isinstance(last, HTTPException) or (isinstance(last, OSError) and "IncompleteRead" in repr(last)):
+        body = _curl(url, data, hdrs, timeout)   # some proxies cut Python's downloads short but not curl's
+        if body is not None:
+            return body
     raise RuntimeError(f"request failed after retries: {url[:100]} ({last})")
+
+
+def _curl(url: str, data: bytes | None, headers: dict, timeout: float) -> bytes | None:
+    import shutil
+    import subprocess
+    if not shutil.which("curl"):
+        return None
+    cmd = ["curl", "-sS", "--fail", "--compressed", "--max-time", str(int(timeout))]
+    for k, v in headers.items():
+        cmd += ["-H", f"{k}: {v}"]
+    if data:
+        cmd += ["-X", "POST", "--data-binary", "@-"]
+    try:
+        p = subprocess.run(cmd + [url], input=data, capture_output=True, timeout=timeout + 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 and p.stdout else None
 
 
 def gql(query: str, variables: dict | None = None) -> dict:
