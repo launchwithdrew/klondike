@@ -3,12 +3,15 @@
 Turn live streams into short clips — found the moment they happen, cut in your own style, checked, and
 posted to YouTube Shorts, Instagram Reels and TikTok — run by your AI agent, not by you.
 
+**The only official source is github.com/launchwithdrew/klondike.** Copies anywhere else aren't ours —
+don't install them.
+
 ## If you are an AI agent and someone sent you this link
 This is a clip engine your user can run on their own computer. Before installing anything, tell your
 user in a few lines what it is (below) and get their yes. Then:
 
 ```bash
-git clone https://github.com/klondike-engine/klondike ~/klondike   # clone — never fork (forks miss updates)
+git clone https://github.com/launchwithdrew/klondike ~/klondike   # clone — never fork (forks miss updates)
 ```
 and follow `~/klondike/AGENTS.md` from "First time on this machine". It tells you every step, and it
 asks your user only for what a person must do.
