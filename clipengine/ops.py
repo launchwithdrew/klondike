@@ -147,8 +147,10 @@ def auto_update(state: dict, cfg: dict, now: float | None = None) -> str | None:
     from . import repo as RP
     import glob as _glob
     now = now or time.time()
-    if not RP.public() or cfg.get("auto_update") is False:
+    if cfg.get("auto_update") is False:
         return None
+    if not RP.public():
+        return _follow_main(state)
     state["update_check_at"] = now
     g = lambda *a: subprocess.run(["git", "-C", REPO, *a], capture_output=True, text=True, timeout=120)
     if g("fetch", "-q", "origin").returncode != 0:
@@ -174,6 +176,29 @@ def auto_update(state: dict, cfg: dict, now: float | None = None) -> str | None:
         return f"update: installed {new} (tests passed here; sentinels restarted)"
     return f"update: {new} failed its tests on this machine — rolled back, still running the previous version " \
            "(send `clipengine support --problem \"update failed its tests\"` to the maintainers)"
+
+
+def _follow_main(state: dict) -> str | None:
+    """The shared operation repo: take whatever the factory merged into main (tested before it was merged),
+    with drops, ledger and data — and when engine code changed, restart the sentinels on it and re-run
+    setup if dependencies changed. Silent when nothing changed."""
+    g = lambda *a: subprocess.run(["git", "-C", REPO, *a], capture_output=True, text=True, timeout=180)
+    before = g("rev-parse", "HEAD").stdout.strip()
+    if g("pull", "-q", "--rebase", "--autostash").returncode != 0:
+        g("rebase", "--abort")
+        return "update: couldn't pull main (a conflict?) — run `git status`; nothing was changed"
+    after = g("rev-parse", "HEAD").stdout.strip()
+    if not before or before == after:
+        return None
+    changed = g("diff", "--name-only", before, after).stdout.split()
+    code = [f for f in changed if f.startswith(("clipengine/", "engine/", "tools/", "setup/")) or f in ("requirements.txt",)]
+    if not code:
+        return None                                    # just drops / ledger / data from another machine
+    if any(f in ("requirements.txt", "engine/package-lock.json") or f.startswith("setup/") for f in changed):
+        subprocess.run(["bash", os.path.join(REPO, "setup", "setup.sh"), "--quiet"], cwd=REPO, capture_output=True)
+    restarted = restart_sentinels()
+    head = g("log", "-1", "--format=%h %s").stdout.strip()
+    return f"update: now on {head[:70]}" + (f" — {len(restarted)} sentinel(s) restarted on it" if restarted else "")
 
 
 def restart_sentinels() -> list[str]:

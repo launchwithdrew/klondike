@@ -57,6 +57,15 @@ def config() -> dict:
         for k in ("stale_after_h", "stale_min_score", "max_wait_h"):
             if k in user:
                 cfg[k] = user[k]
+        import time as _t
+        for o in user.get("temporary") or []:         # e.g. a launch-night budget: applies until it expires
+            try:
+                until = dt.datetime.fromisoformat(str(o["until"]).replace("Z", "+00:00")).timestamp()
+            except (KeyError, ValueError):
+                continue
+            if _t.time() < until:
+                for p, v in (o.get("platforms") or {}).items():
+                    cfg["platforms"][p] = {**cfg["platforms"].get(p, {}), **v}
     return cfg
 
 

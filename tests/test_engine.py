@@ -1057,3 +1057,56 @@ def test_cycle_installs_a_new_release_by_itself(monkeypatch, tmp_path):
     assert O.auto_update({}, {"auto_update": False}) is None                      # opt-out
     monkeypatch.setattr(RP, "public", lambda: False)
     assert O.auto_update({}, {}) is None                                          # our own op updates with git pull
+
+
+def test_temporary_posting_budget_expires_by_itself(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    from clipengine import gate as G
+    p = tmp_path / "distribution.json"
+    p.write_text(_json.dumps({"platforms": {"tiktok": {"daily_cap": 4, "gap_min": 120}},
+                              "temporary": [{"until": "2999-01-01T00:00:00Z", "platforms": {"tiktok": {"daily_cap": 12}}},
+                                            {"until": "2000-01-01T00:00:00Z", "platforms": {"tiktok": {"gap_min": 1}}}]}))
+    monkeypatch.setattr(G, "CONFIG", str(p))
+    tk = G.config()["platforms"]["tiktok"]
+    assert tk["daily_cap"] == 12 and tk["gap_min"] == 120                  # live override on, expired one off
+
+
+def test_our_op_follows_main_and_restarts_sentinels_only_for_code(monkeypatch):
+    from clipengine import ops as O, repo as RP
+    monkeypatch.setattr(RP, "public", lambda: False)
+    heads = iter(["aaa", "bbb", "ccc", "ddd"])
+    changed = {"files": "ledger.jsonl\noutbox/x/post.json\n"}
+    def fake_run(cmd, **k):
+        sub = cmd[3]
+        out = next(heads) if sub == "rev-parse" else {"diff": changed["files"], "log": "bbb engine: better scoring"}.get(sub, "")
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    monkeypatch.setattr(O.subprocess, "run", fake_run)
+    monkeypatch.setattr(O, "restart_sentinels", lambda: ["+streamera restarted"])
+    assert O.auto_update({}, {}) is None                                        # data from another machine: silent
+    changed["files"] = "clipengine/grade.py\n"
+    assert O.auto_update({}, {}) == "update: now on bbb engine: better scoring — 1 sentinel(s) restarted on it"
+    assert O.auto_update({}, {"auto_update": False}) is None
+
+
+def test_engine_poster_and_stats_stand_down_when_the_agent_posts():
+    post = open(os.path.join(ROOT, "engine", "post.mjs")).read()
+    stats = open(os.path.join(ROOT, "engine", "stats.mjs")).read()
+    lib = open(os.path.join(ROOT, "engine", "lib.mjs")).read()
+    assert "post_with === 'agent'" in lib
+    assert "if (standDown()) break;" in post and "standDown()) { release(); return; }" in post
+    assert "if (agentPosts())" in stats
+
+
+def test_agent_posts_sync_through_git_in_our_op(tmp_path, monkeypatch):
+    import json as _json
+    from clipengine import handpost as HP, repo as RP
+    monkeypatch.setattr(HP, "REPO", str(tmp_path))
+    monkeypatch.setattr(RP, "sync", lambda: True)
+    d = tmp_path / "outbox" / "s"; d.mkdir(parents=True); (d / "clip.mp4").write_bytes(b"v")
+    (d / "post.json").write_text(_json.dumps({"slug": "s", "title": "T", "description": "D", "platforms": ["youtube"]}))
+    cmds = []
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", lambda cmd, **k: (cmds.append(cmd[3:]), _sp.CompletedProcess(cmd, 1 if "diff" in cmd else 0, "", ""))[1])
+    HP.mark("s", "youtube", "https://youtube.com/shorts/x")
+    verbs = [c[0] if c[0] != "-c" else "commit" for c in cmds]
+    assert verbs[:2] == ["add", "diff"] and "commit" in verbs and verbs[-2:] == ["pull", "push"]

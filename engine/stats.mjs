@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { ROOT, SYNC, ACCOUNTS, GIT_AUTHOR, log, readLedger } from './lib.mjs';
+import { ROOT, SYNC, agentPosts, ACCOUNTS, GIT_AUTHOR, log, readLedger } from './lib.mjs';
 
 const HANDLES = { tiktok: ACCOUNTS.tiktok.username.replace(/^@/, ''), instagram: ACCOUNTS.instagram.username,
                   youtube: ACCOUNTS.youtube.handle.replace(/^@/, '') };
@@ -58,6 +58,7 @@ async function readGrid(page, platform) {
 }
 
 async function main() {
+  if (agentPosts()) { log('stats: post_with is "agent" — the agent records views (clipengine views); nothing to do here'); return; }
   const dry = process.argv.includes('--dry');
   const week = Date.now() - 7 * 86400e3;
   const live = readLedger().filter(r => r.status === 'live' && r.url && Date.parse(r.at || 0) > week);

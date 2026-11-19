@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { ROOT, SYNC, OUTBOX, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, acquireLock, probe } from './lib.mjs';
+import { ROOT, SYNC, OUTBOX, agentPosts, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, acquireLock, probe } from './lib.mjs';
 import { postYouTube, checkYouTube } from './youtube.mjs';
 import { postInstagram, checkInstagram } from './instagram.mjs';
 import { postTikTok, checkTikTok } from './tiktok.mjs';
@@ -126,6 +126,14 @@ function pushResults(msg) {
   } catch (e) { log('git push failed:', String(e.stderr || e.message).split('\n')[0]); }
 }
 
+let stoodDown = false;
+function standDown() {
+  if (!agentPosts()) { stoodDown = false; return false; }
+  if (!stoodDown) log('post_with is "agent" (config/ops.json): the agent posts with its own browser — this poster stands down');
+  stoodDown = true;
+  return true;
+}
+
 async function runOnce(ctx) {
   pull();
   const items = readyItems();
@@ -153,6 +161,7 @@ async function main() {
   }
   const release = acquireLock();
   if (!release) { log('another engine run is active; exiting'); return; }
+  if (!args.has('--watch') && !args.has('--check') && standDown()) { release(); return; }
   if (args.has('--watch')) {
     // Idle cheaply: pull every 30 s; only start/attach Chrome when there is something to post.
     log('watching', OUTBOX, DRY ? '(dry)' : '');
@@ -164,6 +173,7 @@ async function main() {
         do {
           again = false;
           pull();
+          if (standDown()) break;
           const items = readyItems();
           if (!items.length) break;
           const ctx = await launch();

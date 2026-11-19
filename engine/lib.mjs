@@ -9,6 +9,12 @@ import { execFileSync } from 'node:child_process';
 // It is wherever the repo was cloned.
 export const ROOT = process.env.CLIPENGINE_ROOT || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 export const OUTBOX = path.join(ROOT, 'outbox');
+// config/ops.json, read fresh each time (a machine can switch who posts without a restart)
+export function ops() {
+  try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'ops.json'), 'utf8')); } catch { return {}; }
+}
+// "post_with": "agent" — the agent posts with its own browser; this engine's poster and stats stand down
+export const agentPosts = () => ops().post_with === 'agent';
 // Our shared operation syncs through git; a public copy (.public-build) is one machine and never commits or pushes.
 export const SYNC = !fs.existsSync(path.join(ROOT, '.public-build')) && process.env.CLIPENGINE_NO_SYNC !== '1';
 export const POSTED = path.join(ROOT, 'posted');

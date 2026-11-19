@@ -144,8 +144,26 @@ def mark(slug: str, platform: str, url: str) -> str:
     if os.path.isdir(d) and not left:
         os.makedirs(posted, exist_ok=True)
         shutil.move(d, os.path.join(posted, slug))
+        _sync([ledger_p, d, os.path.join(posted, slug)], f"posted by agent: {slug} ({platform})")
         return f"{slug}: live on {platform} — all platforms done, moved to posted/"
+    _sync([ledger_p], f"posted by agent: {slug} ({platform})")
     return f"{slug}: live on {platform}" + (f" — still to post: {', '.join(left)}" if left else "")
+
+
+def _sync(paths: list[str], msg: str) -> None:
+    """In the shared operation repo, a recorded post or view is committed and pushed like the poster's own
+    (one machine's record is everyone's repeat guard). A public copy never touches git."""
+    from . import repo as RP
+    if not RP.sync():
+        return
+    import subprocess
+    g = lambda *a: subprocess.run(["git", "-C", REPO, *a], capture_output=True, text=True)
+    g("add", *[os.path.relpath(p, REPO) for p in paths if os.path.exists(p)])
+    if g("diff", "--cached", "--quiet").returncode == 0:
+        return
+    g("-c", "user.name=clipengine", "-c", "user.email=clipengine@users.noreply.github.com", "commit", "-qm", msg)
+    g("pull", "-q", "--rebase", "--autostash")
+    g("push", "-q")
 
 
 def views(slug: str, platform: str, n: int) -> str:
@@ -154,4 +172,5 @@ def views(slug: str, platform: str, n: int) -> str:
     with open(perf, "a") as fh:
         fh.write(json.dumps({"slug": slug, "platform": platform, "views": int(n), "source": "agent",
                              "checked_at": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
+    _sync([perf], f"views: {slug} {platform} {int(n)}")
     return f"{slug} on {platform}: {int(n):,} views recorded"
