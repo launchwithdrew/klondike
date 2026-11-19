@@ -139,6 +139,43 @@ def stop(channel_or_dir: str, why: str = "stopped") -> str:
     return f"-{st['login']} {why}"
 
 
+def auto_update(state: dict, cfg: dict, now: float | None = None) -> str | None:
+    """A channel's own copy keeps itself current with no one doing anything: every cycle it checks the
+    engine's repository, and when the maintainers have pushed a release it installs it with `update`
+    (tested on this machine, rolled back if it fails, local fixes kept, sentinels restarted) — at a quiet
+    moment, never mid-render. One line in the cycle output. Off with "auto_update": false in config/ops.json."""
+    from . import repo as RP
+    import glob as _glob
+    now = now or time.time()
+    if not RP.public() or cfg.get("auto_update") is False:
+        return None
+    state["update_check_at"] = now
+    g = lambda *a: subprocess.run(["git", "-C", REPO, *a], capture_output=True, text=True, timeout=120)
+    if g("fetch", "-q", "origin").returncode != 0:
+        return None                                   # offline for a moment: try next hour
+    behind = g("rev-list", "--count", "HEAD..@{u}").stdout.strip()
+    if not behind or behind == "0":
+        return None
+    new = g("log", "-1", "--format=%s", "@{u}").stdout.strip()
+    busy = [f for f in _glob.glob(os.path.join(REPO, "runs", "**", "*.src.ts"), recursive=True)
+            if now - os.path.getmtime(f) < 900]
+    if busy:                                          # a clip is rendering: install next cycle instead
+        return f"update: {new} is ready — installing after the clip that's rendering now"
+    import contextlib
+    import io
+    from . import support as SP
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            ok = SP.update(quiet=True)
+    except SystemExit as exc:
+        return f"update: couldn't install {new} ({str(exc)[:80]}) — will retry next hour"
+    if ok:
+        return f"update: installed {new} (tests passed here; sentinels restarted)"
+    return f"update: {new} failed its tests on this machine — rolled back, still running the previous version " \
+           "(send `clipengine support --problem \"update failed its tests\"` to the maintainers)"
+
+
 def restart_sentinels() -> list[str]:
     """Running sentinels keep the old code in memory: after an update, restart each on the new code."""
     out = []
@@ -223,6 +260,11 @@ def cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False)
     top = top or cfg["max_sentinels"]
     state = _state()
     lines, notes = [], []
+
+    # 0. auto-update (public copies): once an hour, take a new release — tested here, rolled back if it fails
+    line = auto_update(state, cfg)
+    if line:
+        lines.append(line)
 
     # 1. sentinels: revive the dead, follow the radar
     sents = {s["login"]: s for s in all_sentinels()}

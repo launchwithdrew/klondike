@@ -72,7 +72,7 @@ checks the machine. If neither solves it: `docs/troubleshooting.md`, then `docs/
 | Fixing a bug in the engine yourself | `docs/fixing-bugs.md` |
 | Changing the look, streamers or category | `docs/customizing.md` |
 | Telling the user how it's going | `clipengine report` |
-| Getting the newest version | `clipengine update` |
+| Getting the newest version | automatic: `cycle` installs each new release (tested here first) |
 | Sharing anonymous results to improve the detector | `docs/insights.md` (opt-in) |
 
 ## Never

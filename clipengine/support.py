@@ -138,7 +138,7 @@ def _tests_pass() -> tuple[bool, str]:
     return r.returncode == 0, ((r.stdout or "").strip().splitlines() or [""])[-1]
 
 
-def update(test: bool = True) -> bool:
+def update(test: bool = True, quiet: bool = False) -> bool:
     """Pull the newest engine, keep this channel's fixes, and keep the new version only if it passes its
     tests on this machine — otherwise go back to the version that worked."""
     from . import repo as RP
@@ -197,7 +197,8 @@ def update(test: bool = True) -> bool:
     if conflict:
         print("these local fixes no longer apply (the code changed): "
               + ", ".join(os.path.basename(c) for c in conflict) + " — fix again with the bug runbook")
-    subprocess.run(["bash", os.path.join(REPO, "setup", "setup.sh"), "--quiet"], cwd=REPO)
+    subprocess.run(["bash", os.path.join(REPO, "setup", "setup.sh"), "--quiet"], cwd=REPO,
+                   capture_output=quiet)          # an automatic update stays out of the cycle's few lines
     from .ops import doctor, restart_sentinels
     for line in restart_sentinels():               # running sentinels would keep the old code otherwise
         print(line)

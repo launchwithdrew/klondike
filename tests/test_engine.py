@@ -1033,3 +1033,27 @@ def test_agent_posting_lists_due_clips_and_records_posts(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         HP.mark("kai_moment", "twitter", "https://x")
     assert "1,234 views" in HP.views("kai_moment", "tiktok", 1234)
+
+
+def test_cycle_installs_a_new_release_by_itself(monkeypatch, tmp_path):
+    from clipengine import ops as O, repo as RP, support as SP
+    monkeypatch.setattr(RP, "public", lambda: True)
+    monkeypatch.setattr(O, "REPO", str(tmp_path))
+    behind = {"n": "2\n"}
+    def fake_run(cmd, **k):
+        out = {"rev-list": behind["n"], "log": "Klondike v0.2.0\n"}.get(cmd[3], "")
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    monkeypatch.setattr(O.subprocess, "run", fake_run)
+    monkeypatch.setattr(SP, "update", lambda quiet=False: True)
+    assert O.auto_update({}, {}) == "update: installed Klondike v0.2.0 (tests passed here; sentinels restarted)"
+    behind["n"] = "0\n"
+    assert O.auto_update({}, {}) is None                                          # nothing new: silent
+    behind["n"] = "1\n"
+    r = tmp_path / "runs" / "sentinel-a" / "renders"; r.mkdir(parents=True); (r / "x.mp4.src.ts").write_bytes(b"x")
+    assert "after the clip that's rendering" in O.auto_update({}, {})              # never mid-render
+    (r / "x.mp4.src.ts").unlink()
+    monkeypatch.setattr(SP, "update", lambda quiet=False: False)
+    assert "rolled back" in O.auto_update({}, {})
+    assert O.auto_update({}, {"auto_update": False}) is None                      # opt-out
+    monkeypatch.setattr(RP, "public", lambda: False)
+    assert O.auto_update({}, {}) is None                                          # our own op updates with git pull
