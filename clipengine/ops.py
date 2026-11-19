@@ -139,6 +139,18 @@ def stop(channel_or_dir: str, why: str = "stopped") -> str:
     return f"-{st['login']} {why}"
 
 
+def stop_all() -> list[str]:
+    """Stop every sentinel and the poster on this machine (cycle starts them again when it next runs)."""
+    out = [stop(s["dir"]) for s in all_sentinels() if s.get("pid") and _alive(s["pid"])]
+    if _poster_running():
+        try:
+            os.kill(int(open(os.path.join(REPO, ".engine.lock")).read().strip()), signal.SIGTERM)
+            out.append("-poster stopped")
+        except (OSError, ValueError):
+            pass
+    return out or ["nothing was running"]
+
+
 # ---- the cycle ---------------------------------------------------------------------------------------
 
 def _posting_machine() -> bool:

@@ -828,3 +828,25 @@ def test_update_keeps_a_good_release_and_the_channels_fix(tmp_path, monkeypatch,
     assert "updated to" in capsys.readouterr().out
     assert _git_t(me, "log", "-1", "--format=%s").strip() == "v2"
     assert (me / "engine.py").read_text() == "A = 2\n\n\n\n\nB = 1  # fix\n"
+
+
+def test_readme_front_door_tells_an_agent_what_to_do_and_what_stays_private():
+    readme = os.path.join(ROOT, "public", "README.md")
+    t = open(readme if os.path.exists(readme) else os.path.join(ROOT, "README.md")).read()   # private repo / public build
+    door = t[t.index("If you are an AI agent"):t.index("## Quick reference")]
+    for must in ("get their yes", "git clone https://github.com/klondike-engine/klondike", "never fork", "AGENTS.md",
+                 "sends nothing", "can't push", "stop --all", "four risks"):
+        assert must in door, must
+    assert len(door.split()) < 400                                   # cheap for the agent that reads it
+
+
+def test_stop_all_stops_sentinels_and_poster(tmp_path, monkeypatch):
+    from clipengine import ops as O
+    killed = []
+    monkeypatch.setattr(O, "all_sentinels", lambda: [{"dir": "a", "pid": 11}, {"dir": "b", "pid": 0}])
+    monkeypatch.setattr(O, "_alive", lambda pid: True)
+    monkeypatch.setattr(O, "stop", lambda d: killed.append(d) or f"-{d} stopped")
+    monkeypatch.setattr(O, "_poster_running", lambda: False)
+    assert O.stop_all() == ["-a stopped"] and killed == ["a"]
+    monkeypatch.setattr(O, "all_sentinels", lambda: [])
+    assert O.stop_all() == ["nothing was running"]

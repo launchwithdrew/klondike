@@ -156,8 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     dr.add_argument("--accounts", action="store_true", help="also check the three platform sign-ins (opens Chrome)")
     st = sub.add_parser("start", help="start a sentinel in the background (survives the shell)")
     st.add_argument("--channel", required=True)
-    sp = sub.add_parser("stop", help="stop a sentinel")
-    sp.add_argument("--channel", required=True)
+    sp = sub.add_parser("stop", help="stop a sentinel (--all: every sentinel and the poster)")
+    sp.add_argument("--channel")
+    sp.add_argument("--all", action="store_true")
     sub.add_parser("sentinels", help="one line per running sentinel (DOWN ones print the restart command)")
     qu = sub.add_parser("queue", help="sentinel drafts worth a look, best first (one line each)")
     qu.add_argument("--all", action="store_true", help="include skipped/unsafe/stale/low drafts")
@@ -273,8 +274,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if O.doctor(a.accounts) else 1
         elif a.cmd == "start":
             print(O.start(a.channel))
-        else:
+        elif a.all:
+            print("\n".join(O.stop_all()))
+        elif a.channel:
             print(O.stop(a.channel))
+        else:
+            print("stop --channel LOGIN, or stop --all")
+            return 2
         return 0
     if a.cmd == "sentinels":
         from . import sentinel as SN
