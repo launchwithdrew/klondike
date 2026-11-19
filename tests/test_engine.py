@@ -834,11 +834,11 @@ def test_update_keeps_a_good_release_and_the_channels_fix(tmp_path, monkeypatch,
 def test_readme_front_door_tells_an_agent_what_to_do_and_what_stays_private():
     readme = os.path.join(ROOT, "public", "README.md")
     t = open(readme if os.path.exists(readme) else os.path.join(ROOT, "README.md")).read()   # private repo / public build
-    door = t[t.index("If you are an AI agent"):t.index("## Quick reference")]
-    for must in ("get their yes", "git clone https://github.com/launchwithdrew/klondike", "never fork", "AGENTS.md",
-                 "sends nothing", "can't push", "stop --all", "four good-to-know"):
-        assert must in door, must
-    assert len(door.split()) < 400                                   # cheap for the agent that reads it
+    for must in ("check with your user first", "git clone https://github.com/launchwithdrew/klondike", "don't fork",
+                 "AGENTS.md", "sends nothing to us", "stop --all", "Good to know", "official home"):
+        assert must in t, must
+    assert "If you are an AI agent" not in t and "risk" not in t.lower()     # reads like a product, not a warning
+    assert len(t.split()) < 450                                              # cheap for the agent that reads it
 
 
 def test_stop_all_stops_sentinels_and_poster(tmp_path, monkeypatch):
