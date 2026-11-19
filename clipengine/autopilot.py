@@ -657,7 +657,20 @@ def publish_window_args(entry: dict, trim_start: float | None, trim_end: float |
 # ---- autopilot --------------------------------------------------------------------------------------
 
 def _code_stamp() -> float:
-    return max((os.path.getmtime(f) for f in glob.glob(os.path.join(REPO, "clipengine", "*.py"))), default=0)
+    """The autopilot loop's OWN code. Each cycle already runs as a fresh process on whatever code is there,
+    so only a change to the loop itself needs the autopilot to restart."""
+    files = [os.path.join(REPO, "clipengine", f) for f in ("autopilot.py", "attention.py", "__main__.py")]
+    return max((os.path.getmtime(f) for f in files if os.path.exists(f)), default=0)
+
+
+def _new_code_starts() -> tuple[bool, str]:
+    """Before the loop replaces itself: does the new code import and parse its own command line?"""
+    try:
+        r = subprocess.run([sys.executable, "-m", "clipengine", "autopilot", "status"], cwd=REPO,
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode == 0, ((r.stderr or r.stdout).strip().splitlines() or [""])[-1][:120]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)[:120]
 
 
 def autopilot_status() -> dict:
@@ -681,6 +694,49 @@ def autopilot_start(every_min: float | None = None, sessions: bool = False) -> s
     return (f"autopilot started (pid {pid}): cycle every {every:g} min"
             + (" inside the usual stream hours (clipengine schedule)" if sessions else "")
             + f" — log {os.path.relpath(LOG, REPO)}; `clipengine attention` says what needs you")
+
+
+def autopilot_died() -> bool:
+    """Started and never stopped on purpose (stop removes the pid file), but its process is gone."""
+    return os.path.exists(PID) and not _alive(_read_pid(PID))
+
+
+def revive_if_dead(by: str, now: float | None = None, min_gap_s: float = 900) -> str | None:
+    """Called by the always-running sentinels: if the autopilot died (not stopped), start it again with its
+    last settings — at most once per 15 min, and only one sentinel does it (a lock file)."""
+    if not autopilot_died():
+        return None
+    now = now or time.time()
+    lock = os.path.join(RUNS, ".ap-revive.lock")
+    try:
+        try:
+            last = float(open(lock).read().strip() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        if now - last < min_gap_s:
+            return None
+        fd = os.open(lock + ".tmp", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except OSError:
+        return None                                        # another sentinel is on it
+    try:
+        open(lock, "w").write(str(now))
+        if not autopilot_died():
+            return None
+        st = _json(APSTATE)
+        try:
+            os.remove(PID)                                 # so start() doesn't think it is still running
+        except OSError:
+            pass
+        msg = autopilot_start(st.get("every"), bool(st.get("sessions")))
+        AT.event("failure", f"autopilot had stopped unexpectedly — restarted by the {by} sentinel",
+                 key=f"ap-revive:{int(now) // 900}")
+        return msg
+    finally:
+        try:
+            os.remove(lock + ".tmp")
+        except OSError:
+            pass
 
 
 def autopilot_stop() -> str:
@@ -722,6 +778,26 @@ def _write_ap(**kw) -> None:
     json.dump(st, open(APSTATE, "w"), indent=1)
 
 
+def _maybe_restart(stamp: float, every_min: float, sessions: bool, t0: float) -> float:
+    """The loop's own code changed: restart on it — but only if the new code starts; else keep this loop."""
+    if _code_stamp() == stamp:
+        return stamp
+    ok, why = _new_code_starts()
+    if not ok:
+        # never trade a working loop for one that won't start: keep going on this one and say so
+        print(f"[autopilot] new version won't start ({why}) — staying on the running one", flush=True)
+        AT.event("failure", f"autopilot couldn't restart on the new engine ({why}) — still running the "
+                 "old loop; cycles already use the new code", key=f"ap-restart:{int(t0) // 3600}")
+        return _code_stamp()
+    print("[autopilot] engine updated — restarting on the new version", flush=True)
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "clipengine", "autopilot", "run", "--every",
+                                  str(every_min)] + (["--sessions"] if sessions else []))
+    except OSError as exc:
+        print(f"[autopilot] restart failed ({exc}) — staying on the running one", flush=True)
+    return _code_stamp()
+
+
 def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None = None,
                   cycle_cmd: list[str] | None = None) -> None:
     """The loop itself (runs detached). Each round runs `cycle` as a child process, so a crash in one cycle
@@ -753,10 +829,8 @@ def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None =
                          key=f"cycle-fail:{int(t0) // 3600}")
             _write_ap(last_cycle_at=t0, last_rc=rc)
         n += 1
-        if _code_stamp() != stamp and rounds is None:   # cycle pulled new engine code: run it
-            print("[autopilot] engine updated — restarting on the new version", flush=True)
-            os.execv(sys.executable, [sys.executable, "-m", "clipengine", "autopilot", "run", "--every",
-                                      str(every_min)] + (["--sessions"] if sessions else []))
+        if rounds is None:
+            stamp = _maybe_restart(stamp, every_min, sessions, t0)
         while not stop["now"] and time.time() < t0 + every_min * 60 and (rounds is None or n < rounds):
             time.sleep(1)
     print("[autopilot] stopped", flush=True)

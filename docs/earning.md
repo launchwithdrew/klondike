@@ -17,7 +17,7 @@ Rows go to `data/performance.jsonl` with the post's age (`age_h`).
 - Streamers (`streamers`, `fit`), formats (`formats`: length bucket, layout, headline pattern) and the
   posting bars are all judged on that worth. Each publish records its layout (stack / facecam), caption
   style (line / line+question) and the judge's score parts; `parts` says which parts predicted worth. `learn.format_factor()` turns formats into a ±5 gate nudge.
-- `taste`: a streamer with ≥ 3 clips that failed (rubric ≤ 1 check, or skipped in the queue) and a
+- `taste`: a streamer with ≥ 3 clips that failed (rubric ≤ 1 check, `--taste no`, or skipped in the queue) and a
   ≥ 60 % failure rate is multiplied down (to 0.5 at worst) — the radar's history signal reads it.
 - `windows`: per platform, the local hours (`timezone` in `config/distribution.json`, default
   America/New_York) whose posts did ≥ 5 % better, once there are 10 reads; `prime_hours` (17–21) before.

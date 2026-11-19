@@ -12,7 +12,8 @@ need the webcam overlay's rectangle. It is a fixed region with a face in it, whi
   5. confidence = how often the face is there × how many sides of the box were actually found
 
 Results are normalised [x, y, w, h] (0–1 of the frame). Per creator:
-  * manual override — `"facecam": [x, y, w, h]` on the creator in config/creators.json (always wins)
+  * manual override — `"facecam": [x, y, w, h]` on the creator in config/creators.json (always wins);
+    `"facecam": false` = this creator has no webcam box (full-room camera, avatar): always the stack layout
   * cache           — data/facecam.json (written at runtime by `clipengine facecam` and by renders)
 
 `clipengine facecam --rec DIR` / `--channel LOGIN` prints what it found and saves a check image.
@@ -309,6 +310,12 @@ def override(login: str) -> list[float] | None:
     return None
 
 
+def disabled(login: str | None) -> bool:
+    """`"facecam": false` on a creator: no webcam box (a full-room camera, an avatar) — always the stack layout."""
+    c = (_load(CREATORS).get("creators") or {}).get((login or "").lower()) or {}
+    return c.get("facecam") is False
+
+
 def cached(login: str) -> dict | None:
     return _load(CACHE).get((login or "").lower())
 
@@ -327,7 +334,7 @@ def save(login: str, res: dict, source: str) -> None:
 
 def known(login: str | None) -> dict | None:
     """What we know for this creator without looking at video: the override, else a confident cache."""
-    if not login:
+    if not login or disabled(login):
         return None
     ov = override(login)
     if ov:
@@ -338,11 +345,47 @@ def known(login: str | None) -> dict | None:
     return None
 
 
-def for_clip(source: str, login: str | None, start: float = 0.0, end: float | None = None) -> dict:
+def cam_present(source: str, box: list[float], start: float = 0.0, end: float | None = None, n: int = 8) -> bool:
+    """Is the streamer actually in that box during this clip? A face in any of n frames is enough (a headset
+    hides a face from the detector most of the time); none at all = the webcam isn't on screen (the streamer
+    went full-screen game or switched scene), and a facecam cut would show a slice of gameplay instead."""
+    import cv2
+    frames = sample_frames(source, n, start, end)
+    if not frames:
+        return True                                     # can't look: trust the checked box
+    cas = _cascades()
+    x, y, w, h = box
+    for f in frames:
+        H, W = f.shape[:2]
+        crop = f[int(y * H):int((y + h) * H), int(x * W):int((x + w) * W)]
+        if crop.size == 0:
+            continue
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if g.shape[1] < 320:                             # small webcam: enlarge so a face is big enough to find
+            k = 320 / g.shape[1]
+            g = cv2.resize(g, (320, int(g.shape[0] * k)))
+        if faces_in(g, cas):
+            return True
+    return False
+
+
+def for_clip(source: str, login: str | None, start: float = 0.0, end: float | None = None,
+             detect: bool = True) -> dict:
     """The facecam to use for one clip: the creator's override, else what this clip itself shows (and it
-    updates the cache), else a confident cached box. {'box': None} = cut the stack layout instead."""
+    updates the cache), else a confident cached box. {'box': None} = cut the stack layout instead.
+    detect=False (brand layout "facecam_detect": false): only checked boxes — no override, no facecam."""
     if login and override(login):
-        return {"box": override(login), "confidence": 1.0, "source": "config/creators.json"}
+        box = override(login)
+        if available() and not cam_present(source, box, start, end):
+            return {"box": None, "confidence": 0.0, "source": "config/creators.json",
+                    "why": "the webcam isn't on screen in this clip (full-screen game or another scene)"}
+        return {"box": box, "confidence": 1.0, "source": "config/creators.json"}
+    if disabled(login):
+        return {"box": None, "confidence": 0.0, "source": "config/creators.json",
+                "why": "no webcam box for this creator (\"facecam\": false)"}
+    if not detect:
+        return {"box": None, "confidence": 0.0, "source": "none",
+                "why": "no checked webcam box for this creator (set \"facecam\" in config/creators.json)"}
     res = detect_file(source, n=20, start=start, end=end)
     if res.get("box") and res["confidence"] >= GOOD:
         save(login, res, "render")
@@ -421,7 +464,62 @@ def from_channel(login: str, minutes: float = 5.0, n: int = 32) -> tuple[dict, l
     return detect_frames(frames), frames
 
 
-def cli(rec: str | None = None, channel: str | None = None, out: str | None = None, save_it: bool = True) -> dict:
+def refine(box: list[float], frames: list, search: float = 0.035, inset_px: int = 3) -> list[float]:
+    """A clean cut of the webcam: each side of a rough box snaps to the overlay's real border nearby — the line
+    that is a sharp edge in EVERY frame (the picture inside changes, the border doesn't) — then moves in a few
+    pixels so no border line or game sliver shows. Sides on the frame's edge stay there."""
+    gs = [np.asarray(f, dtype=np.float32) for f in frames]
+    gs = [g.mean(axis=2) if g.ndim == 3 else g for g in gs]
+    if len(gs) < 2:
+        return list(box)
+    H, W = gs[0].shape
+    gx = [np.abs(np.diff(g, axis=1)) for g in gs]
+    gy = [np.abs(np.diff(g, axis=0)) for g in gs]
+    x0, y0 = box[0] * W, box[1] * H
+    x1, y1 = (box[0] + box[2]) * W, (box[1] + box[3]) * H
+    sx = (int(y0 + 0.15 * (y1 - y0)), int(y1 - 0.15 * (y1 - y0)))
+    sy = (int(x0 + 0.15 * (x1 - x0)), int(x1 - 0.15 * (x1 - x0)))
+
+    def score(i: int, grads: list, span: tuple[int, int], axis: int) -> float:
+        return min(float((g[span[0]:span[1], i] if axis == 1 else g[i, span[0]:span[1]]).mean()) for g in grads)
+
+    def snap(c: float, size: int, grads: list, span: tuple[int, int], axis: int, inward: int) -> float:
+        reach0 = max(2, int(round(14 * size / (1920 if axis == 1 else 1080))))
+        if c <= 2 or c >= size - 2:
+            # on the frame's edge: a coloured frame around the webcam still has an inner edge to cut inside
+            start = 0 if c <= 2 else size - 2
+            for d in range(reach0, 0, -1):
+                j = start + inward * d
+                if 0 <= j < size - 1 and score(j, grads, span, axis) > 12:
+                    return j + 0.5
+            return c
+        lo, hi = int(max(0, c - search * size)), int(min(size - 2, c + search * size))
+        best, at = 0.0, None
+        for i in range(lo, hi + 1):
+            sc = score(i, grads, span, axis)
+            if sc > best:
+                best, at = sc, i
+        if at is None or best <= 6:
+            return c
+        # a border is a band: its inner edge (a few px further in) is where the picture starts
+        reach = max(2, int(round(14 * size / (1920 if axis == 1 else 1080))))
+        for d in range(reach, 0, -1):
+            j = at + inward * d
+            if 0 <= j < size - 1 and score(j, grads, span, axis) >= 0.35 * best:
+                at = j
+                break
+        return at + 0.5
+
+    L, R = snap(x0, W, gx, sx, 1, +1), snap(x1, W, gx, sx, 1, -1)
+    T, B = snap(y0, H, gy, sy, 0, +1), snap(y1, H, gy, sy, 0, -1)
+    k = inset_px * W / 1920
+    L, R = (L + k if L > 2 else 0.0), (R - k if R < W - 2 else float(W))
+    T, B = (T + k if T > 2 else 0.0), (B - k if B < H - 2 else float(H))
+    return [round(L / W, 4), round(T / H, 4), round((R - L) / W, 4), round((B - T) / H, 4)]
+
+
+def cli(rec: str | None = None, channel: str | None = None, out: str | None = None, save_it: bool = True,
+        refine_it: bool = False) -> dict:
     if not available():
         raise SystemExit("facecam: opencv is not installed — run bash setup/setup.sh")
     if rec:
@@ -436,6 +534,15 @@ def cli(rec: str | None = None, channel: str | None = None, out: str | None = No
     else:
         raise SystemExit("facecam: pass --rec DIR or --channel LOGIN")
     ov = override(login) if login else None
+    if refine_it:
+        base = ov or res.get("box")
+        if not base or len(frames) < 2:
+            raise SystemExit("facecam --refine: no box to refine (set one in config/creators.json first)")
+        nb = refine(base, frames)
+        check_image(frames[len(frames) // 2], {"box": nb, "confidence": 1.0}, out)
+        print(f"facecam {login}: clean cut {nb} (from {base}) — look at the check image: {out}\n"
+              f"  if it's right, put it in config/creators.json as \"facecam\": {nb}")
+        return {"box": nb, "from": base, "login": login, "check_image": out}
     if frames:
         check_image(frames[len(frames) // 2], res, out)
     good = bool(res.get("box")) and res["confidence"] >= GOOD

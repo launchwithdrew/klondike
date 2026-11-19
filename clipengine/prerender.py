@@ -95,7 +95,8 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
         try:
             with FC.creator(entry.get("login")):
                 info = V.render(src, first, s, e, words, tmp, crop="blur", layout="stack",
-                                watermark=V.WATERMARK, drop_captions=SN.game_spans(words) or None)
+                                watermark=V.WATERMARK, drop_captions=SN.game_spans(words) or None,
+                                captions_later=True)
         finally:
             try:
                 os.remove(src)
@@ -106,6 +107,10 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
             raise RuntimeError(f"pre-render came out {(e - s) - got:.1f} s short")
         os.replace(tmp, mp4)
         os.replace(tmp.rsplit(".mp4", 1)[0] + ".transcript.json", mp4.rsplit(".mp4", 1)[0] + ".transcript.json")
+        caps_json = None
+        if info.get("captions_later") and os.path.exists(info["captions_later"]):
+            caps_json = mp4.rsplit(".mp4", 1)[0] + ".captions.json"     # burned with the card at publish
+            os.replace(info["captions_later"], caps_json)
         for ext in (".ass", ".srt"):
             try:
                 os.remove(tmp.rsplit(".mp4", 1)[0] + ext)
@@ -118,6 +123,7 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
                      "audio": [w.get("w") for w in a.get("audio", [])]}
         vis = VI.check(mp4)
         meta = {"id": entry["id"], "mp4": mp4, "start": s, "stop": e, "slot": info.get("card_slot") or {},
+                "captions": caps_json,
                 "layout": info.get("layout"), "facecam": info.get("facecam"), "watermark": info.get("watermark"),
                 "bleeps": info.get("bleeps"), "audit": audit,
                 "vision": {k: vis[k] for k in ("cuts_per_min", "static", "dark", "flags")},

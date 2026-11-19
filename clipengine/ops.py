@@ -455,7 +455,7 @@ def plan_sentinels(rows: list[dict], moments: list[dict], roster: dict, top: int
     ok = lambda l: l in live and AP.policy(l, roster) != "never"
     first = [l for l, c in roster.items() if c.get("vods") is False and ok(l)]
     prom = [l for l in (promoted or []) if ok(l)]
-    picked = [r["login"] for r in rows if r.get("action") in ("scan", "record") and ok(r["login"])]
+    picked = [r["login"] for r in rows if r.get("action") in ("scan", "record", "start") and ok(r["login"])]
     hot = [m["login"] for m in moments if not m.get("unsafe") and not m.get("published") and ok(m["login"])]
     rest = [r["login"] for r in rows if ok(r["login"])]
     return list(dict.fromkeys(first + prom + picked + hot + rest))[:top]
@@ -636,6 +636,10 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             from . import radar as R
             res = R.run(None, None, show=top + 3, quiet=True)
             live = set(res.get("live_logins") or [r["login"] for r in res["streamers"]])   # every live stream, not only ranked ones
+            from .live import source_name as _sn0
+            live |= {_sn0(l) for l in live if l.startswith("kick:")}      # a Kick sentinel runs as kick-<slug>
+            # Kick rows off the roster are listed for a person to judge (kick.py is unverified): no automatic sentinel
+            plan_rows = [r for r in res["streamers"] if r.get("platform") != "kick" or r["login"] in roster]
             if any(k.startswith("kick:") for k in roster):     # Kick creators: their own live check
                 from . import kick as K
                 from .live import source_name as _sn
@@ -655,7 +659,7 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             except Exception as exc:
                 prom = []
                 notes.append(f"tier 1 failed: {str(exc)[:60]}")
-            want = plan_sentinels(res["streamers"], res["moments"], roster, top, promoted=prom, live_extra=live)
+            want = plan_sentinels(plan_rows, res["moments"], roster, top, promoted=prom, live_extra=live)
             for l in prom:
                 if l in want and l not in {s_["login"] for s_ in all_sentinels() if s_["alive"] and not s_["stopped"]}:
                     notes.append(f"{l} promoted to tier 2 (chat heating up)")
@@ -872,7 +876,8 @@ def doctor(accounts: bool = False) -> bool:
         from . import kick as K
         st = K.live_status(kicks[0])
         check("kick data (kick.com)", not st.get("error"), (st.get("error") or "")[:120] +
-              " — needs kick.com, ws-us2.pusher.com and the *.live-video.net playback hosts")
+              " — needs kick.com, ws-us2.pusher.com and the *.live-video.net playback hosts; `clipengine kick-check` "
+              "says which step fails")
     from . import repo as RP
     if not RP.public() and os.environ.get("CLIPENGINE_NO_SYNC") == "1":
         print("· test run (CLIPENGINE_NO_SYNC=1): nothing is committed or pushed, tracked data isn't rewritten")

@@ -20,7 +20,7 @@ was of, and the banger score it had), then writes data/weights.json:
   streamer_posts  how many reads each streamer has (the gate explores the unknown)
   formats     the same for layout, caption style and length bucket (format_factor() turns it into a nudge)
   parts       per judge score part (grade.engine_score parts): worth of posts high vs low on it
-  taste       streamers whose clips keep failing the frame check / rubric / queue skip: pushed down
+  taste       streamers whose clips keep failing the frame check / rubric / --taste no / queue skip: pushed down
   windows     per platform, the local hours whose posts did best (prime time until there's data);
               the gate schedules clips that aren't time-critical into them
   summary     ONE plain line: what changed this run and why (report shows it)
@@ -43,6 +43,7 @@ PERF = os.path.join(REPO, "data", "performance.jsonl")
 LEDGER = os.path.join(REPO, "ledger.jsonl")
 CLIPPED = os.path.join(REPO, "data", "clipped.jsonl")
 WEIGHTS = os.path.join(REPO, "data", "weights.json")
+TASTE = os.path.join(REPO, "data", "taste.jsonl")        # explicit --taste no verdicts
 
 TARGET_AGE_H = 24.0
 PRIOR_POSTS = 3          # shrinkage: a streamer needs a few posts before their factor moves far from 1.0
@@ -212,9 +213,18 @@ def posting_windows(by_plat_hour: dict[str, list[tuple[int, float]]], tz: str, d
     return out
 
 
-def taste(clipped_rows: list[dict], drafts: list[dict] | None = None) -> dict[str, dict]:
-    """Per streamer: clips that failed the frame check / rubric (≤1 check true) or were skipped in the queue."""
+def taste(clipped_rows: list[dict], drafts: list[dict] | None = None,
+          verdicts: list[dict] | None = None) -> dict[str, dict]:
+    """Per streamer: clips that failed the frame check / rubric (≤1 check true), were skipped in the queue,
+    or got an explicit `--taste no` ("would a fan be glad to see this posted?" — data/taste.jsonl)."""
     t: dict[str, dict] = {}
+    for r in verdicts or []:
+        login = (r.get("login") or "").lower()
+        if login and r.get("verdict") == "no":
+            d = t.setdefault(login, {"miss": 0, "seen": 0})
+            d["seen"] += 1
+            d["miss"] += 1
+            d["taste_no"] = d.get("taste_no", 0) + 1
     for r in clipped_rows:
         login = (r.get("login") or "").lower()
         if not login or r.get("rubric") is None:
@@ -224,7 +234,7 @@ def taste(clipped_rows: list[dict], drafts: list[dict] | None = None) -> dict[st
         d["miss"] += int(len(r.get("rubric") or []) <= 1)
     for r in drafts or []:
         login = (r.get("login") or "").lower()
-        if login and r.get("status") == "skipped":
+        if login and r.get("status") == "skipped" and r.get("reason") != "taste":   # those are in `verdicts`
             d = t.setdefault(login, {"miss": 0, "seen": 0})
             d["seen"] += 1
             d["miss"] += 1
@@ -235,7 +245,8 @@ def taste(clipped_rows: list[dict], drafts: list[dict] | None = None) -> dict[st
 
 
 def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creators: dict,
-          previous: dict | None = None, now: float | None = None, drafts: list[dict] | None = None) -> dict:
+          previous: dict | None = None, now: float | None = None, drafts: list[dict] | None = None,
+          verdicts: list[dict] | None = None) -> dict:
     import time
     now = now or time.time()
     previous = previous or {}
@@ -285,7 +296,7 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
     for (plat, login), v in per_fit.items():
         fit.setdefault(plat, {})[login] = round(_shrink(v, streamers.get(login, 1.0)), 3)
     # taste: a streamer whose clips keep failing the frame check / rubric is pushed down (radar + gate read it)
-    tst = taste(clipped_rows, drafts)
+    tst = taste(clipped_rows, drafts, verdicts)
     for login, d in tst.items():
         if d["factor"] < 1.0:
             streamers[login] = round(streamers.get(login, 1.0) * d["factor"], 3)
@@ -412,7 +423,8 @@ def explain(previous: dict, streamers: dict, thresholds: dict, windows: dict, ts
         why = ""
         if tst.get(login, {}).get("factor", 1.0) < 1.0:
             d = tst[login]
-            why = f"{d['miss']} of {d['seen']} clips failed the frame check/taste"
+            why = (f"{d['miss']} of {d['seen']} clips failed the frame check/taste"
+                   + (f" ({d['taste_no']} --taste no)" if d.get("taste_no") else ""))
         else:
             mine = [(k, e) for k, e in evidence.items() if login_for(k[0], clipped, creators) == login]
             shared = [(k, e) for k, e in mine if e.get("shares") is not None and e.get("med_shares") is not None]
@@ -450,7 +462,8 @@ def run(write: bool = True) -> dict:
         drafts = load_queue()
     except Exception:
         drafts = []
-    res = learn(_rows(PERF), _rows(LEDGER), _rows(CLIPPED), creators(), previous, drafts=drafts)
+    res = learn(_rows(PERF), _rows(LEDGER), _rows(CLIPPED), creators(), previous, drafts=drafts,
+                verdicts=_rows(TASTE))
     print(f"LEARN — {sum(res['streamer_posts'].values())} post reads (24 h medians: "
           + ", ".join(f"{p} {d['median_views']:,.0f}" for p, d in res["platforms"].items()) + ")")
     for login, f in sorted(res["streamers"].items(), key=lambda x: -x[1]):

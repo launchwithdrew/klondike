@@ -21,7 +21,9 @@ _SEXUAL = [
     r"\bbooty\b", r"\bthick\b", r"\bdick\w*", r"\bcock\w*", r"\bpuss(y|ies)\b", r"\btits?\b", r"\btitties\b", r"\bboobs?\b",
     r"\bnut(ted|ting)?\b", r"\bsmash(ed|ing)?\b", r"\bhook ?up\w*", r"\bonlyfans\b", r"\bporn\w*", r"\bbang(ed|ing)\b",
     r"\bfucking each other\b", r"\bprison wife\b", r"\bmain bitch\b", r"\bside (bitch|chick|piece)\b",
-    r"\bso (fucking |f\*+ing )?hot\b", r"\b(that|her|them|dat) ass\b", r"\bass was\b", r"\bjiggl\w*", r"\bcondom\w*", r"\berect\w*", r"\bmoan\w*", r"\bgyat+\b", r"\brizz\w*", r"\bgoon\w*",
+    r"\bso (fucking |f\*+ing )?hot\b", r"\b(that|her|them|dat) ass\b", r"\bass was\b", r"\bjiggl\w*", r"\bcondom\w*", r"\berect\w*", r"\bmoan\w*", r"\bgy+a+t+\b", r"\brizz\w*", r"\bgoon\w*",
+    r"\bthongs?\b", r"\bbikini\w*", r"\bdump ?truck\w*", r"\bcaked?( up)?\b", r"\bbussy\b", r"\bthicc\w*",
+    "\U0001F351", "\U0001F975", "\U0001F346", "\U0001F4A6",            # peach, hot face, eggplant, droplets
 ]
 _RE = re.compile("|".join(_SEXUAL), re.I)
 
@@ -46,7 +48,7 @@ def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: li
     chat = scan_text(" ".join(chat_lines or []))
     # chat jokes about everything, so one word is noise — but several people on it is the moment's topic
     chat_msgs = sum(1 for c in chat_lines or [] if _RE.search(c or ""))
-    chat_hot = len(chat) >= 3 or chat_msgs >= max(3, 0.05 * len(chat_lines or []))
+    chat_hot = len(chat) >= 3 or chat_msgs >= max(3, 0.03 * len(chat_lines or []))
     flagged = len(said) >= 2 or bool(named) or chat_hot
     why = []
     if said:

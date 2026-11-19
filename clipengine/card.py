@@ -98,6 +98,18 @@ def _wrap(text: str, w: _Writer, max_w: int) -> list[str]:
     return lines
 
 
+def styles() -> dict:
+    """Title styles beyond the built-in card, from the channel's own private folder `clipengine/house/`
+    (never part of the engine's releases: a channel's look stays between it and its agent). A style is
+    `fn(title, quote, out_png, card, quote_style, width) -> (png, height, mid_y)`, listed in
+    `clipengine/house/__init__.py` as CARD_STYLES = {"name": fn}; brand.json picks it with card.style."""
+    try:
+        from . import house                          # noqa: F401  (absent in a fresh copy)
+        return dict(getattr(house, "CARD_STYLES", {}) or {})
+    except ImportError:
+        return {}
+
+
 def make_card(title: str, quote: str | None, out_png: str, width: int = 1080,
               title_size: int | None = None, quote_size: int | None = None,
               style: dict | None = None) -> tuple[str, int, int]:
@@ -107,6 +119,9 @@ def make_card(title: str, quote: str | None, out_png: str, width: int = 1080,
     b = B.load()
     card = {**b["card"], **((style or {}).get("card") or {})}
     qs = {**b["quote"], **((style or {}).get("quote") or {})}
+    style_fn = styles().get(card.get("style") or "")
+    if style_fn:                                    # a title style the channel brought (see styles())
+        return style_fn(title, quote, out_png, card, qs, width=width)
     title_size = title_size or card["size"]
     quote_size = quote_size or qs["size"]
     tw = _Writer(title_size, B.font(card["font"]))
@@ -149,3 +164,4 @@ def make_card(title: str, quote: str | None, out_png: str, width: int = 1080,
         qw.draw(img, (qx + 26, qy + 14), qtext, B.rgba(qs["text"]))
     img.save(out_png)
     return out_png, H, by + box_h // 2
+

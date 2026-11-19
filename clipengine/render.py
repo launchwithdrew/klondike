@@ -128,7 +128,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,{cs["font"]},{size},{B.ass_color(cs["color"])},&H000019FF,{B.ass_color(cs["outline"])},&H80000000,-1,0,0,0,100,100,0,0,1,{cs["outline_width"]},0,2,80,80,{margin_v},1
+Style: Cap,{cs["font"]},{size},{B.ass_color(cs["color"])},&H000019FF,{B.ass_color(cs["outline"])},&H80000000,-1,0,0,0,100,100,0,0,1,{cs["outline_width"]},0,{1 if cs.get("align") == "left" else 2},{int(cs.get("margin_l", 80))},80,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -232,7 +232,7 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
            censor: bool = True, mute_audio: bool = False, layout: str = "single",
            title: str | None = None, quote: str | None = None, extra_censor: set[str] | None = None,
            drop_captions: list[tuple[float, float]] | None = None, login: str | None = None,
-           facecam: list[float] | None = None) -> dict:
+           facecam: list[float] | None = None, captions_later: bool = False) -> dict:
     """Render [start_s, end_s] (VOD seconds) of `source` (a .ts whose first
     frame is VOD second source_t0). `words` are VOD-time word dicts.
 
@@ -262,7 +262,8 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
         if facecam:
             fc_info = {"box": list(facecam), "confidence": 1.0, "source": "given"}
         else:
-            fc_info = FC.for_clip(source, who, start=max(0.0, start_s - source_t0), end=end_s - source_t0)
+            fc_info = FC.for_clip(source, who, start=max(0.0, start_s - source_t0), end=end_s - source_t0,
+                                  detect=bp["layout"].get("facecam_detect", True))
         mi = FC.media_info(source) if fc_info.get("box") else {}
         if fc_info.get("box") and mi.get("width"):
             split = float(bp["layout"].get("split", FACECAM_MAX))
@@ -274,19 +275,41 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
     stack_top = int(round(1920 * float(bp["layout"].get("split", STACK_TOP / 1920)) / 2)) * 2
     caps = bp["captions"]
     cards = word_cards(clip_words, start_s, end_s, caps.get("uppercase", True))
+    if caps.get("show", True) is False:
+        cards = []                          # the pack burns no captions (the .srt below still has the words)
+        write_srt(word_cards(clip_words, start_s, end_s, caps.get("uppercase", True)), base + ".srt")
     ass = base + ".ass"
+    cap_size = caps.get("size") or (72 if layout in ("stack", "facecam") else 84)
     cap_y = float(caps.get("y", 0.56)) * 1920
     if geo:
         # captions belong on the gameplay panel, clear of the headline card on the seam
         cap_y = min(1920 - 420, max(cap_y, geo["top"] + 330))
-    write_ass(cards, ass, margin_v=int(round(1920 - cap_y)),
-              size=caps.get("size") or (72 if layout in ("stack", "facecam") else 84))
+    later = None
+    if captions_later:
+        # a pre-render: the title isn't written yet, so the captions are burned with the card (burn_card)
+        later = base + ".captions.json"
+        json.dump({"cards": cards, "size": cap_size, "default_y": cap_y}, open(later, "w"))
+        cards_burn = []
+    else:
+        cards_burn = cards
+    card_png, card_y, card_h = None, None, None
+    seam_top = geo["top"] if geo else None
+    if title and bp["card"].get("show", True):
+        from .card import make_card
+        t = C.censor_text(title) if censor else title
+        q = (C.censor_text(quote) if censor else quote) if quote else None
+        card_png, card_h, card_mid = make_card(t, q, base + ".card.png")
+        stack_top_ = int(round(1920 * float(bp["layout"].get("split", STACK_TOP / 1920)) / 2)) * 2
+        slot0 = {"layout": layout, "seam": seam_top if geo else (stack_top_ if layout == "stack" else None)}
+        card_y = card_position(bp, slot0, card_h, card_mid)
+        cap_y = caption_y(bp, card_y, card_h, cap_size, cap_y)
+    write_ass(cards_burn, ass, margin_v=int(round(1920 - cap_y)), size=cap_size)
     cap_font_dir = os.path.dirname(B.font(caps.get("font_file", "InterDisplay-Bold.ttf")))
-    write_srt(cards, base + ".srt")
+    if cards or caps.get("show", True) is not False:
+        write_srt(cards, base + ".srt")
     rel_bleeps = [[round(max(0.0, a - start_s), 2), round(b - start_s, 2)] for a, b in bleeps]
     dur = end_s - start_s
 
-    card_png = None
     # where the headline card goes: kept with a pre-render so the card can be burned in later (burn_card)
     slot = {"layout": layout, "seam": geo["top"] if geo else (stack_top if layout == "stack" else None)}
     if layout == "stack":
@@ -304,12 +327,6 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
               f"[top][bot]vstack=2,subtitles='{ass}':fontsdir='{cap_font_dir}'")
     else:
         vf = f"[0:v]{CROPS[crop]},subtitles='{ass}':fontsdir='{cap_font_dir}'"
-    if title and bp["card"].get("show", True):
-        from .card import make_card
-        t = C.censor_text(title) if censor else title
-        q = (C.censor_text(quote) if censor else quote) if quote else None
-        card_png, card_h, card_mid = make_card(t, q, base + ".card.png")
-        card_y = card_position(bp, slot, card_h, card_mid)
     if header:
         h = C.censor_text(header) if censor else header
         if censor and h != header:
@@ -336,7 +353,7 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
         m = int(logo.get("margin", 32))
         corner = logo.get("corner", "bottom-right")
         ox = f"W-w-{m}" if "right" in corner else f"{m}"
-        oy = f"H-h-{m}" if "bottom" in corner else f"{m}"
+        oy = f"H-h-{m}" if "bottom" in corner else f"{int(logo.get('top', m))}"   # top: clear of the apps' icons
         chain += (f";[{n}:v]format=rgba,colorchannelmixer=aa={float(logo.get('opacity', 0.65))},"
                   f"scale={int(logo.get('width', 260))}:-1[wm];[{last}][wm]overlay={ox}:{oy}[v2]")
         last, n = "v2", n + 1
@@ -366,7 +383,8 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
     json.dump(transcript, open(base + ".transcript.json", "w"), indent=2)
     return {"out": out, "cards": len(cards), "censored": sum("***" in c["text"] for c in cards),
             "bleeps": rel_bleeps, "watermark": use_wm, "crop": crop if layout == "single" else layout,
-            "layout": layout, "facecam": fc_info, "title": title, "quote": quote, "card_slot": slot}
+            "layout": layout, "facecam": fc_info, "title": title, "quote": quote, "card_slot": slot,
+            "captions_later": later, "card_box": [card_y, card_h] if card_png else None}
 
 
 def render_preset() -> str:
@@ -378,9 +396,22 @@ def render_preset() -> str:
         return "veryfast"
 
 
+def caption_y(bp: dict, card_y: int | None, card_h: int | None, size: int, default_y: float) -> float:
+    """Where the captions' bottom line sits: neatly right under the headline card (the pack's
+    captions.under_card, default on), else where the pack put them."""
+    if card_y is None or not card_h or not bp["captions"].get("under_card", True):
+        return default_y
+    gap = int(bp["captions"].get("gap", 18))
+    return min(1920 - 300, card_y + card_h + gap + int(size * 1.2))
+
+
 def card_position(bp: dict, slot: dict, card_h: int, card_mid: int) -> int:
     """y of the headline card: on the seam (facecam always; stack when the pack says "seam"), else top/bottom."""
     pos = bp["card"].get("position", "top")
+    if bp["card"].get("anchor") == "below_seam" and slot.get("seam"):
+        return slot["seam"] + int(bp["card"].get("seam_gap", 0))   # just under the seam: the webcam stays clear
+    if bp["card"].get("anchor") == "above_seam" and slot.get("seam"):
+        return slot["seam"] - card_h                        # the card's bottom on the seam (a corner title)
     if slot.get("layout") == "facecam" and slot.get("seam"):
         return slot["seam"] - card_mid
     if pos == "seam" and slot.get("layout") == "stack" and slot.get("seam"):
@@ -391,7 +422,7 @@ def card_position(bp: dict, slot: dict, card_h: int, card_mid: int) -> int:
 
 
 def burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: dict, trim_start: float = 0.0,
-              dur: float | None = None, censor: bool = True) -> dict:
+              dur: float | None = None, censor: bool = True, captions: str | None = None) -> dict:
     """The last step of a pre-rendered draft: overlay the headline card on the finished clip (captions,
     bleeps, logo already in it), optionally trimmed. One short encode; audio is copied when not trimmed."""
     from . import brand as B
@@ -401,15 +432,32 @@ def burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: di
     if trim_start > 0:
         cmd += ["-ss", f"{trim_start:.3f}"]
     cmd += ["-i", pre]
-    card_png = None
+    card_png, y, card_h = None, None, None
     if title and bp["card"].get("show", True):
         from .card import make_card
         t = C.censor_text(title) if censor else title
         q = (C.censor_text(quote) if censor else quote) if quote else None
         card_png, card_h, card_mid = make_card(t, q, base + ".card.png")
         y = card_position(bp, slot, card_h, card_mid)
+    subs = ""
+    cap = json.load(open(captions)) if captions and os.path.exists(captions) else None
+    if cap and cap.get("cards"):
+        # the pre-render left its captions out: burn them now, right under this card
+        caps = bp["captions"]
+        shift = trim_start
+        cards = [{**c, "start": c["start"] - shift, "end": c["end"] - shift} for c in cap["cards"]
+                 if c["end"] - shift > 0]
+        ass = base + ".ass"
+        cy = caption_y(bp, y, card_h, cap["size"], cap["default_y"])
+        write_ass(cards, ass, margin_v=int(round(1920 - cy)), size=cap["size"])
+        font_dir = os.path.dirname(B.font(caps.get("font_file", "InterDisplay-Bold.ttf")))
+        subs = f"subtitles='{ass}':fontsdir='{font_dir}',"
+    if card_png:
         cmd += ["-loop", "1", "-t", f"{(dur or 180) + 2:.3f}", "-framerate", "30", "-i", card_png,
-                "-filter_complex", f"[0:v][1:v]overlay=0:{y}:shortest=1,format=yuv420p[vout]", "-map", "[vout]"]
+                "-filter_complex", f"[0:v]{subs}null[b];[b][1:v]overlay=0:{y}:shortest=1,format=yuv420p[vout]",
+                "-map", "[vout]"]
+    elif subs:
+        cmd += ["-filter_complex", f"[0:v]{subs}format=yuv420p[vout]", "-map", "[vout]"]
     else:
         cmd += ["-map", "0:v:0"]
     cmd += ["-map", "0:a:0?"]

@@ -46,7 +46,12 @@ DEFAULTS = {
     "audience_cap": 300000,
     "heat_cap_vpm": 200,
     "act_score": 45,
+    "kick": True,                 # also list live Kick streams in the category (best effort, see kick.py)
+    "kick_category": None,        # Kick's subcategory slug; default made from "game"
+    "kick_min_viewers": 500,
+    "kick_retry_min": 30,         # after Kick fails, don't ask again for this long (one quiet line meanwhile)
 }
+KICK_STATE = os.path.join(REPO, "runs", "kick-radar.json")
 
 _STREAMS = """query($name: String!, $first: Int, $langs: [String!]) { game(name: $name) {
   streams(first: $first, options: {languages: $langs}) { edges { node {
@@ -88,6 +93,38 @@ def live_streams(cfg: dict) -> list[dict]:
                     "viewers": int(n.get("viewersCount") or 0), "title": n.get("title") or "",
                     "started": n.get("createdAt")})
     return out
+
+
+def kick_streams(cfg: dict, now: float | None = None) -> tuple[list[dict], str]:
+    """Live Kick streams in the category as radar rows, plus ONE status line ("kick: 3 live (official API)",
+    "kick: unreachable (403)"). Never raises; after a failure it waits `kick_retry_min` before asking again."""
+    import time
+    if not cfg.get("kick"):
+        return [], ""
+    now = now or time.time()
+    try:
+        st = json.load(open(KICK_STATE))
+    except (OSError, ValueError):
+        st = {}
+    if st.get("failed_at") and now - st["failed_at"] < cfg.get("kick_retry_min", 30) * 60:
+        left = int((cfg.get("kick_retry_min", 30) * 60 - (now - st["failed_at"])) // 60) + 1
+        return [], f"kick: unreachable ({st.get('why', '?')}) — next try in {left} min"
+    try:
+        from . import kick as K
+        from . import ops as O
+        res = K.category_streams(cfg["game"], cfg["languages"], cfg.get("kick_category"),
+                                 creds=K.credentials(O.config()))
+    except Exception as exc:                       # belt and braces: the radar never dies over Kick
+        res = {"ok": False, "rows": [], "why": str(exc)[:40]}
+    try:
+        os.makedirs(os.path.dirname(KICK_STATE), exist_ok=True)
+        json.dump({} if res["ok"] else {"failed_at": now, "why": res["why"]}, open(KICK_STATE, "w"))
+    except OSError:
+        pass
+    if not res["ok"]:
+        return [], f"kick: unreachable ({res['why']})"
+    rows = [r for r in res["rows"] if r["viewers"] >= cfg.get("kick_min_viewers", 0)]
+    return rows, f"kick: {len(rows)} live over {cfg.get('kick_min_viewers', 0):,} viewers ({res['via']}, unverified)"
 
 
 def category_clips(cfg: dict) -> list[dict]:
@@ -147,7 +184,8 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
     factors = (learned.get("streamers") or {})
     rows = []
     for s in streams:
-        if s["viewers"] < cfg["min_viewers"]:
+        kick = s.get("platform") == "kick"
+        if s["viewers"] < (cfg.get("kick_min_viewers", 0) if kick else cfg["min_viewers"]):
             continue
         r = roster.get(s["login"], {})
         f = factors.get(s["login"])
@@ -163,7 +201,8 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
         score = round(sum(parts.values()), 1)
         rows.append({**s, "score": score, "parts": {k: round(v, 1) for k, v in parts.items()},
                      "heat_vpm": round(heat.get(s["login"], 0.0), 1), "on_roster": bool(r),
-                     "vods": r.get("vods"), "policy": str(r.get("policy") or "allowed").lower()})
+                     "vods": r.get("vods"), "policy": str(r.get("policy") or "allowed").lower(),
+                     **({"platform": "kick", "cmd": f"start --channel {s['login']}"} if kick else {})})
     # creators who don't allow clipping (config/creators.json "policy": "never") are listed last
     return sorted(rows, key=lambda r: (r["policy"] == "never", -r["score"]))
 
@@ -219,6 +258,8 @@ def _action(row: dict, cfg: dict) -> str:
         return "never"
     if row["score"] < cfg["act_score"]:
         return "watch"
+    if row.get("platform") == "kick":           # no VOD scanning on Kick: a sentinel records it live
+        return "start"
     if row["vods"] is True:
         return "scan"
     if row["vods"] is False:
@@ -237,7 +278,8 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
         cfg["trending_window_h"] = hours
     now = dt.datetime.now(dt.timezone.utc)
     streams, clips = live_streams(cfg), category_clips(cfg)
-    rows = score_streamers(streams, clips, creators(), learned_weights(), cfg, now)
+    kick_rows, kick_line = kick_streams(cfg, now.timestamp())
+    rows = score_streamers(streams + kick_rows, clips, creators(), learned_weights(), cfg, now)
     for r in rows[:show]:
         r["action"] = _action(r, cfg)
     moments = trending_moments(clips, cfg, now, load_clipped())
@@ -249,18 +291,21 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
                 m["unsafe"] = "doesn't allow clipping (policy: never)"
         moments.sort(key=lambda m: (bool(m["unsafe"]) or bool(m["published"]), -m["vpm"]))
     res = {"at": now.isoformat(), "game": cfg["game"], "streamers": rows, "moments": moments,
-           "live_count": len(streams), "live_logins": [s["login"] for s in streams]}
+           "live_count": len(streams) + len(kick_rows), "live_logins": [s["login"] for s in streams + kick_rows],
+           "kick": kick_line}
     if quiet:
         return res
 
     print(f"RADAR {now:%H:%M} UTC — {cfg['game']} ({','.join(cfg['languages'])}): "
-          f"{len(streams)} live, {len(clips)} viewer clips today\n")
+          f"{len(streams)} live, {len(clips)} viewer clips today" + (f"\n{kick_line}" if kick_line else "") + "\n")
     print(f"{'score':>5}  {'streamer':<18}{'viewers':>9}{'clip v/min':>11}  action   (audience/heat/history/priority)")
     for r in rows[:show]:
         p = r["parts"]
-        tag = "" if r["on_roster"] else "  NEW"
+        tag = ("" if r["on_roster"] else "  NEW") + ("  kick" if r.get("platform") == "kick" else "")
         print(f"{r['score']:5.0f}  {r['login']:<18}{r['viewers']:>9,}{r['heat_vpm']:>11.1f}  {r['action']:<8} "
               f"({p['audience']:.0f}/{p['heat']:.0f}/{p['history']:.0f}/{p['priority']:.0f}){tag}")
+        if r.get("cmd") and r["action"] != "never":
+            print(f"           -> python -m clipengine {r['cmd']}")
     print(f"\nHOTTEST MOMENTS (last {cfg['trending_window_h']:g} h, by views per minute)")
     for m in moments[:show]:
         flag = f"  ⛔ {m['unsafe']}" if m["unsafe"] else (f"  ✓ published as {m['published']}" if m["published"] else "")

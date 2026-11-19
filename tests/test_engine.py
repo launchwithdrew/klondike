@@ -1996,6 +1996,23 @@ def test_facecam_override_beats_cache(tmp_path, monkeypatch):
     assert FC.current_login() is None
 
 
+def test_facecam_off_for_a_creator_and_only_checked_boxes_when_detection_is_off(tmp_path, monkeypatch):
+    from clipengine import facecam as FC
+    roster = tmp_path / "creators.json"
+    roster.write_text(json.dumps({"creators": {"streamera": {"facecam": [0.7, 0.7, 0.3, 0.3]},
+                                               "roomcam": {"facecam": False}, "unchecked": {}}}))
+    monkeypatch.setattr(FC, "CREATORS", str(roster))
+    monkeypatch.setattr(FC, "CACHE", str(tmp_path / "facecam.json"))
+    looked = []
+    monkeypatch.setattr(FC, "detect_file", lambda *a, **k: looked.append(1) or {"box": [0, 0, .2, .2], "confidence": .9})
+    FC.save("roomcam", {"box": [0.0, 0.0, 0.2, 0.2], "confidence": 0.9}, "test")
+    assert FC.for_clip("x.mp4", "roomcam")["box"] is None and FC.known("roomcam") is None   # never a facecam
+    assert FC.for_clip("x.mp4", "streamera", detect=False)["box"] == [0.7, 0.7, 0.3, 0.3]   # a checked box
+    assert FC.for_clip("x.mp4", "unchecked", detect=False)["box"] is None                   # stack, not a guess
+    assert looked == []                                                                     # nothing detected
+    assert FC.for_clip("x.mp4", "unchecked")["box"] == [0, 0, .2, .2] and looked == [1]     # default: detect
+
+
 def test_facecam_render_and_fallback(src, tmp_path, monkeypatch):
     from clipengine import facecam as FC
     monkeypatch.setattr(FC, "CACHE", str(tmp_path / "facecam.json"))
@@ -2007,7 +2024,11 @@ def test_facecam_render_and_fallback(src, tmp_path, monkeypatch):
     assert (v["width"], v["height"]) == (1080, 1920) and info["layout"] == "facecam"
     ass = open(out.replace(".mp4", ".ass")).read()
     margin_v = int(ass.split("Style: Cap,")[1].split(",")[20])
-    assert 1920 - margin_v >= V.facecam_geometry([0.0, 0.0, 0.25, 0.3], 1920, 1080)["top"] + 300   # captions on gameplay
+    card_y, card_h = info["card_box"]
+    size = int(ass.split("Style: Cap,")[1].split(",")[1])
+    cap_top = 1920 - margin_v - int(size * 1.2)
+    assert card_y + card_h <= cap_top <= card_y + card_h + 60       # captions neatly right under the card
+    assert cap_top > V.facecam_geometry([0.0, 0.0, 0.25, 0.3], 1920, 1080)["top"]       # on the gameplay
     out2 = str(tmp_path / "fb.mp4")                                          # no webcam in a test pattern
     info2 = V.render(src, 100.0, 100.0, 103.0, [], out2, layout="facecam", watermark=None)
     assert info2["layout"] == "stack" and "rendered stack instead" in info2["facecam"]["note"]
@@ -2472,3 +2493,314 @@ def test_kick_creators_run_in_both_tiers():
     assert "K.KickChat(login[5:])" in src
     src = open(os.path.join(ROOT, "clipengine", "sentinel.py")).read()
     assert "K.KickChat(source)" in src
+
+
+def test_prerender_leaves_captions_for_the_card_step(src, tmp_path):
+    words = [{"w": " no", "start": 101.0, "end": 101.3}, {"w": " way", "start": 101.5, "end": 101.8}]
+    pre = str(tmp_path / "pre.mp4")
+    info = V.render(src, 100.0, 100.0, 103.0, words, pre, layout="stack", watermark=None, captions_later=True)
+    assert "Dialogue:" not in open(pre.replace(".mp4", ".ass")).read()            # nothing burned yet
+    cap = json.load(open(info["captions_later"]))
+    assert [c["text"] for c in cap["cards"]] and cap["size"]
+    out = str(tmp_path / "out.mp4")
+    r = V.burn_card(pre, out, "Streamera found a SECRET room", "no way", info["card_slot"], dur=3,
+                    captions=info["captions_later"])
+    assert r["card"] and "Dialogue:" in open(out.replace(".mp4", ".ass")).read()   # burned with the card
+
+
+# ---- taste: one explicit yes/no, separate from the score -----------------------------------------
+
+def test_taste_is_required_to_drop_and_no_refuses_and_is_recorded(tmp_path, monkeypatch):
+    import json as _json, datetime as _dt
+    from clipengine import publish as PB, learn as LN
+    monkeypatch.setenv("CLIPENGINE_NO_AUDIT", "1")
+    monkeypatch.setenv("CLIPENGINE_NO_SYNC", "1")
+    monkeypatch.setattr(PB, "TASTE", str(tmp_path / "taste.jsonl"))
+    assert PB.parse_taste("Yes") is True and PB.parse_taste("no") is False and PB.parse_taste(None) is None
+    with pytest.raises(ValueError):
+        PB.parse_taste("maybe")
+    out = tmp_path / "c.mp4"
+    (tmp_path / "c.transcript.json").write_text(_json.dumps({"segments": [{"start": 1.0, "text": "no way", "words": []}]}))
+    rep = {"out": str(out), "watermark": True, "pre_vision": {"cuts_per_min": 0, "static": 0, "dark": 0, "flags": []}}
+    args = (rep, "streamera", "streamera", 100.0, 120.0, _dt.datetime.now(_dt.timezone.utc), "Streamera NO WAY 😭",
+            "line", None, None, True, False, False, False, {}, ["hook", "payoff"])
+    with pytest.raises(SystemExit, match="--taste yes\\|no"):         # frames checked + rubric, but no taste answer
+        PB._finish(*args)
+    # --taste no: refused before anything renders, recorded as a skip with reason "taste"
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.json").write_text(_json.dumps({"login": "StreamerA"}))
+    with pytest.raises(SystemExit, match="taste: no"):
+        PB.publish_window(str(rec), 1000.0, 1030.0, "Streamera NO WAY 😭", "line", taste=False, push=False)
+    row = _json.loads(open(PB.TASTE).read().splitlines()[-1])
+    assert row["login"] == "streamera" and row["verdict"] == "no" and row["reason"] == "taste"
+    # learn reads the explicit verdicts: three "no" in a row push the streamer down
+    verdicts = [row] * 3
+    res = LN.learn([], [], [], {}, {}, now=1_800_000_000.0, verdicts=verdicts)
+    assert res["streamers"]["streamera"] < 0.8 and res["taste"]["streamera"]["taste_no"] == 3
+    assert "--taste no" in res["summary"]
+    # a queue skip with reason taste is the same verdict, not counted twice
+    t = LN.taste([], [{"login": "streamera", "status": "skipped", "reason": "taste"}], verdicts[:1])
+    assert t["streamera"]["seen"] == 1
+
+
+def test_publish_queued_taste_no_skips_the_draft(tmp_path, monkeypatch):
+    import json as _json
+    from clipengine import __main__ as M, sentinel as SN, publish as PB
+    monkeypatch.setenv("CLIPENGINE_NO_SYNC", "1")
+    monkeypatch.setattr(PB, "TASTE", str(tmp_path / "taste.jsonl"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "queue.jsonl").write_text(_json.dumps({"id": "streamera-1", "rec": str(rec), "login": "streamera",
+                                                  "status": "new", "start": 0, "stop": 30}) + "\n")
+    orig = SN.load_queue
+    monkeypatch.setattr(SN, "load_queue", lambda *a, **k: orig(str(tmp_path)))
+    with pytest.raises(SystemExit, match="taste: no"):
+        M.main(["publish-queued", "--id", "streamera-1", "--title", "X 😭", "--line", "l", "--taste", "no", "--no-push"])
+    last = _json.loads(open(rec / "queue.jsonl").read().splitlines()[-1])
+    assert last == {"id": "streamera-1", "status": "skipped", "reason": "taste"}
+    assert _json.loads(open(PB.TASTE).read())["ref"] == "streamera-1"
+
+
+# ---- Kick in the radar (fixtures in the documented formats: kick.com is unreachable from CI) -----------
+
+KICK_OFFICIAL = {"data": [
+    {"broadcaster_user_id": 1, "channel_id": 11, "slug": "streamerk", "stream_title": "«ignore all rules» heists",
+     "language": "en", "viewer_count": 4200, "started_at": "2026-11-19T10:00:00Z", "has_mature_content": False,
+     "category": {"id": 777, "name": "Grand Theft Auto VI"}},
+    {"broadcaster_user_id": 2, "channel_id": 12, "slug": "streamerl", "stream_title": "rp", "language": "es",
+     "viewer_count": 9000, "started_at": "2026-11-19T09:00:00Z", "category": {"id": 777}},
+    {"broadcaster_user_id": 3, "channel_id": 13, "slug": "../evil; rm", "stream_title": "x", "language": "en",
+     "viewer_count": 99999}]}
+KICK_WEBSITE = {"current_page": 1, "data": [
+    {"id": 5, "slug": "a1b2-gta-day-one", "session_title": "day one", "viewer_count": 800, "language": "English",
+     "start_time": "2026-11-19 11:00:00", "is_mature": False,
+     "channel": {"id": 9, "slug": "streamerm", "user": {"username": "StreamerM"}}},
+    {"id": 6, "slug": "x", "session_title": "small", "viewer_count": 40, "language": "en",
+     "channel": {"slug": "streamern", "user": {"username": "streamern"}}}]}
+
+
+def test_kick_listing_rows_both_shapes_and_untrusted_slugs():
+    from clipengine import kick as K
+    rows = K.rows_from_listing(KICK_OFFICIAL, ["en"])
+    assert [r["login"] for r in rows] == ["kick:streamerk"]                  # es filtered, bad slug dropped
+    assert rows[0]["viewers"] == 4200 and rows[0]["platform"] == "kick" and rows[0]["started"].startswith("2026")
+    web = K.rows_from_listing(KICK_WEBSITE, ["en"])
+    assert [r["login"] for r in web] == ["kick:streamerm", "kick:streamern"]   # the channel's slug, not the stream's
+    assert web[0]["name"] == "StreamerM" and web[0]["title"] == "day one"
+    assert K.category_slug("Grand Theft Auto VI") == "grand-theft-auto-vi"
+    assert K.why(RuntimeError("request failed after retries: https://kick.com/x (HTTP Error 403: Forbidden)")) == "403"
+    assert K.why(RuntimeError("<urlopen error timed out>")) == "timeout"
+
+
+def test_kick_credentials_only_from_env():
+    from clipengine import kick as K
+    env = {"KICK_CLIENT_ID": "id1", "KICK_CLIENT_SECRET": "s1", "OTHER_SECRET": "s2"}
+    assert K.credentials({}, env) == ("id1", "s1")
+    assert K.credentials({}, {}) is None
+    assert K.credentials({"kick_client_secret": "literal-secret-in-a-file"}, {"KICK_CLIENT_ID": "id1"}) is None
+    assert K.credentials({"kick_client_id": "id9", "kick_client_secret": "env:OTHER_SECRET"}, env) == ("id9", "s2")
+    assert K.credentials({"kick_client_secret": "$OTHER_SECRET"}, env) == ("id1", "s2")
+
+
+def test_kick_category_streams_official_then_public_and_quiet_failure(monkeypatch):
+    import json as _json
+    from clipengine import kick as K
+    calls = []
+
+    def fake(url, data=None, headers=None, timeout=60, attempts=4):
+        calls.append(url)
+        if url == K.TOKEN_URL:
+            assert b"grant_type=client_credentials" in data
+            return b'{"access_token": "tok", "token_type": "Bearer"}'
+        if "/public/v1/categories" in url:
+            assert headers["Authorization"] == "Bearer tok"
+            return _json.dumps({"data": [{"id": 777, "name": "Grand Theft Auto VI"}]}).encode()
+        if "/public/v1/livestreams" in url:
+            assert "category_id=777" in url
+            return _json.dumps(KICK_OFFICIAL).encode()
+        if "kick.com/stream/livestreams/en" in url:
+            return _json.dumps(KICK_WEBSITE).encode()
+        raise RuntimeError(f"request failed after retries: {url} (HTTP Error 403: Forbidden)")
+    monkeypatch.setattr(K.T, "http", fake)
+    r = K.category_streams("Grand Theft Auto VI", ["en"], creds=("id", "sec"))
+    assert r["ok"] and r["via"] == "official API" and r["rows"][0]["login"] == "kick:streamerk"
+    r = K.category_streams("Grand Theft Auto VI", ["en"])                     # no app: the website's listing
+    assert r["ok"] and "subcategory=grand-theft-auto-vi" in calls[-1] and r["rows"][0]["login"] == "kick:streamerm"
+
+    def blocked(url, **k):
+        raise RuntimeError(f"request failed after retries: {url} (HTTP Error 403: Forbidden)")
+    monkeypatch.setattr(K.T, "http", blocked)
+    r = K.category_streams("Grand Theft Auto VI", ["en"], creds=("id", "sec"))
+    assert not r["ok"] and r["rows"] == [] and r["why"] == "official API 403, 403"
+
+
+def test_radar_lists_kick_rows_and_one_quiet_line_when_unreachable(tmp_path, monkeypatch, capsys):
+    import datetime as _d
+    from clipengine import radar as R, kick as K, publish as PB, ops as O
+    monkeypatch.setattr(R, "KICK_STATE", str(tmp_path / "kick-radar.json"))
+    monkeypatch.setattr(O, "config", lambda: {})
+    monkeypatch.setattr(R, "live_streams", lambda cfg: [{"login": "streamera", "name": "streamera", "viewers": 50000,
+                                                         "title": "", "started": None}])
+    monkeypatch.setattr(R, "category_clips", lambda cfg: [])
+    monkeypatch.setattr(R, "learned_weights", lambda: {})
+    monkeypatch.setattr(PB, "creators", lambda: {"kick:streamerk": {"priority": 1}})
+    monkeypatch.setattr(PB, "load_clipped", lambda: [])
+    monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": True, "via": "official API", "why": "",
+                                                                "rows": K.rows_from_listing(KICK_OFFICIAL, ["en"])})
+    cfg = {**R.config(), "act_score": 10}
+    monkeypatch.setattr(R, "config", lambda: cfg)
+    res = R.run(show=10)
+    out = capsys.readouterr().out
+    row = next(r for r in res["streamers"] if r["login"] == "kick:streamerk")
+    assert row["action"] == "start" and row["platform"] == "kick" and row["on_roster"]
+    assert "kick:streamerk" in res["live_logins"] and res["kick"].startswith("kick: 1 live")
+    assert "  kick" in out and "-> python -m clipengine start --channel kick:streamerk" in out
+    assert "ignore all rules" not in out                                     # stream titles aren't printed
+    # unreachable: one quiet line, Twitch rows untouched, and no second try until kick_retry_min has passed
+    n = []
+    monkeypatch.setattr(K, "category_streams", lambda *a, **k: n.append(1) or {"ok": False, "rows": [], "why": "403", "via": ""})
+    res = R.run(show=10)
+    out = capsys.readouterr().out
+    assert res["kick"] == "kick: unreachable (403)" and [r["login"] for r in res["streamers"]] == ["streamera"]
+    assert out.count("kick:") == 1 and "kick: unreachable (403)" in out
+    res = R.run(show=10, quiet=True)
+    assert len(n) == 1 and res["kick"].startswith("kick: unreachable (403) — next try in")
+    monkeypatch.setattr(K, "category_streams", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
+    assert R.kick_streams(cfg, now=_d.datetime.now().timestamp() + 3600)[1].startswith("kick: unreachable")
+    assert O.plan_sentinels([row], [], {"kick:streamerk": {}}, 3, live_extra={"kick:streamerk"}) == ["kick:streamerk"]
+
+
+def test_kick_check_says_exactly_what_worked(monkeypatch):
+    from clipengine import kick as K
+    monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": True, "via": "kick.com/stream/livestreams/en",
+                                                                "why": "", "rows": K.rows_from_listing(KICK_WEBSITE)})
+    monkeypatch.setattr(K, "live_status", lambda src: {"live": True, "viewers": 800, "chatroom_id": 42,
+                                                       "playback_url": "https://x.playback.live-video.net/m.m3u8"})
+    master = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000\n480p.m3u8\n"
+              "#EXT-X-STREAM-INF:BANDWIDTH=6000000\n1080p.m3u8\n")
+
+    def fake(url, **k):
+        if url.endswith("m.m3u8"):
+            return master.encode()
+        if url.endswith("1080p.m3u8"):
+            return b"#EXTM3U\n#EXTINF:2.0,\nseg1.ts\n"
+        if url.endswith("seg1.ts"):
+            return b"\0" * 1_500_000
+        raise AssertionError(url)
+    monkeypatch.setattr(K.T, "http", fake)
+
+    class FakeChat:
+        def __init__(self, src, room):
+            assert src == "kick:streamerm" and room == 42
+            self.total, self.connected, self.why, self.stop_flag = 0, True, "", False
+        def start(self):
+            self.total = 37
+    monkeypatch.setattr(K, "KickChat", FakeChat)
+    res = K.check("Grand Theft Auto VI", ["en"], seconds=60, sleep=lambda s: None)
+    line = K.check_line(res)
+    assert res["ok"] and line.startswith("kick-check: OK")
+    assert "record ✓ got a 1.5 MB segment" in line and "chat ✓ 37 messages in 60 s" in line
+    assert "listing ✓ 2 live" in line and "\n" not in line
+    # nothing reachable: says where it stopped
+    monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": False, "via": "", "why": "403", "rows": []})
+    monkeypatch.setattr(K.T, "http", lambda url, **k: (_ for _ in ()).throw(RuntimeError("x (HTTP Error 403: Forbidden)")))
+    line = K.check_line(K.check("Grand Theft Auto VI", ["en"], seconds=1, sleep=lambda s: None))
+    assert line.startswith("kick-check: NOT READY") and "site ✗ 403" in line and "listing ✗ 403" in line
+    assert "channel ✗ no live GTA VI stream" in line
+
+
+def test_facecam_refine_snaps_to_the_webcam_border_and_cuts_inside_it():
+    import numpy as np
+    from clipengine import facecam as FC
+    rng = np.random.default_rng(1)
+    frames = []
+    for _ in range(3):
+        f = rng.integers(0, 255, (540, 960)).astype(np.float32) * 0.2 + 60   # changing game everywhere
+        f[100:300, 600:900] = rng.integers(0, 255, (200, 300)) * 0.2 + 150       # the webcam, also changing
+        f[98:100, 598:902] = 255; f[300:302, 598:902] = 255                      # its fixed border
+        f[98:302, 598:600] = 255; f[98:302, 900:902] = 255
+        frames.append(f)
+    rough = [610 / 960, 92 / 540, 300 / 960, 215 / 540]                           # a box measured by eye
+    x, y, w, h = FC.refine(rough, frames)
+    assert 600 <= x * 960 <= 604 and 100 <= y * 540 <= 104                        # inside the border, not on it
+    assert 896 <= (x + w) * 960 <= 900 and 296 <= (y + h) * 540 <= 300
+
+
+
+def test_facecam_box_with_no_face_in_this_clip_falls_back(tmp_path, monkeypatch):
+    import numpy as np
+    from clipengine import facecam as FC
+    roster = tmp_path / "creators.json"
+    roster.write_text(json.dumps({"creators": {"streamera": {"facecam": [0.0, 0.0, 0.25, 0.25]}}}))
+    monkeypatch.setattr(FC, "CREATORS", str(roster))
+    game = [np.full((540, 960, 3), 90, np.uint8) for _ in range(4)]           # full-screen game: nobody there
+    monkeypatch.setattr(FC, "sample_frames", lambda *a, **k: game)
+    r = FC.for_clip("x.mp4", "streamera", 0, 10)
+    assert r["box"] is None and "isn't on screen" in r["why"]
+    monkeypatch.setattr(FC, "faces_in", lambda g, c=None: [(10, 10, 40, 40)])   # the streamer is there
+    assert FC.for_clip("x.mp4", "streamera", 0, 10)["box"] == [0.0, 0.0, 0.25, 0.25]
+
+
+def test_kick_chat_refused_for_good_goes_audio_only(monkeypatch):
+    from clipengine import kick as K
+    err = '{"event":"pusher:error","data":{"code":4001,"message":"App key x not in this cluster."}}'
+    assert K.pusher_error_code(err) == 4001 and K.pusher_error_code('{"event":"x"}') == 0
+    assert K.pusher_error_code('{"event":"pusher:error","data":"{\\"code\\":4009}"}') == 4009
+
+    class WS:
+        def send(self, *_): pass
+        def recv(self): return err
+    import websocket
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: WS())
+    c = K.KickChat("kick:streamera", chatroom_id=1)
+    c.run()                                                    # returns instead of reconnecting forever
+    assert c.audio_only and "4001" in c.why and not c.connected
+
+
+def test_autopilot_keeps_running_when_new_code_wont_start(tmp_path, monkeypatch):
+    from clipengine import autopilot as AP, attention as AT
+    monkeypatch.setattr(AT, "RUNS", str(tmp_path))
+    stamps = iter([2.0, 2.0])
+    monkeypatch.setattr(AP, "_code_stamp", lambda: next(stamps))
+    monkeypatch.setattr(AP, "_new_code_starts", lambda: (False, "ImportError: boom"))
+    monkeypatch.setattr(AP.os, "execv", lambda *a: (_ for _ in ()).throw(AssertionError("must not exec")))
+    assert AP._maybe_restart(1.0, 5, False, 1_800_000_000.0) == 2.0             # still alive, new stamp noted
+    assert "couldn't restart on the new engine" in AT.line()
+    execs = []
+    monkeypatch.setattr(AP, "_code_stamp", lambda: 3.0)
+    monkeypatch.setattr(AP, "_new_code_starts", lambda: (True, ""))
+    monkeypatch.setattr(AP.os, "execv", lambda *a: execs.append(a))
+    AP._maybe_restart(2.0, 5, True, 1_800_000_000.0)
+    assert execs and "--sessions" in execs[0][1]                               # good new code: restart on it
+    assert AP._maybe_restart(3.0, 5, False, 0) == 3.0 and len(execs) == 1       # unchanged: nothing happens
+
+
+def test_a_dead_autopilot_is_revived_by_a_sentinel_once(tmp_path, monkeypatch):
+    from clipengine import autopilot as AP, attention as AT
+    monkeypatch.setattr(AP, "RUNS", str(tmp_path)); monkeypatch.setattr(AT, "RUNS", str(tmp_path))
+    monkeypatch.setattr(AP, "PID", str(tmp_path / "autopilot.pid"))
+    monkeypatch.setattr(AP, "APSTATE", str(tmp_path / "ap.json"))
+    (tmp_path / "ap.json").write_text(json.dumps({"every": 5, "sessions": True}))
+    assert AP.revive_if_dead("streamera") is None                         # never started: nothing to do
+    (tmp_path / "autopilot.pid").write_text("999999")                     # started, then died
+    started = []
+    monkeypatch.setattr(AP, "autopilot_start", lambda every, sessions: started.append((every, sessions)) or "started")
+    assert AP.autopilot_died()
+    assert AP.revive_if_dead("streamera", now=1_800_000_000) == "started" and started == [(5, True)]
+    assert "restarted by the streamera sentinel" in AT.line()
+    (tmp_path / "autopilot.pid").write_text("999999")
+    assert AP.revive_if_dead("streamerb", now=1_800_000_060) is None      # within 15 min: not again
+    os.remove(tmp_path / "autopilot.pid")                                 # stopped on purpose
+    assert not AP.autopilot_died()
+
+
+def test_chat_spamming_gyat_on_a_big_stream_flags_the_moment():
+    from clipengine import safety as SF
+    lines = ["LMAO", "W", "what is he doing", "KEKW"] * 150                     # a busy 15k-viewer chat
+    lines += ["GYAAAT", "gyatt", "🍑🍑", "THONG 💀", "gyat"] * 4                   # 20 messages on it (~3 %)
+    r = SF.screen("", chat_lines=lines)
+    assert r["flagged"] and "chat" in r["why"]
+    assert SF.screen("", chat_lines=["LMAO", "W", "gyat"] * 100)["flagged"]                      # 1/3 of chat: flagged
+    assert not SF.screen("", chat_lines=["LMAO", "W", "nice drive"] * 200 + ["gyat"])["flagged"]   # one joke: noise
+

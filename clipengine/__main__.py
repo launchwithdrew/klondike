@@ -103,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--check", action="store_true", help="validate the drop without dropping")
     pb.add_argument("--no-push", action="store_true")
     for x in (pb,):
+        x.add_argument("--taste", metavar="yes|no", help="yes|no — would a fan of this streamer be glad to see this posted? (no = skip, reason taste)")
         x.add_argument("--rubric", metavar="CHECKS",
                        help="with --frames-checked: the checks that pass, from hook,context,payoff,share (or none)")
         x.add_argument("--fix", action="append", default=[], metavar='"heard=>said"',
@@ -126,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         x.add_argument("--fix", action="append", default=[], metavar='"heard=>said"')
         x.add_argument("--bleep", action="append", default=[], metavar="WORD")
         x.add_argument("--rubric", metavar="CHECKS")
+        x.add_argument("--taste", metavar="yes|no", help="yes|no — would a fan of this streamer be glad to see this posted? (no = skip, reason taste)")
     sub.add_parser("creators", help="who is live right now, and whether their stream is saved as a VOD")
     sn = sub.add_parser("sentinel", help="watch one live streamer in real time: chat + audio + viewer clips -> drafts in the queue")
     sn.add_argument("--channel", required=True, help='Twitch login, or YouTube: "yt:@handle" or a live URL (audio-only)')
@@ -199,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     pq.add_argument("--end", type=float, help="trim: seconds to drop from the end")
     pq.add_argument("--frames-checked", action="store_true")
     pq.add_argument("--rubric", metavar="CHECKS")
+    pq.add_argument("--taste", metavar="yes|no", help="yes|no — would a fan of this streamer be glad to see this posted? (no = skip, reason taste)")
     pq.add_argument("--post", action="store_true")
     pq.add_argument("--check", action="store_true")
     pq.add_argument("--no-push", action="store_true")
@@ -241,6 +244,11 @@ def main(argv: list[str] | None = None) -> int:
     fcg.add_argument("--rec", help="a `record` / sentinel folder")
     fcg.add_argument("--channel", help="Twitch login: looks at the last minutes of the newest VOD")
     fc.add_argument("--out", help="check image path")
+    fc.add_argument("--refine", action="store_true",
+                    help="snap the streamer's box (config or detected) to the webcam's real border: a clean cut")
+    kc = sub.add_parser("kick-check", help="one line: does Kick work from this machine (site, GTA VI listing, recording, chat)")
+    kc.add_argument("--channel", help="kick:<slug> to try (default: the top live Kick stream in the category)")
+    kc.add_argument("--seconds", type=float, default=60.0, help="how long to read chat")
     rd = sub.add_parser("radar", help="score every live stream in the category and list the hottest moments")
     rd.add_argument("--hours", type=float, help="trending window in hours (default from config/radar.json)")
     rd.add_argument("--out", help="also save the full result as JSON")
@@ -261,6 +269,12 @@ def main(argv: list[str] | None = None) -> int:
             caption_kw["rubric"] = checks
         except ValueError as exc:
             ap.error(str(exc))
+    if getattr(a, "taste", None) is not None:
+        from . import publish as PB
+        try:
+            caption_kw["taste"] = PB.parse_taste(a.taste)
+        except ValueError as exc:
+            ap.error(str(exc))
     if getattr(a, "question", None):
         caption_kw["question"] = a.question
     if getattr(a, "bleep", None):
@@ -279,7 +293,10 @@ def main(argv: list[str] | None = None) -> int:
                 AP.autopilot_run(a.every or O.config().get("autopilot_every_min", 5), a.sessions, a.rounds)
         elif a.cmd == "attention":
             from . import attention as AT
-            text = AT.line()
+            items = AT.pending()
+            if AP.autopilot_died():
+                items = [{"kind": "failure", "text": "autopilot stopped unexpectedly → clipengine autopilot start"}] + items
+            text = AT.line(items)
             if text:
                 print(text)
             if a.seen:
@@ -330,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd == "facecam":
         from . import facecam as FC
-        FC.cli(rec=a.rec, channel=a.channel, out=a.out)
+        FC.cli(rec=a.rec, channel=a.channel, out=a.out, refine_it=a.refine)
         return 0
     if a.cmd == "init":
         from . import onboard as OB
@@ -434,6 +451,9 @@ def main(argv: list[str] | None = None) -> int:
         from . import publish as PB
         from . import autopilot as AP
         AP.refuse_never(e.get("login", ""))
+        if caption_kw.get("taste") is False:      # a fan wouldn't want it: skip the draft, learn from it
+            SN.set_status(e, "skipped", reason="taste")
+            PB.taste_no(e.get("login", ""), e["id"], push=not a.no_push, title=a.title)
         if e.get("scan"):                       # a catch-up draft from a saved stream: the normal VOD path
             kw = AP.publish_window_args(e, a.start, a.end)
             rep = PB.publish_scan(kw.pop("scan_dir"), kw.pop("pick"), a.title, a.line, a.quote, a.slug, a.frames_checked,
@@ -462,6 +482,15 @@ def main(argv: list[str] | None = None) -> int:
         if not out:
             print("prerender: nothing pending")
         return 0
+    if a.cmd == "kick-check":
+        from . import kick as K
+        from . import radar as R
+        from . import ops as O
+        cfg = R.config()
+        res = K.check(cfg["game"], cfg["languages"], cfg.get("kick_category"), a.channel, a.seconds,
+                      creds=K.credentials(O.config()))
+        print(K.check_line(res))
+        return 0 if res["ok"] else 1
     if a.cmd == "train":
         from . import train as TR
         TR.run(a.channel or None, a.vod or None, a.hours, write=not a.dry, out=a.out)

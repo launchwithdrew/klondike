@@ -434,6 +434,12 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
                 if draft:
                     threading.Thread(target=_draft_safe, args=(out, login, moment, model_name), daemon=True).start()
         if now - last_beat >= 30:
+            if int(now // 30) % 20 == 0:                   # every ~10 min: is the autopilot still alive?
+                try:
+                    from . import autopilot as AP
+                    AP.revive_if_dead(login)
+                except Exception:
+                    pass
             last_beat = now
             json.dump({"login": login, "pid": os.getpid(), "beat": now,
                        "chat_connected": bool(chat.connected or getattr(chat, "fallback", False)),

@@ -9,7 +9,11 @@
 
 **Every publish runs twice.** The first run renders and prints the engine score, captions and frames.
 If it says `WON'T POST`, even a perfect rubric can't clear any platform's bar — skip it. The second run
-adds `--frames-checked --rubric ... --post` and drops it.
+adds `--frames-checked --rubric ... --taste yes --post` and drops it.
+
+**Taste (`--taste yes|no`)** is one yes/no, separate from the score: would a fan of this streamer be glad to see this posted? Not cringe, not mean-spirited, not a dead moment, not a spoiler dump. `--taste no` refuses the
+post and records a skip with reason `taste` (`data/taste.jsonl`); `learn` pushes down streamers whose clips keep
+failing it. `--frames-checked` without `--taste` is refused.
 
 **Headline (`--title`):** what happens on screen in this cut, true, under ~80 characters, 1–2 words in
 CAPS, 1–2 emoji at the end. Never violence words (kill, shoot, murder) or sexual terms — publish refuses

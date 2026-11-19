@@ -70,8 +70,11 @@ def model(name: str):
     if name not in _MODELS:
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         from faster_whisper import WhisperModel
+        # Models are cached by setup; never re-check the hub on load — each
+        # check hits the model CDN and fires a network-approval prompt.
         _MODELS[name] = WhisperModel(name, device="cpu", compute_type="int8",
-                                     cpu_threads=os.cpu_count() or 4)
+                                     cpu_threads=os.cpu_count() or 4,
+                                     local_files_only=True)
     return _MODELS[name]
 
 

@@ -23,8 +23,16 @@ suggests hot streamers outside the list in every `cycle`. YouTube streamers: sta
 `--channel yt:@handle` (audio-only).
 
 **The category — `config/radar.json`:** `game` (e.g. "Grand Theft Auto VI"), `languages`.
+`"kick": true` also lists the category's live Kick streams (unverified; `clipengine kick-check` tests this
+machine; Kick's official API is used when `KICK_CLIENT_ID` / `KICK_CLIENT_SECRET` are set in the environment).
 
 **Posting limits — `config/distribution.json`:** each platform's minimum score, daily cap and gap.
 The daily `learn` moves the minimums by itself when results say so.
 
 Start over completely: `clipengine init --force ...` (your old pack is kept as `brand/brand.json.bak`).
+
+## A title style of your own
+Your agent can design one with you: a Python function in `clipengine/house/` (your private folder — it
+stays on your computer and is kept across updates), listed as `CARD_STYLES = {"mystyle": fn}` in
+`clipengine/house/__init__.py`, then `"card": {"style": "mystyle"}` in `brand/brand.json`. See
+`clipengine/card.py` (`styles()`) for what the function receives and returns.
