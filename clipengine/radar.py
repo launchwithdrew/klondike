@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sys
 import math
 import os
 
@@ -51,8 +52,8 @@ _STREAMS = """query($name: String!, $first: Int, $langs: [String!]) { game(name:
   streams(first: $first, options: {languages: $langs}) { edges { node {
     viewersCount title createdAt broadcaster { login displayName } } } } } }"""
 
-_CLIPS = """query($name: String!, $langs: [Language!]) { game(name: $name) {
-  clips(first: 100, criteria: {period: LAST_DAY, sort: VIEWS_DESC, languages: $langs}) { edges { node {
+_CLIPS = """query($name: String!, $langs: [Language!], $first: Int) { game(name: $name) {
+  clips(first: $first, criteria: {period: LAST_DAY, sort: VIEWS_DESC, languages: $langs}) { edges { node {
     slug title viewCount createdAt durationSeconds videoOffsetSeconds
     broadcaster { login displayName } video { id } } } } } }"""
 
@@ -90,7 +91,15 @@ def live_streams(cfg: dict) -> list[dict]:
 
 
 def category_clips(cfg: dict) -> list[dict]:
-    d = T.gql(_CLIPS, {"name": cfg["game"], "langs": [l.upper() for l in cfg["languages"]]})
+    """The day's most-viewed viewer clips in the category. A flaky network that keeps cutting the big
+    response short gets a smaller one instead (and the radar never dies over the clips list)."""
+    d = {}
+    for first in (100, 40, 15):
+        try:
+            d = T.gql(_CLIPS, {"name": cfg["game"], "langs": [l.upper() for l in cfg["languages"]], "first": first})
+            break
+        except RuntimeError as exc:
+            print(f"[radar] viewer clips (first {first}) failed: {str(exc)[:80]} — trying a smaller list", file=sys.stderr)
     out = []
     for e in (((d.get("game") or {}).get("clips") or {}).get("edges") or []):
         n = e["node"]

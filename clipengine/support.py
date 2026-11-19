@@ -198,7 +198,9 @@ def update(test: bool = True) -> bool:
         print("these local fixes no longer apply (the code changed): "
               + ", ".join(os.path.basename(c) for c in conflict) + " — fix again with the bug runbook")
     subprocess.run(["bash", os.path.join(REPO, "setup", "setup.sh"), "--quiet"], cwd=REPO)
-    from .ops import doctor
+    from .ops import doctor, restart_sentinels
+    for line in restart_sentinels():               # running sentinels would keep the old code otherwise
+        print(line)
     doctor()
     return True
 

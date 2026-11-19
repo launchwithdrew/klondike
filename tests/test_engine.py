@@ -17,6 +17,22 @@ from clipengine import signals as S  # noqa: E402
 from clipengine import twitch as T  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _default_brand(tmp_path_factory):
+    """Engine tests check the engine, not this channel's look: every test starts from the default brand
+    pack (a channel's own words-per-caption or colours made render tests fail after `init`)."""
+    from clipengine import brand as _B
+    before = os.environ.get("CLIPENGINE_BRAND")
+    os.environ["CLIPENGINE_BRAND"] = str(tmp_path_factory.mktemp("brand") / "none.json")
+    _B.load(fresh=True)
+    yield
+    if before is None:
+        os.environ.pop("CLIPENGINE_BRAND", None)
+    else:
+        os.environ["CLIPENGINE_BRAND"] = before
+    _B.load(fresh=True)
+
+
 def chat(spec, base=8, seconds=1200, seed=1):
     """Synthetic chat: `base` msgs/10s of varied talk from many users, plus
     bursts: spec = [(t, n, text_fn, emotes)]."""
@@ -868,3 +884,88 @@ def test_publishing_a_sentinel_draft_keeps_its_live_chat_signal(monkeypatch):
     with_chat = G.engine_score({**base, "chat_score": SN.chat_score_from_p(0.83)})["score"]
     assert with_chat > without                                     # a strong live chat now counts
     assert SN.chat_score_from_p(None) == 0.0 and SN.chat_score_from_p(1.0) == SN.chat_score_from_p(0.99)
+
+
+def test_live_cut_survives_timestamp_jumps_and_never_comes_out_short(tmp_path):
+    # a recorder restart leaves an 11 s timestamp jump inside the recording; the cut must still start,
+    # end and last exactly where the wall clock says (each segment carries its own tone to check)
+    import json as _json
+    import numpy as np
+    from clipengine import live as L, render as V
+    rec = tmp_path / "rec"; (rec / "segments").mkdir(parents=True)
+    t0 = 1_800_000_000.0
+    with open(rec / "index.jsonl", "w") as fh:
+        for i in range(8):
+            off = i * 2 + (11 if i >= 4 else 0)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
+                            "-f", "lavfi", "-i", f"sine=frequency={300 + 100 * i}:sample_rate=48000", "-t", "2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-bf", "0", "-c:a", "aac",
+                            "-output_ts_offset", str(off), "-f", "mpegts", str(rec / "segments" / f"s{i}.ts")], check=True)
+            fh.write(_json.dumps({"t": t0 + 2 * i, "d": 2.0, "f": f"s{i}.ts"}) + "\n")
+    (rec / "recording.json").write_text(_json.dumps({"login": "x"}))
+
+    def tone(path, at):
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(at), "-t", "0.6", "-i", path, "-ac", "1", "-ar", "8000",
+                              "-f", "s16le", "-"], capture_output=True).stdout
+        x = np.frombuffer(raw, np.int16).astype(float)
+        return round(np.fft.rfftfreq(len(x), 1 / 8000)[np.argmax(np.abs(np.fft.rfft(x)))] / 100) * 100
+
+    for s, e in ((t0 + 3, t0 + 13), (t0 + 9.2, t0 + 14.6)):          # across the jump, and after it
+        src, out = str(tmp_path / "src.ts"), str(tmp_path / "out.mp4")
+        first = L.cut_source(str(rec), s - 3, e + 3, src)
+        V.render(src, first, s, e, [], out, crop="blur", layout="stack", title="T", quote="q")
+        assert abs(L.media_duration(out) - (e - s)) < 0.5
+        assert tone(out, 0.1) == 300 + 100 * int((s + 0.4 - t0) // 2)
+        assert tone(out, e - s - 0.8) == 300 + 100 * int((e - 0.5 - t0) // 2)
+
+
+def test_http_retries_truncated_reads(monkeypatch):
+    from http.client import IncompleteRead
+    from clipengine import twitch as T
+    calls = []
+
+    class Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"ok"
+
+    def urlopen(req, timeout=None):
+        calls.append(1)
+        if len(calls) < 3:
+            raise IncompleteRead(b"x" * 10, 90)
+        return Resp()
+    monkeypatch.setattr(T.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(T.time, "sleep", lambda s: None)
+    assert T.http("https://example.invalid/") == b"ok" and len(calls) == 3
+    calls.clear()
+    monkeypatch.setattr(T.urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(IncompleteRead(b"", 5)))
+    with pytest.raises(RuntimeError):
+        T.http("https://example.invalid/", attempts=2)
+
+
+def test_radar_falls_back_to_a_smaller_clips_list(monkeypatch):
+    from clipengine import radar as R
+    asked = []
+
+    def gql(q, v):
+        asked.append(v["first"])
+        if v["first"] > 15:
+            raise RuntimeError("request failed after retries (IncompleteRead)")
+        return {"game": {"clips": {"edges": [{"node": {"slug": "s", "title": "t", "viewCount": 5, "createdAt": "2026-01-01T00:00:00Z",
+                                                      "durationSeconds": 30, "broadcaster": {"login": "A"}}}]}}}
+    monkeypatch.setattr(R.T, "gql", gql)
+    out = R.category_clips({"game": "g", "languages": ["en"]})
+    assert asked == [100, 40, 15] and out[0]["login"] == "a"
+
+
+def test_update_restarts_running_sentinels_on_new_code(monkeypatch):
+    from clipengine import ops as O
+    log = []
+    monkeypatch.setattr(O, "all_sentinels", lambda: [{"dir": "d1", "pid": 7, "login": "a", "source": "a", "stopped": False},
+                                                     {"dir": "d2", "pid": 8, "login": "b", "source": "b", "stopped": True}])
+    alive = {7: True, 8: True}
+    monkeypatch.setattr(O, "_alive", lambda pid: alive.get(pid, False))
+    monkeypatch.setattr(O, "stop", lambda d, why="": (log.append(("stop", d)), alive.update({7: False})))
+    monkeypatch.setattr(O, "start", lambda src: (log.append(("start", src)), f"+{src} started")[1])
+    assert O.restart_sentinels() == ["+a restarted on the new version"]
+    assert log == [("stop", "d1"), ("start", "a")]                     # a stopped sentinel stays stopped

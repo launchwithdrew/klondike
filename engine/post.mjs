@@ -18,7 +18,7 @@ const DRY = args.has('--dry');
 const POSTERS = { youtube: postYouTube, instagram: postInstagram, tiktok: postTikTok };
 const MAX_TRIES = 3;
 
-import { startChrome, launch } from './chrome.mjs';
+import { startChrome, launch, HEADLESS, ATTACHED, CDP_URL } from './chrome.mjs';
 
 // A platform is due when it isn't live yet and its scheduled time (post.json "schedule", set by the
 // distribution gate) has come. An item with nothing due is left alone — Chrome isn't even started.
@@ -135,6 +135,17 @@ async function runOnce(ctx) {
 
 async function main() {
   if (args.has('--login')) {
+    if (ATTACHED) {
+      console.log(`Using your own browser at ${CDP_URL} — its saved sign-ins are used. If an account isn't signed in there yet, sign in there, then run: node post.mjs --check`);
+      return;
+    }
+    if (HEADLESS) {
+      console.log('This computer has no screen, so a sign-in window would be invisible. Either sign in on a computer with a ' +
+        'screen, or start a browser you can see and sign in to (e.g. your agent\'s own browser) with ' +
+        '--remote-debugging-port=9222 and add "browser_cdp_url": "http://127.0.0.1:9222" to config/ops.json — the engine then posts from it. ' +
+        'See docs/troubleshooting.md.');
+      return;
+    }
     // Sign-in happens in a plain (non-automated) Chrome on the engine profile — Google blocks automated sign-in.
     await startChrome(['https://accounts.google.com/ServiceLogin?continue=https://studio.youtube.com', 'https://www.instagram.com/accounts/login/', 'https://www.tiktok.com/login']);
     console.log('Sign in to YouTube, Instagram and TikTok in the engine Chrome window. Leave it open; the engine uses it.');

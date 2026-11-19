@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+from http.client import HTTPException   # IncompleteRead etc. (a module-level `http` below shadows the package)
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,8 +84,8 @@ def http(url: str, data: bytes | None = None, headers: dict | None = None,
             last = e
             if e.code in (400, 401, 403, 404):  # not transient
                 break
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last = e
+        except (urllib.error.URLError, TimeoutError, OSError, HTTPException) as e:
+            last = e                            # incl. IncompleteRead: a proxy that truncates responses
         if i < attempts - 1:
             time.sleep(3 ** i)
     raise RuntimeError(f"request failed after retries: {url[:100]} ({last})")

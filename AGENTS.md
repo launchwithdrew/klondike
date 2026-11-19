@@ -24,6 +24,10 @@ bash setup/setup.sh                       # installs everything (a few minutes t
 cd engine && npm ci && node post.mjs --login   # the USER signs in to all three accounts in that window
 node post.mjs --check && cd ..                 # confirms the right accounts
 ```
+**Have your own browser with the user already signed in?** Use it instead (its saved sign-ins, no second
+sign-in): run it with remote debugging (e.g. `--remote-debugging-port=9222`), add
+`"browser_cdp_url": "http://127.0.0.1:9222"` to `config/ops.json`, skip `--login`, then run `--check`.
+
 Give the user `brand/kit/` (profile picture, banner, bios) and walk them through `brand/kit/checklist.md`.
 
 ## Every session

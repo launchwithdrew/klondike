@@ -139,6 +139,22 @@ def stop(channel_or_dir: str, why: str = "stopped") -> str:
     return f"-{st['login']} {why}"
 
 
+def restart_sentinels() -> list[str]:
+    """Running sentinels keep the old code in memory: after an update, restart each on the new code."""
+    out = []
+    for s in all_sentinels():
+        if not (s.get("pid") and _alive(s["pid"])) or s.get("stopped"):
+            continue
+        src = s.get("source") or s["login"]
+        stop(s["dir"], "restarting on the new version")
+        for _ in range(40):                        # let it exit before starting again
+            if not _alive(s["pid"]):
+                break
+            time.sleep(0.25)
+        out.append(start(src).replace("started", "restarted on the new version"))
+    return out
+
+
 def stop_all() -> list[str]:
     """Stop every sentinel and the poster on this machine (cycle starts them again when it next runs)."""
     out = [stop(s["dir"]) for s in all_sentinels() if s.get("pid") and _alive(s["pid"])]
@@ -154,7 +170,8 @@ def stop_all() -> list[str]:
 # ---- the cycle ---------------------------------------------------------------------------------------
 
 def _posting_machine() -> bool:
-    return os.path.isdir(os.path.join(REPO, "chrome-profile"))
+    """This machine posts: it has the engine's signed-in Chrome, or uses the agent's own browser."""
+    return os.path.isdir(os.path.join(REPO, "chrome-profile")) or bool(config().get("browser_cdp_url"))
 
 
 def _poster_running() -> bool:
@@ -346,8 +363,20 @@ def doctor(accounts: bool = False) -> bool:
     check("logo", os.path.isfile(B.asset(B.load(fresh=True)["logo"].get("file", ""))),
           "clipengine init makes one (brand/kit/logo.png), or set logo.file in brand/brand.json")
     check("fonts", os.path.exists(os.path.join(REPO, "assets", "fonts", "NotoColorEmoji.ttf")), "git pull (assets/ is in the repo)")
-    check("posting machine (signed-in chrome-profile/)", _posting_machine(),
-          "the channel owner signs in once: cd engine && node post.mjs --login")
+    cdp = config().get("browser_cdp_url")
+    if cdp:
+        import urllib.request
+        try:
+            urllib.request.urlopen(cdp.rstrip("/") + "/json/version", timeout=5).read()
+            ok = True
+        except Exception:
+            ok = False
+        check(f"posting browser (your own, at {cdp})", ok, "start it with remote debugging on that port, or remove "
+              "browser_cdp_url from config/ops.json to use the engine's own Chrome")
+    else:
+        check("posting machine (signed-in chrome-profile/)", _posting_machine(),
+              "the channel owner signs in once: cd engine && node post.mjs --login (or use your own browser: "
+              "docs/troubleshooting.md)")
     if accounts and _posting_machine():
         r = subprocess.run(["node", "post.mjs", "--check"], cwd=os.path.join(REPO, "engine"), capture_output=True,
                            text=True, timeout=180)

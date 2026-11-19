@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import glob
 import json
+import subprocess
 import os
 import re
 import time
@@ -211,13 +212,28 @@ def load_index(rec_dir: str) -> list[dict]:
 
 def cut_source(rec_dir: str, t0: float, t1: float, out_ts: str) -> float:
     """Concatenate recorded segments covering wall-clock [t0, t1] into out_ts.
-    Returns the wall-clock time of its first frame (pass as source_t0)."""
+    Returns the wall-clock time of its first frame (pass as source_t0).
+
+    The segments' own timestamps can jump (a recorder restart starts a new playlist session, a
+    missed segment leaves a hole), and ffmpeg seeks and trims by those timestamps — so a moment
+    after a jump was cut from the wrong place, or came out short and lost its payoff. The concat
+    demuxer re-times every segment to its wall-clock place instead: file time == wall time − first."""
     idx = [r for r in load_index(rec_dir) if r["t"] + r["d"] > t0 - 2 and r["t"] < t1 + 2]
     if not idx:
         raise RuntimeError("that moment is not in the recording (before it started, or pruned)")
-    with open(out_ts, "wb") as fh:
-        for r in idx:
-            fh.write(open(os.path.join(rec_dir, "segments", r["f"]), "rb").read())
+    lst = out_ts + ".txt"
+    with open(lst, "w") as fh:
+        for i, r in enumerate(idx):
+            path = os.path.abspath(os.path.join(rec_dir, "segments", r["f"])).replace("'", "'\\''")
+            span = (idx[i + 1]["t"] - r["t"]) if i + 1 < len(idx) else r["d"]
+            fh.write(f"file '{path}'\nduration {max(0.05, span):.3f}\n")
+    p = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
+                        "-f", "mpegts", out_ts], capture_output=True, text=True)
+    os.remove(lst)
+    if p.returncode != 0 or not os.path.exists(out_ts) or os.path.getsize(out_ts) == 0:
+        with open(out_ts, "wb") as fh:                    # fall back to raw bytes (old behaviour)
+            for r in idx:
+                fh.write(open(os.path.join(rec_dir, "segments", r["f"]), "rb").read())
     return idx[0]["t"]
 
 
@@ -296,14 +312,32 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
     the recording itself, not only viewer clips)."""
     from . import audio as A
     from . import render as V
+    import sys as _sys
+    say = lambda m: print(f"[render] {m}", file=_sys.stderr, flush=True)   # stdout stays the JSON report
     src = out + ".src.ts"
+    say(f"cutting {end_ts - start_ts:.0f} s from the recording…")
     first = cut_source(rec_dir, start_ts - 3, end_ts + 3, src)
+    say("transcribing (the slow part: a few minutes on a CPU)…")
     x = A.decode_pcm(src, 0, None)
     words = A.real_words(A.transcribe(x, model, offset=first))
+    say("rendering the vertical clip…")
     from . import censor as C
     words = C.apply_fixes(words, fixes)          # e.g. {"kill me?": "kill him?"}
     info = V.render(src, first, start_ts, end_ts, words, out, crop="blur", layout=layout,
                     title=title, quote=quote, watermark=watermark, extra_censor=extra_censor,
                     drop_captions=drop_captions)
     os.remove(src)
+    got = media_duration(out)
+    want = end_ts - start_ts
+    if got and got < want - 1.5:      # never hand over a clip that silently lost its ending
+        raise RuntimeError(f"render came out {want - got:.1f} s short ({got:.1f} of {want:.1f} s) — the recording "
+                           "has a hole in this window; pick a window inside the recording or trim with --end")
     return info
+
+
+def media_duration(path: str) -> float | None:
+    try:
+        return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                                     path], capture_output=True, text=True).stdout.strip())
+    except (ValueError, OSError):
+        return None
