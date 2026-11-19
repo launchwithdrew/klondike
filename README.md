@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/klondike-banner.png" alt="Klondike — clip engine" width="100%"></p>
+
 # Klondike
 
 Turn live streams into short clips — found the moment they happen, cut in your own style, checked, and
