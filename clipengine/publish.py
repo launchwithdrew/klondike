@@ -147,8 +147,10 @@ def publish_scan(scan_dir: str, pick: int, title: str, line: str, quote: str | N
 
 def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, line: str, quote: str | None = None,
                    slug: str | None = None, frames_checked: bool = False, post: bool = False,
-                   push: bool = True, check_only: bool = False, rubric: list[str] | None = None, **kw) -> dict:
-    """For a live recording (streams with no VOD): wall-clock window."""
+                   push: bool = True, check_only: bool = False, rubric: list[str] | None = None,
+                   chat_score: float | None = None, **kw) -> dict:
+    """For a live recording (streams with no VOD): wall-clock window. A sentinel draft passes the chat
+    strength its detector measured live (`chat_score`) — a recording keeps no chat of its own."""
     from . import live as L
     from . import render as V
     login = json.load(open(os.path.join(rec_dir, "recording.json")))["login"]
@@ -168,6 +170,8 @@ def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, lin
     words = [w for seg in tr.get("segments", []) for w in seg.get("words", [])
              if start_ts <= w.get("start", 0) <= end_ts]
     sig = G.signals_from_live(rec_dir, login, start_ts, end_ts, words)
+    if chat_score is not None:
+        sig["chat_score"] = chat_score
     return _finish(rep, login, login, start_ts, end_ts, moment, title, line, quote, slug, frames_checked, post, push,
                    check_only, sig, rubric)
 

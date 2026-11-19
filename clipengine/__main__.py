@@ -303,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         from . import publish as PB
         rep = PB.publish_window(e["rec"], e["start"] + (a.start or 0), e["stop"] - (a.end or 0), a.title, a.line,
                                 a.quote, a.slug, a.frames_checked, a.post, push=not a.no_push, check_only=a.check,
+                                chat_score=SN.chat_score_from_p(e["p"]) if e.get("p") is not None else None,
                                 **caption_kw)
         if a.frames_checked and not a.check and str(rep.get("status", "")).startswith("DROPPED"):
             SN.set_status(e, "published", slug=rep.get("slug"))

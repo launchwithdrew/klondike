@@ -399,7 +399,8 @@ def test_banger_score_tiers_and_penalties():
 
 def test_gate_minimums_caps_gaps_and_staleness():
     from clipengine import gate as GT
-    cfg = GT.config()
+    import json as _json
+    cfg = _json.loads(_json.dumps(GT.DEFAULTS))     # the shipped defaults, not this channel's tuned dials
     now = 1_800_000_000.0
     d = GT.decide(80, now - 600, now, {}, cfg)
     assert {p: x["action"] for p, x in d.items()} == {"tiktok": "now", "instagram": "now", "youtube": "now"}
@@ -852,3 +853,18 @@ def test_stop_all_stops_sentinels_and_poster(tmp_path, monkeypatch):
     monkeypatch.setattr(O, "all_sentinels", lambda: [])
     assert O.stop_all() == ["nothing was running"]
 
+
+
+def test_publishing_a_sentinel_draft_keeps_its_live_chat_signal(monkeypatch):
+    # a recording keeps no chat, so publish-queued must carry the detector's live chat strength into the score
+    from clipengine import sentinel as SN, grade as G
+    import inspect
+    from clipengine import publish as PB
+    assert "chat_score" in inspect.signature(PB.publish_window).parameters
+    src = open(os.path.join(ROOT, "clipengine", "__main__.py")).read()
+    assert "chat_score=SN.chat_score_from_p(e[\"p\"])" in src
+    base = {"crowd_vpm": None, "crowd_views": None, "audio_factor": 1.0, "streamer_factor": 1.0, "age_h": 0.1, "flags": []}
+    without = G.engine_score({**base, "chat_score": None})["score"]
+    with_chat = G.engine_score({**base, "chat_score": SN.chat_score_from_p(0.83)})["score"]
+    assert with_chat > without                                     # a strong live chat now counts
+    assert SN.chat_score_from_p(None) == 0.0 and SN.chat_score_from_p(1.0) == SN.chat_score_from_p(0.99)

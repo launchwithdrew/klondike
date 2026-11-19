@@ -416,6 +416,11 @@ def _draft_safe(out, login, moment, model_name):
         print(f"[sentinel] draft failed: {exc}", flush=True)
 
 
+def chat_score_from_p(p: float) -> float:
+    """The detector's live probability as the banger score's chat signal (same scale as a VOD scan)."""
+    return -6 * math.log(1 - min(0.99, max(0.0, float(p or 0))))
+
+
 def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", wait_s: float = 90) -> dict:
     """Cut + check one moment from the recording and append ONE line to queue.jsonl."""
     from . import audio as A
@@ -447,7 +452,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     sf = SF.screen(said, chat_lines=chat_lines)
     vis = VI.check(src)
     sig = G.signals_from_live(out, login, moment["start"], moment["stop"], words)
-    sig["chat_score"] = -6 * math.log(1 - min(0.99, moment["p"]))
+    sig["chat_score"] = chat_score_from_p(moment["p"])
     if moment.get("crowd_new"):                     # viewers already clipping it: strong early crowd signal
         sig["crowd_vpm"] = (sig.get("crowd_vpm") or 0) + 5 * moment["crowd_new"]
     sig["flags"] = (sig.get("flags") or []) + vis["flags"]
