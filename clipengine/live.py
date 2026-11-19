@@ -1,0 +1,308 @@
+"""Live recorder — for streamers whose stream is NOT archived as a VOD.
+
+Some big streamers are live on Twitch with viewers clipping them, but their
+broadcast is not saved as a public VOD, so the VOD-based engine cannot reach
+them. This module records the public live stream as it airs into a rolling
+buffer on disk (default 2 h), with the wall-clock time of every 2 s segment
+(Twitch's #EXT-X-PROGRAM-DATE-TIME), and skips Twitch's stitched ads.
+
+Then `live_clips` reads the viewer clips made during the buffer (their
+creation time is public even with no VOD) and cuts each one from OUR
+recording: a viewer clip covers the ~N seconds before the viewer pressed the
+button, and viewers watch a few seconds behind live, so the moment sits in
+[created_at - duration - delay, created_at - delay + 2].
+
+Recording goes FORWARD only: what aired before the recorder started is gone.
+Run it on a machine that stays up, one process per streamer.
+Public playback only, no sign-in. Only creators who allow clipping.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import glob
+import json
+import os
+import re
+import time
+import urllib.parse
+
+from . import twitch as T
+
+SEG_RE = re.compile(r"#EXT-X-PROGRAM-DATE-TIME:(\S+)\s*#EXTINF:([\d.]+),([^\n]*)\n(\S+)")
+
+
+def _epoch(iso: str) -> float:
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def live_variant(login: str, quality: str = "best", tries: int = 6) -> str:
+    """URL of a live media playlist we can actually reach (hosts rotate;
+    retry with a fresh token until one is reachable)."""
+    last = None
+    for _ in range(tries):
+        tok = T.gql(T._TOKEN_QUERY, {"isLive": True, "login": login.lower(), "isVod": False,
+                                     "vodID": "", "playerType": "site"}).get("streamPlaybackAccessToken")
+        if not tok or not tok.get("value"):
+            raise RuntimeError(f"{login} is not live")
+        qs = urllib.parse.urlencode({"allow_source": "true", "allow_audio_only": "true",
+                                     "player": "twitchweb", "fast_bread": "true",
+                                     "token": tok["value"], "sig": tok["signature"]})
+        master = T.http(f"https://usher.ttvnw.net/api/channel/hls/{login.lower()}.m3u8?{qs}").decode()
+        lines = master.splitlines()
+        variants = []
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF:") and i + 1 < len(lines):
+                bw = int((re.search(r"BANDWIDTH=(\d+)", line) or [0, 0])[1])
+                url = lines[i + 1].strip()
+                if "audio_only" not in line:
+                    variants.append((bw, url))
+        variants.sort(reverse=True)
+        url = variants[0][1] if quality == "best" else variants[-1][1]
+        try:
+            pl = T.http(url, attempts=1).decode("utf-8", "replace")
+            seg = next((m.group(4) for m in SEG_RE.finditer(pl) if "live" in m.group(3).lower()), None)
+            if seg:                         # segments can come from a different host than the playlist
+                T.http(seg, attempts=1, timeout=15)
+            return url
+        except Exception as exc:           # host not reachable from here: new token, new host
+            last = exc
+            time.sleep(1)
+    raise RuntimeError(f"no reachable live playlist for {login}: {last}")
+
+
+def is_youtube(source: str) -> bool:
+    return source.startswith(("yt:", "https://www.youtube.com/", "https://youtube.com/", "https://youtu.be/"))
+
+
+def youtube_variant(source: str) -> str:
+    """Live HLS media playlist for a YouTube live stream ("yt:@handle", a channel or a watch URL), via yt-dlp."""
+    import yt_dlp
+    url = source[3:] if source.startswith("yt:") else source
+    if url.startswith("@"):
+        url = f"https://www.youtube.com/{url}/live"
+    opts = {"quiet": True, "no_warnings": True, "format": "best[protocol^=m3u8]/best", "noplaylist": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info.get("is_live"):
+        raise RuntimeError(f"{source} is not live")
+    hls = info.get("url") or next((f["url"] for f in info.get("formats", []) if "m3u8" in (f.get("protocol") or "")), None)
+    if not hls:
+        raise RuntimeError(f"no live HLS playlist for {source}")
+    return hls
+
+
+def source_name(source: str) -> str:
+    """A short name for files and logs: Twitch login, or the YouTube handle."""
+    if not is_youtube(source):
+        return source.lower()
+    m = re.search(r"@([A-Za-z0-9_.-]+)", source)
+    return ("yt-" + (m.group(1) if m else re.sub(r"\W+", "", source)[-11:])).lower()
+
+
+_SEG_ANY = re.compile(r"#EXTINF:([\d.]+),[^\n]*\n(\S+)")
+
+
+def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float | None = None) -> None:
+    """Record a live channel into out_dir/segments/<epoch_ms>.ts + index.jsonl.
+    Keeps the newest `buffer_s` seconds. Skips stitched ads (Twitch).
+
+    `login` is a Twitch login, or a YouTube source ("yt:@handle", channel or watch URL): YouTube
+    has no stitched ads, and when its playlist carries no PROGRAM-DATE-TIME the segments are
+    timed by arrival."""
+    youtube = is_youtube(login)
+    resolve = (lambda: youtube_variant(login)) if youtube else (lambda: live_variant(login))
+    seg_dir = os.path.join(out_dir, "segments")
+    os.makedirs(seg_dir, exist_ok=True)
+    index = os.path.join(out_dir, "index.jsonl")
+    json.dump({"login": source_name(login), "source": login, "started": time.time()},
+              open(os.path.join(out_dir, "recording.json"), "w"))
+    seen: set[str] = set()
+    failed_hosts: set[str] = set()
+    url = resolve()
+    t_start, n_ads, n_segs = time.time(), 0, 0
+    t_resolved = time.time()
+    print(f"[live] recording {login} -> {out_dir} (buffer {buffer_s / 3600:.1f} h)", flush=True)
+    last_beat = time.time()
+    while stop_after_s is None or time.time() - t_start < stop_after_s:
+        if time.time() - last_beat > 60:
+            print(f"[live] {dt.datetime.now():%H:%M:%S} {login}: {n_segs} segments "
+                  f"({n_segs * 2 / 60:.1f} min recorded), {n_ads} ad segments skipped", flush=True)
+            last_beat = time.time()
+        try:
+            pl = T.http(url, attempts=2, timeout=15).decode()
+        except Exception as exc:
+            print(f"[live] playlist fetch failed ({str(exc)[:80]}) — re-resolving", flush=True)
+            try:
+                url, t_resolved = resolve(), time.time()
+            except Exception as exc:
+                print(f"[live] {exc} — retrying in 30 s", flush=True)
+                time.sleep(30)
+            continue
+        if youtube and time.time() - t_resolved > 4 * 3600:   # YouTube playlist URLs expire after ~6 h
+            try:
+                url, t_resolved = resolve(), time.time()
+            except Exception:
+                pass
+        ad_ranges = "stitched-ad" in pl or "twitch-stitched-ad" in pl
+        segs = [(m.group(1), float(m.group(2)), m.group(3), m.group(4)) for m in SEG_RE.finditer(pl)]
+        if youtube and not segs:                       # no PROGRAM-DATE-TIME: time new segments by arrival
+            fresh = [(None, float(m.group(1)), "live", m.group(2)) for m in _SEG_ANY.finditer(pl)
+                     if m.group(2) not in seen]
+            t_next = time.time() - sum(d for _, d, _, _ in fresh)
+            for i, (_, d, ti, u) in enumerate(fresh):
+                segs.append((t_next, d, ti, u))
+                t_next += d
+        for when, dur, title, seg_url in segs:
+            if seg_url.startswith("/") or not seg_url.startswith("http"):
+                seg_url = urllib.parse.urljoin(url, seg_url)
+            if seg_url in seen:
+                continue
+            seen.add(seg_url)
+            if not youtube and "live" not in title.lower():   # Twitch titles content segments "live"; ads are "Amazon" etc.
+                n_ads += 1
+                continue
+            t0 = when if isinstance(when, (int, float)) else _epoch(when)
+            path = os.path.join(seg_dir, f"{int(t0 * 1000)}.ts")
+            try:
+                data = T.http(seg_url, attempts=2, timeout=20)
+            except Exception as exc:              # download first: a failure must not leave an empty .ts behind
+                host = seg_url.split("/")[2]
+                if host not in failed_hosts:
+                    failed_hosts.add(host)
+                    print(f"[live] segment download failed from {host} ({str(exc)[:100]}) — "
+                          "if this repeats, that host is blocked from this machine", flush=True)
+                continue
+            with open(path, "wb") as fh:
+                fh.write(data)
+            with open(index, "a") as fh:
+                fh.write(json.dumps({"t": t0, "d": dur, "f": os.path.basename(path)}) + "\n")
+            n_segs += 1
+        # prune the buffer
+        cutoff = time.time() - buffer_s
+        for f in glob.glob(os.path.join(seg_dir, "*.ts")):
+            if int(os.path.basename(f)[:-3]) / 1000 < cutoff:
+                os.remove(f)
+        if n_segs and n_segs % 150 == 0:
+            print(f"[live] {login}: {n_segs} segments ({n_segs * 2 / 60:.0f} min), {n_ads} ad segments skipped"
+                  f"{' (ad break now)' if ad_ranges else ''}", flush=True)
+        if len(seen) > 5000:
+            seen = set(list(seen)[-2000:])
+        time.sleep(2.0)
+
+
+def load_index(rec_dir: str) -> list[dict]:
+    out = []
+    for line in open(os.path.join(rec_dir, "index.jsonl")):
+        r = json.loads(line)
+        if os.path.isfile(os.path.join(rec_dir, "segments", r["f"])):
+            out.append(r)
+    out.sort(key=lambda r: r["t"])
+    # A restarted recorder can save the same stretch again under slightly different timestamps
+    # (Twitch's PROGRAM-DATE-TIME differs per playlist session). Keep the first copy, drop overlaps,
+    # or every cut across that stretch repeats it and the timeline after it shifts.
+    kept: list[dict] = []
+    for r in out:
+        if kept and r["t"] < kept[-1]["t"] + kept[-1]["d"] - 0.5:
+            continue
+        kept.append(r)
+    return kept
+
+
+def cut_source(rec_dir: str, t0: float, t1: float, out_ts: str) -> float:
+    """Concatenate recorded segments covering wall-clock [t0, t1] into out_ts.
+    Returns the wall-clock time of its first frame (pass as source_t0)."""
+    idx = [r for r in load_index(rec_dir) if r["t"] + r["d"] > t0 - 2 and r["t"] < t1 + 2]
+    if not idx:
+        raise RuntimeError("that moment is not in the recording (before it started, or pruned)")
+    with open(out_ts, "wb") as fh:
+        for r in idx:
+            fh.write(open(os.path.join(rec_dir, "segments", r["f"]), "rb").read())
+    return idx[0]["t"]
+
+
+_CLIPS_LIVE = """query($login: String!) { user(login: $login) {
+  clips(first: 100, criteria: {period: LAST_DAY, sort: VIEWS_DESC}) {
+    edges { node { slug title viewCount createdAt durationSeconds } } } } }"""
+
+
+def live_moments(rec_dir: str, delay_s: float = 8.0) -> list[dict]:
+    """Viewer clips made while we were recording, as wall-clock windows,
+    overlapping ones merged, most-viewed first."""
+    meta = json.load(open(os.path.join(rec_dir, "recording.json")))
+    idx = load_index(rec_dir)
+    if not idx:
+        return []
+    have0, have1 = idx[0]["t"], idx[-1]["t"] + idx[-1]["d"]
+    u = T.gql(_CLIPS_LIVE, {"login": meta["login"]}).get("user") or {}
+    ms: list[dict] = []
+    for e in ((u.get("clips") or {}).get("edges") or []):
+        c = e["node"]
+        end = _epoch(c["createdAt"]) - delay_s + 2
+        start = end - c["durationSeconds"] - 2
+        if start < have0 or end > have1:
+            continue
+        hit = next((m for m in ms if start <= m["end"] - 5 and end >= m["start"] + 5), None)
+        if hit:
+            hit["views"] += c["viewCount"]
+            hit["clips"] += 1
+            hit["titles"].append(c["title"])
+            if c["viewCount"] > hit["best"]["views"]:
+                hit["best"] = {"start": start, "end": end, "views": c["viewCount"]}
+        else:
+            ms.append({"start": start, "end": end, "views": c["viewCount"], "clips": 1,
+                       "titles": [c["title"]], "best": {"start": start, "end": end, "views": c["viewCount"]}})
+    return sorted(ms, key=lambda m: -m["views"])
+
+
+def render_live(rec_dir: str, top: int = 3, out_dir: str | None = None, model: str = "small",
+                watermark: str | None = None) -> list[dict]:
+    """Cut + caption the most-viewed viewer-clipped moments from the recording."""
+    from . import audio as A
+    from . import render as V
+    out_dir = out_dir or os.path.join(rec_dir, "renders")
+    os.makedirs(out_dir, exist_ok=True)
+    login = json.load(open(os.path.join(rec_dir, "recording.json")))["login"]
+    reports = []
+    for m in live_moments(rec_dir)[:top]:
+        b = m["best"]
+        src = os.path.join(out_dir, f"_src_{int(b['start'])}.ts")
+        first = cut_source(rec_dir, b["start"] - 4, b["end"] + 4, src)
+        x = A.decode_pcm(src, 0, None)
+        tr = A.transcribe(x, model, offset=first)
+        words = A.real_words(tr)
+        s, e = b["start"], b["end"]
+        inside = [w for w in words if s <= w["start"] <= e]
+        if inside:                                     # trim dead air at the ends only
+            s, e = max(s, inside[0]["start"] - 1.0), min(e, inside[-1]["end"] + 1.5)
+        e = max(e, s + 12)
+        name = f"{login}_{dt.datetime.fromtimestamp(s).strftime('%H%M%S')}"
+        out = os.path.join(out_dir, name + ".mp4")
+        info = V.render(src, first, s, e, words, out, crop="blur", watermark=watermark)
+        os.remove(src)
+        rep = {**info, "views": m["views"], "titles": m["titles"][:3], "length_s": round(e - s, 1),
+               "status": "DRAFT — a person must watch it and approve before posting"}
+        json.dump(rep, open(os.path.join(out_dir, name + ".report.json"), "w"), indent=2)
+        print(f"[live] {out}  {e - s:.0f}s  {m['views']:,} views  “{m['titles'][0][:50]}”", flush=True)
+        reports.append(rep)
+    return reports
+
+
+def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title: str | None = None,
+                  quote: str | None = None, layout: str = "stack", model: str = "small",
+                  watermark: str | None = None, fixes: dict | None = None,
+                  extra_censor: set[str] | None = None, drop_captions: list | None = None) -> dict:
+    """Render any wall-clock window of a recording (moments found by reading
+    the recording itself, not only viewer clips)."""
+    from . import audio as A
+    from . import render as V
+    src = out + ".src.ts"
+    first = cut_source(rec_dir, start_ts - 3, end_ts + 3, src)
+    x = A.decode_pcm(src, 0, None)
+    words = A.real_words(A.transcribe(x, model, offset=first))
+    from . import censor as C
+    words = C.apply_fixes(words, fixes)          # e.g. {"kill me?": "kill him?"}
+    info = V.render(src, first, start_ts, end_ts, words, out, crop="blur", layout=layout,
+                    title=title, quote=quote, watermark=watermark, extra_censor=extra_censor,
+                    drop_captions=drop_captions)
+    os.remove(src)
+    return info

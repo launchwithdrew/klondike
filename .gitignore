@@ -1,0 +1,23 @@
+# this channel's own things — never overwritten by updates, never committed upstream
+brand/*
+!brand/brand.example.json
+config/*
+!config/sentinel_model.json
+data/
+ledger.jsonl
+outbox/
+posted/
+failed/
+runs/
+logs/
+local/
+chrome-profile/
+.engine.lock
+# environment
+.venv/
+node_modules/
+engine/node_modules/
+__pycache__/
+.pytest_cache/
+*.ts
+.DS_Store

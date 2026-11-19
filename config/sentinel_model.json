@@ -1,0 +1,32 @@
+{
+ "_about": "Logistic model over sentinel features. Chat weights are learned by `clipengine train` from past streams (label: viewers clipped it); audio_z and crowd_new are set by hand.",
+ "bias": -0.3725,
+ "weights": {
+  "z_users": 0.2371,
+  "z_msgs": -0.2555,
+  "z_laugh": 0.1171,
+  "z_shock": 0.1026,
+  "z_hype": -0.165,
+  "accel": 0.0381,
+  "clip": 0.7183,
+  "conv": 0.0816,
+  "junk": -0.0698,
+  "surge": -0.0409,
+  "audio_z": 0.35,
+  "crowd_new": 1.2,
+  "z_users@-10": 0.0473,
+  "z_laugh@-10": 0.0485,
+  "z_shock@-10": 0.0639,
+  "z_users@-20": 0.1088,
+  "z_laugh@-20": 0.1343,
+  "z_shock@-20": 0.0951
+ },
+ "trigger": 0.7,
+ "release": 0.35,
+ "eval": {
+  "trained": "2026-11-19T01:33:32.153338+00:00",
+  "held_out_recall_top10": 0.44,
+  "false_fires_per_hour": 6.2,
+  "note": "General detector: trained on 20+ big English streams in GTA VI and Just Chatting outside any one channel's roster; held-out recall 0.44 of top-10 viewer-clipped moments at ~6.2 false fires/h (trigger 0.7). Retrain on your own streamers with `clipengine train`."
+ }
+}

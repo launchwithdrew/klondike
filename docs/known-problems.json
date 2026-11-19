@@ -1,0 +1,21 @@
+{
+  "_about": "Problems the engine has hit, the log line that gives each away, and the fix. `clipengine diagnose` matches recent logs against these. Add an entry whenever a new problem is solved.",
+  "problems": [
+    {"id": "host-blocked", "match": "Tunnel connection failed: 403|segment download failed from|no reachable live playlist", "problem": "This machine can't reach a Twitch video server (network or firewall rules).", "fix": "Run the engine on a machine with normal internet access; on a restricted network, allow *.ttvnw.net hosts. Streams offline also show this."},
+    {"id": "signed-out-google", "match": "not signed in to Google|accounts.google.com", "problem": "The poster's Chrome is signed out of YouTube.", "fix": "The user signs in once: cd engine && node post.mjs --login, then node post.mjs --check."},
+    {"id": "signed-out-tiktok", "match": "not logged in to TikTok", "problem": "The poster's Chrome is signed out of TikTok.", "fix": "The user signs in once: cd engine && node post.mjs --login."},
+    {"id": "signed-out-instagram", "match": "logged in, but not as|not logged in to Instagram|instagram.com/accounts/login", "problem": "Instagram is signed out or signed in to a different account.", "fix": "Sign in to the account in brand/brand.json: cd engine && node post.mjs --login."},
+    {"id": "wrong-account", "match": "wrong channel|logged in as @", "problem": "The poster is signed in to a different account than the brand pack names.", "fix": "Either sign in to the right account (node post.mjs --login) or correct the handles in brand/brand.json."},
+    {"id": "no-handles", "match": "no TikTok username in brand|no handle in brand", "problem": "The brand pack is missing account handles.", "fix": "clipengine init --force with --youtube --instagram --tiktok, or edit brand/brand.json."},
+    {"id": "chrome-missing", "match": "engine Chrome did not start|Chrome not found", "problem": "Google Chrome isn't installed where the poster looks.", "fix": "Install Google Chrome, or set CLIPENGINE_CHROME to its path."},
+    {"id": "disk-full", "match": "No space left on device|only \\d+ GB free", "problem": "The disk is full or nearly full.", "fix": "clipengine cycle clears old drafts; stop a sentinel (clipengine stop --channel X) or lower buffer_h in config/ops.json."},
+    {"id": "push-failed", "match": "git push failed|push, will retry|rejected", "problem": "This machine can't push to the repo.", "fix": "git pull, then push again; if it still fails, the machine needs push access to the repo."},
+    {"id": "headline-refused", "match": "PUBLISH REFUSED: title uses|headline wraps to|quote too long", "problem": "The headline breaks a rule (risky wording or too long).", "fix": "Rewrite it per brand/voice.md: true to the cut, under ~80 characters, no violence or sexual words."},
+    {"id": "unsafe", "match": "REFUSED — sexual content", "problem": "The clip was refused as sexual content.", "fix": "Skip this moment; censoring words doesn't make it safe."},
+    {"id": "ffmpeg", "match": "ffmpeg failed", "problem": "Rendering failed.", "fix": "Run bash setup/setup.sh (checks ffmpeg); if it repeats on one source, skip that moment and report it with clipengine support."},
+    {"id": "twitch-api", "match": "GQL error|server error", "problem": "Twitch's data service returned an error.", "fix": "Usually temporary: the next cycle retries. If it persists for an hour, run clipengine update and report it."},
+    {"id": "poster-held", "match": "HELD:", "problem": "The poster held a clip (bad title, not vertical, too long, or not marked brand-safe).", "fix": "Read the reason on that log line; re-publish the clip fixed. Held clips are in failed/."},
+    {"id": "recorder-retry", "match": "recorder stopped", "problem": "A sentinel's recorder keeps restarting (stream offline, or its video server unreachable).", "fix": "If the streamer is live, see host-blocked; otherwise cycle stops the sentinel when they go offline."},
+    {"id": "models-missing", "match": "faster_whisper|LocalEntryNotFoundError|huggingface", "problem": "The speech models aren't downloaded.", "fix": "bash setup/setup.sh"}
+  ]
+}

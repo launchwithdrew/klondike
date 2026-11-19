@@ -1,0 +1,6 @@
+faster-whisper==1.2.1
+numpy>=1.26
+pytest>=8
+pillow>=10
+yt-dlp==2026.10.26
+websocket-client==1.9.2
