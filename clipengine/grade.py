@@ -43,7 +43,11 @@ DEFAULTS = {
     "chat_scale": 6.0,
     "freshness_half_life_h": 3.0,
     "penalties": {"poll": 0.5, "music": 0.5, "lyrics": 0.5, "dead_open": 0.8, "silent": 0.85, "thin": 0.7,
-                  "cutscene": 0.5, "static": 0.6, "dark": 0.5},
+                  "cutscene": 0.5, "static": 0.45, "dark": 0.4, "menu": 0.4},
+    # a dull picture (vision.liveliness under dull_below) scales the score down to dull_floor at liveliness 0
+    "dull_below": 0.5, "dull_floor": 0.3,
+    # nothing happening: little streamer speech, no reaction, quiet chat, no viewers clipping → × quiet
+    "quiet": 0.55, "quiet_chat": 0.4, "quiet_reaction": 0.3, "quiet_crowd": 0.2,
     "tiers": {"banger": 75, "solid": 60},
     # judge like an editor (defaults in code; config/grading.json may override)
     "game_dialogue_cap": 30,        # engine ceiling for game dialogue no viewer / streamer reaction carries: best 58
@@ -77,7 +81,8 @@ def _penalty(flags: list[str], cfg: dict) -> tuple[float, list[str]]:
         fl = f.lower()
         for key, needle in (("poll", "chat was asked"), ("music", "music"), ("lyrics", "lyrics"),
                             ("dead_open", "dead open"), ("silent", "silent stretch"), ("thin", "thin speech"),
-                            ("cutscene", "cutscene"), ("static", "static ("), ("dark", "dark (")):
+                            ("cutscene", "cutscene"), ("static", "static ("), ("dark", "dark ("),
+                            ("menu", "menu/map screens")):
             if key not in pen:
                 continue
             if needle in fl:
@@ -91,7 +96,8 @@ def engine_score(sig: dict, cfg: dict | None = None) -> dict:
     """sig: crowd_vpm, crowd_views, chat_score, audio_factor (None = not available),
     streamer_factor (None = unknown → neutral), age_h, flags, unsafe, hard_fail, published,
     and (judge like an editor) speech = {streamer_s, dur, game_share, game_dialogue}, reaction 0–1
-    (+ reaction_why), wrong_game. Returns score, parts and `why` — the reasons, in words."""
+    (+ reaction_why), wrong_game, liveliness 0–1 (vision.liveliness: how much moves on screen).
+    Returns score, parts and `why` — the reasons, in words."""
     cfg = cfg or config()
     w = dict(cfg["weights"])
     notes: list[str] = []
@@ -122,6 +128,15 @@ def engine_score(sig: dict, cfg: dict | None = None) -> dict:
     total_w = sum(w[k] for k in used) or 1
     base = 100 * sum(w[k] * v for k, v in used.items()) / total_w
     mult, why = _penalty(flags, cfg)
+    live = sig.get("liveliness")
+    if live is not None and live < cfg["dull_below"]:
+        f = round(cfg["dull_floor"] + (1 - cfg["dull_floor"]) * max(0.0, live) / cfg["dull_below"], 2)
+        mult *= f
+        why.append(f"dull picture (liveliness {live:.2f}) ×{f}")
+    if sp and thin and (react or 0) < cfg["quiet_reaction"] and (parts["chat"] or 0) < cfg["quiet_chat"] \
+            and (parts["crowd"] or 0) < cfg["quiet_crowd"]:
+        mult *= cfg["quiet"]               # plain driving, a walk, a menu: no talk, no reaction, no one clipping
+        why.append(f"nothing happening (no streamer talk, reaction, chat or viewers) ×{cfg['quiet']}")
     score = base * mult
     if sp.get("game_dialogue") or any("game dialogue" in f.lower() for f in flags):
         carried = (parts["crowd"] or 0) >= cfg["carry_crowd"] or (react or 0) >= cfg["carry_reaction"]
@@ -140,6 +155,21 @@ def engine_score(sig: dict, cfg: dict | None = None) -> dict:
             "penalties": why, "why": notes + why}
 
 
+VISION_NEEDLES = ("cutscene", "static (", "dark (", "menu/map screens", "dull picture")
+
+
+def merge_vision_flags(flags: list[str], more: list[str]) -> list[str]:
+    """Add frame-check flags without counting one twice: a category (cutscene, static, dark, menu/map,
+    dull picture) already flagged — e.g. by the draft's source frames — isn't added again from the render."""
+    have = {n for f in flags for n in VISION_NEEDLES if n in f.lower()}
+    out = list(flags)
+    for f in more:
+        cats = {n for n in VISION_NEEDLES if n in f.lower()}
+        if f not in out and not (cats and cats <= have):
+            out.append(f)
+    return out
+
+
 def parts_line(eng: dict, sig: dict | None = None) -> str:
     """The score's work in one short string: «sp 4s ch .91 au .30 re .70 cr –»."""
     f = lambda v: "–" if v is None else f"{v:.2f}".lstrip("0")
@@ -150,6 +180,8 @@ def parts_line(eng: dict, sig: dict | None = None) -> str:
     if sig.get("reaction") is not None:
         out.append(f"re {f(sig['reaction'])}")
     out.append(f"cr {f(p.get('crowd'))}")
+    if sig.get("liveliness") is not None:
+        out.append(f"pic {f(sig['liveliness'])}")
     return " ".join(out)
 
 
@@ -207,6 +239,7 @@ def signals_from_candidate(c: dict, vod: dict, now: dt.datetime | None = None) -
             "flags": c.get("flags") or [], "unsafe": safety.get("why") if safety.get("flagged") else "",
             "hard_fail": c.get("hard_fail") or "", "titles": (crowd or {}).get("titles") or [],
             "speech": c.get("speech"), "reaction": c.get("reaction") if isinstance(c.get("reaction"), (int, float)) else None,   # a scan's is a chat label
+            "liveliness": c.get("liveliness"),
             "reaction_why": c.get("reaction_why"),
             "wrong_game": c.get("wrong_game") or ""}
 

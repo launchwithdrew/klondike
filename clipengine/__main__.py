@@ -103,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--check", action="store_true", help="validate the drop without dropping")
     pb.add_argument("--no-push", action="store_true")
     for x in (pb,):
+        x.add_argument("--truth-override", metavar="REASON", help="confirm an unsupported headline claim seen in the cut")
         x.add_argument("--taste", metavar="yes|no", help="yes|no — would a fan of this streamer be glad to see this posted? (no = skip, reason taste)")
         x.add_argument("--rubric", metavar="CHECKS",
                        help="with --frames-checked: the checks that pass, from hook,context,payoff,share (or none)")
@@ -127,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         x.add_argument("--fix", action="append", default=[], metavar='"heard=>said"')
         x.add_argument("--bleep", action="append", default=[], metavar="WORD")
         x.add_argument("--rubric", metavar="CHECKS")
+        x.add_argument("--truth-override", metavar="REASON", help="confirm an unsupported headline claim seen in the cut")
         x.add_argument("--taste", metavar="yes|no", help="yes|no — would a fan of this streamer be glad to see this posted? (no = skip, reason taste)")
     sub.add_parser("creators", help="who is live right now, and whether their stream is saved as a VOD")
     sn = sub.add_parser("sentinel", help="watch one live streamer in real time: chat + audio + viewer clips -> drafts in the queue")
@@ -178,8 +180,13 @@ def main(argv: list[str] | None = None) -> int:
     cy = sub.add_parser("cycle", help="the whole rhythm in one idempotent command — run every 5-10 min")
     cy.add_argument("--top", type=int, help="sentinels to keep running (default config/ops.json)")
     cy.add_argument("--no-radar", action="store_true", help="don't start/stop sentinels from the radar")
+    fc_setup = sub.add_parser("facecam-setup", help="review a refined webcam box and approve it")
+    fc_setup.add_argument("--channel", required=True)
+    answer = fc_setup.add_mutually_exclusive_group()
+    answer.add_argument("--yes", metavar="BOX", help="approve a reviewed x,y,width,height box")
+    answer.add_argument("--no", action="store_true", help="confirm the creator has no webcam box")
     dr = sub.add_parser("doctor", help="preflight: everything this machine needs, with the fix for each gap")
-    dr.add_argument("--accounts", action="store_true", help="also check the three platform sign-ins (opens Chrome)")
+    dr.add_argument("--accounts", action="store_true", help="check public handles in agent mode or platform sign-ins in Chrome")
     st = sub.add_parser("start", help="start a sentinel in the background (survives the shell)")
     st.add_argument("--channel", required=True)
     sp = sub.add_parser("stop", help="stop a sentinel (--all: every sentinel and the poster)")
@@ -201,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     pq.add_argument("--end", type=float, help="trim: seconds to drop from the end")
     pq.add_argument("--frames-checked", action="store_true")
     pq.add_argument("--rubric", metavar="CHECKS")
+    pq.add_argument("--truth-override", metavar="REASON")
     pq.add_argument("--taste", metavar="yes|no", help="yes|no — would a fan of this streamer be glad to see this posted? (no = skip, reason taste)")
     pq.add_argument("--post", action="store_true")
     pq.add_argument("--check", action="store_true")
@@ -214,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
     pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
+    pd.add_argument("--confirmed", action="store_true", help="you checked the Instagram post and its author")
+    ip = sub.add_parser("import-posts", help="import live posts from another engine for the repeat guard")
+    ip.add_argument("--from", dest="file", required=True)
     vw = sub.add_parser("views", help="(post_with: agent) record a view count you read off a post")
     vw.add_argument("--slug", required=True); vw.add_argument("--platform", required=True); vw.add_argument("--views", type=int, required=True)
     vw.add_argument("--watch-s", type=float, help="average watch time in seconds (from the post's analytics)")
@@ -229,8 +240,25 @@ def main(argv: list[str] | None = None) -> int:
     sb.add_argument("--platform")
     po = sub.add_parser("payout", help="record money a clipping pool paid")
     po.add_argument("--pool", required=True); po.add_argument("--amount", type=float, required=True); po.add_argument("--slug")
+    au = sub.add_parser("audit", help="humans check the engine: `audit speakers` (tags right/wrong)")
+    au.add_argument("what", choices=["speakers", "words"])
+    au.add_argument("--channel", help="creator vocab pack to audit")
+    au.add_argument("--reference", help="JSON of manually verified draft transcript text, keyed by ID")
+    au.add_argument("--last", type=int, default=20)
+    au.add_argument("--mark", nargs=2, metavar=("ID", "right|wrong"))
+    au.add_argument("--note")
     sk = sub.add_parser("skip", help="mark a sentinel draft as looked-at and not worth posting")
     sk.add_argument("--id", required=True)
+    sk.add_argument("--reason", default="other", help="menu/map/loading/driving/dark/static/cutscene/sexual/dud/other, or your own reason")
+    sub.add_parser("eval-judge", help="compare the engine calls to human decisions")
+    ch = sub.add_parser("check-headline", help="check a title against a queued draft")
+    ch.add_argument("--id", required=True)
+    ch.add_argument("--title", required=True)
+    ch.add_argument("--quote")
+    rv = sub.add_parser("review", help="write a self-contained review page for a draft")
+    rv.add_argument("--id", required=True)
+    rv.add_argument("--title")
+    rv.add_argument("--quote")
     tn = sub.add_parser("train", help="train the sentinel on recent VODs, using viewer clips as labels")
     tn.add_argument("--channel", action="append", default=[], help="streamers to learn from (default: top live in the radar)")
     tn.add_argument("--vod", action="append", default=[])
@@ -246,6 +274,11 @@ def main(argv: list[str] | None = None) -> int:
     fc.add_argument("--out", help="check image path")
     fc.add_argument("--refine", action="store_true",
                     help="snap the streamer's box (config or detected) to the webcam's real border: a clean cut")
+    sc = sub.add_parser("scouts", help="were we first? every moment viewers clipped on the roster vs our drafts")
+    sc.add_argument("--hours", type=float, default=6.0)
+    sc.add_argument("--min-views", type=int, default=25)
+    so = sub.add_parser("sources", help="the last 10 yt: sentinel sessions: when, how long, chat or audio-only, drafts")
+    so.add_argument("-n", type=int, default=10)
     kc = sub.add_parser("kick-check", help="one line: does Kick work from this machine (site, GTA VI listing, recording, chat)")
     kc.add_argument("--channel", help="kick:<slug> to try (default: the top live Kick stream in the category)")
     kc.add_argument("--seconds", type=float, default=60.0, help="how long to read chat")
@@ -277,6 +310,8 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(str(exc))
     if getattr(a, "question", None):
         caption_kw["question"] = a.question
+    if getattr(a, "truth_override", None) is not None:
+        caption_kw["truth_override"] = a.truth_override.strip()
     if getattr(a, "bleep", None):
         caption_kw["extra_censor"] = {w.lower() for w in a.bleep}
     if a.cmd in ("autopilot", "attention", "schedule", "catchup", "backup", "restore"):
@@ -345,6 +380,22 @@ def main(argv: list[str] | None = None) -> int:
         SN.run(a.channel, a.out or os.path.join("runs", f"sentinel-{L.source_name(a.channel)}"), a.buffer, not a.no_draft,
                record=not a.no_record)
         return 0
+    if a.cmd == "scouts":
+        from . import scouts as SC
+        SC.show(a.hours, a.min_views)
+        return 0
+    if a.cmd == "import-posts":
+        from . import moments
+        try:
+            count = moments.import_posts(a.file)
+        except (OSError, ValueError) as exc:
+            ap.error(f"import-posts: {exc}")
+        print(f"imported {count} live post record(s)")
+        return 0
+    if a.cmd == "facecam-setup":
+        from . import facecam
+        facecam.setup_channel(a.channel, a.yes, a.no)
+        return 0
     if a.cmd == "facecam":
         from . import facecam as FC
         FC.cli(rec=a.rec, channel=a.channel, out=a.out, refine_it=a.refine)
@@ -405,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "to-post":
             HP.show()
         elif a.cmd == "posted":
-            print(HP.mark(a.slug, a.platform, a.url))
+            print(HP.mark(a.slug, a.platform, a.url, a.confirmed))
         elif a.cmd == "to-measure":
             HP.show_measure()
         elif a.cmd == "followers":
@@ -434,30 +485,58 @@ def main(argv: list[str] | None = None) -> int:
         if not AP.show_sentinels():
             print("tier 2  no sentinels running")
         return 0
+    if a.cmd == "audit":
+        from . import judge as JG
+        if a.what == "speakers":
+            if a.mark:
+                JG.mark_speakers(a.mark[0], a.mark[1], a.note)
+            else:
+                JG.audit_speakers(a.last)
+        else:
+            JG.audit_words(a.last, login=a.channel, reference=a.reference)
+        return 0
+    if a.cmd == "eval-judge":
+        from . import judge as JG
+        JG.eval_judge()
+        return 0
     if a.cmd == "queue":
         from . import sentinel as SN
         if not SN.show_queue(all_=a.all):
             print("queue empty")
         return 0
-    if a.cmd in ("publish-queued", "skip"):
+    if a.cmd in ("publish-queued", "skip", "check-headline", "review"):
         from . import sentinel as SN
         e = next((r for r in SN.load_queue() if r["id"] == a.id), None)
         if not e:
             ap.error(f"no queued draft {a.id}")
+        from . import judge as JG
+        if a.cmd == "review":
+            from . import review
+            print(review.draft_page(e, a.title, a.quote))
+            return 0
+        if a.cmd == "check-headline":
+            preview = JG.check_headline(e, a.title, a.quote)
+            print(json.dumps(preview, indent=2))
+            return 1 if preview["problems"] or preview["unsupported"] else 0
         if a.cmd == "skip":
-            SN.set_status(e, "skipped")
+            SN.mark_seen(e)
+            reason = " ".join(a.reason.split()) or "other"
+            JG.record(e, "drop", reason)
+            SN.set_status(e, "skipped", reason=reason)
             print(f"skipped {e['id']}")
             return 0
         from . import publish as PB
         from . import autopilot as AP
         AP.refuse_never(e.get("login", ""))
+        if a.frames_checked or caption_kw.get("taste") is False:
+            SN.mark_seen(e)
         if caption_kw.get("taste") is False:      # a fan wouldn't want it: skip the draft, learn from it
             SN.set_status(e, "skipped", reason="taste")
-            PB.taste_no(e.get("login", ""), e["id"], push=not a.no_push, title=a.title)
+            PB.taste_no(e.get("login", ""), e["id"], push=not a.no_push, title=a.title, draft=e)
         if e.get("scan"):                       # a catch-up draft from a saved stream: the normal VOD path
             kw = AP.publish_window_args(e, a.start, a.end)
             rep = PB.publish_scan(kw.pop("scan_dir"), kw.pop("pick"), a.title, a.line, a.quote, a.slug, a.frames_checked,
-                                  a.post, push=not a.no_push, check_only=a.check, **kw, **caption_kw)
+                                  a.post, push=not a.no_push, check_only=a.check, draft=e, **kw, **caption_kw)
             if a.frames_checked and not a.check and str(rep.get("status", "")).startswith("DROPPED"):
                 SN.set_status(e, "published", slug=rep.get("slug"))
             return 0
@@ -472,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
                                 a.quote, a.slug, a.frames_checked, a.post, push=not a.no_push, check_only=a.check,
                                 chat_score=SN.chat_score_from_p(e["p"]) if e.get("p") is not None else None,
                                 words=words, drop_captions=SN.game_spans(words) or None,   # captions: people, not the game
-                                pre=pre, **caption_kw)
+                                pre=pre, payoff_ts=e.get("payoff"), draft=e, **caption_kw)
         if a.frames_checked and not a.check and str(rep.get("status", "")).startswith("DROPPED"):
             SN.set_status(e, "published", slug=rep.get("slug"))
         return 0
@@ -481,6 +560,10 @@ def main(argv: list[str] | None = None) -> int:
         out = PR.run_pending(ids=a.id) if a.id else PR.run_pending()
         if not out:
             print("prerender: nothing pending")
+        return 0
+    if a.cmd == "sources":
+        from . import youtube as YT
+        YT.show_sources(a.n)
         return 0
     if a.cmd == "kick-check":
         from . import kick as K

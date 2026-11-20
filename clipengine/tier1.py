@@ -14,11 +14,14 @@ Coverage in two tiers:
   * drafts a tier-1 spike on a creator with saved VODs from the VOD once it is published (the catch-up
     path) — even if they were never promoted. Spikes a sentinel already covered are skipped.
 
-Kick sources ("kick:<slug>") are watched by their own chat reader behind the same interface.
+Kick sources ("kick:<slug>") are watched by their own chat reader behind the same interface (Kick refuses it to
+outside clients — pusher 4001 — so on Kick tier 1 is in practice its viewers' clips), and CrowdWatch reads their
+clips listing; their spikes are drafted from the live/saved broadcast (kick.catchup_spike).
 """
 from __future__ import annotations
 
 import collections
+import datetime as dt
 import json
 import os
 import queue
@@ -212,10 +215,10 @@ def load_state() -> dict:
     return _json(STATE, {})
 
 
-def load_spikes(since: float = 0.0) -> list[dict]:
+def load_spikes(since: float = 0.0, path: str | None = None) -> list[dict]:
     out = []
     try:
-        for line in open(SPIKES):
+        for line in open(path or SPIKES):
             try:
                 r = json.loads(line)
             except ValueError:
@@ -248,6 +251,85 @@ def _chat_for(login: str, multi: MultiChat):
     return _View(multi, login)
 
 
+CROWD_Q = """query($ls: [String!]) { users(logins: $ls) { login clips(first: 20, criteria: {period: LAST_DAY,
+  sort: VIEWS_DESC}) { edges { node { slug title createdAt viewCount } } } } }"""
+CROWD_MIN_VIEWS = 10        # a fresh viewer clip with this many views = a moment the crowd is reacting to
+CROWD_FRESH_S = 1200        # only clips made in the last 20 min count as "happening now"
+CROWD_HOT_S = 600           # after one, the creator counts as hot (promotion to a full sentinel) this long
+
+
+class CrowdWatch(threading.Thread):
+    """Viewers' clips on EVERY watched stream, once a minute, in one batched request. When a fresh clip
+    passes CROWD_MIN_VIEWS the moment becomes a spike (kind "crowd") — drafted by catch-up when no sentinel
+    has it — and the creator turns hot, so cycle promotes them to a full sentinel."""
+    def __init__(self, every_s: float = 60.0):
+        super().__init__(daemon=True)
+        self.logins: list[str] = []
+        self.every_s, self.stop_flag = every_s, False
+        self.fired: dict[str, float] = {}           # slug -> when we fired on it
+        self.hot: dict[str, float] = {}             # login -> hot until
+        self.out: list[dict] = []
+        self.lock = threading.Lock()
+
+    def poll(self, now: float | None = None) -> list[dict]:
+        from . import twitch as T
+        now = now or time.time()
+        logins = [l for l in self.logins if not l.startswith(("kick:", "yt"))]
+        got = []
+        for i in range(0, len(logins), 25):
+            users = T.gql(CROWD_Q, {"ls": logins[i:i + 25]}).get("users") or []
+            for u in users:
+                for e in ((u or {}).get("clips") or {}).get("edges") or []:
+                    sp = crowd_spike((u or {}).get("login", ""), e.get("node") or {}, now, self.fired)
+                    if sp:
+                        self.fired[e["node"]["slug"]] = now
+                        self.hot[sp["login"]] = now + CROWD_HOT_S
+                        got.append(sp)
+        for l in [l for l in self.logins if l.startswith("kick:")]:     # Kick: its own clips listing, one call each
+            try:
+                from . import kick as K
+                for n in K.crowd_nodes(l, now):
+                    sp = crowd_spike(l, n, now, self.fired)
+                    if sp:
+                        self.fired[n["slug"]] = now
+                        self.hot[sp["login"]] = now + CROWD_HOT_S
+                        got.append(sp)
+            except Exception:
+                pass                                        # kick.com refused / slow: Twitch's clips still count
+        for slug in [k for k, t in self.fired.items() if now - t > 6 * 3600]:
+            self.fired.pop(slug)
+        return got
+
+    def run(self):
+        while not self.stop_flag:
+            try:
+                got = self.poll()
+                if got:
+                    with self.lock:
+                        self.out += got
+            except Exception:
+                pass
+            time.sleep(self.every_s)
+
+    def take(self) -> list[dict]:
+        with self.lock:
+            got, self.out = self.out, []
+        return got
+
+
+def crowd_spike(login: str, n: dict, now: float, fired: dict) -> dict | None:
+    """A viewer clip -> a spike record, if it is fresh, has views, and wasn't fired on already (pure)."""
+    try:
+        t = dt.datetime.fromisoformat(n["createdAt"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError, AttributeError):
+        return None
+    if not login or n.get("slug") in fired or now - t > CROWD_FRESH_S or int(n.get("viewCount") or 0) < CROWD_MIN_VIEWS:
+        return None
+    return {"login": login.lower(), "kind": "crowd", "fire": round(t - 30, 1), "peak": round(t, 1), "end": round(t, 1),
+            "start": round(t - 90, 1), "stop": round(t + 20, 1), "p": 1.0, "views": int(n["viewCount"]),
+            "title": (n.get("title") or "")[:80]}
+
+
 def run(stop_after_s: float | None = None) -> None:
     """The tier-1 process: follows runs/tier1/channels.json, judges every channel every STEP_S."""
     os.makedirs(DIR, exist_ok=True)
@@ -268,6 +350,8 @@ def run(stop_after_s: float | None = None) -> None:
             except Exception:
                 pass
     threading.Thread(target=warmer, daemon=True).start()
+    crowd = CrowdWatch()
+    crowd.start()
     t0 = time.time()
     t_next, last_cfg, last_state = time.time() + SN.STEP_S, 0.0, 0.0
     print(f"[tier1] chat-only watcher started (trigger p ≥ {m['trigger']})", flush=True)
@@ -287,6 +371,7 @@ def run(stop_after_s: float | None = None) -> None:
                 if hasattr(c, "stop_flag"):
                     c.stop_flag = True
             multi.set_channels({l for l in want if not l.startswith("kick:")})
+            crowd.logins = sorted(want)
         spikes = []
         for l, j in judges.items():
             sp = j.step(now, chats[l].window(now - SN.WINDOW_S, now))
@@ -296,6 +381,14 @@ def run(stop_after_s: float | None = None) -> None:
                 spikes.append(sp)
                 print(f"[tier1] {l}: spike p={sp['p']:.2f}" + (" (a sentinel has it)" if sp["covered"] else ""),
                       flush=True)
+        for sp in crowd.take():                          # viewers are clipping something right now
+            if any(o["login"] == sp["login"] and abs(o["fire"] - sp["fire"]) < 120 for o in spikes):
+                continue
+            sp["covered"] = sentinel_covers(sp["login"])
+            sp["at"] = now
+            spikes.append(sp)
+            print(f"[tier1] {sp['login']}: viewers clipping ({sp['views']} views)"
+                  + (" (a sentinel has it)" if sp["covered"] else ""), flush=True)
         if spikes:
             with open(SPIKES, "a") as fh:
                 for sp in spikes:
@@ -303,7 +396,9 @@ def run(stop_after_s: float | None = None) -> None:
         if now - last_state >= 15:
             last_state = now
             st = {"pid": os.getpid(), "beat": now, "connected": multi.connected, "msgs_total": multi.total,
-                  "channels": {l: {"p": round(j.p, 3), "heat": round(j.heat(now), 3), "chat_per_min": j.chat_per_min(),
+                  "channels": {l: {"p": round(j.p, 3), "chat_per_min": j.chat_per_min(),
+                                   "heat": round(max(j.heat(now), 1.0 if crowd.hot.get(l, 0) > now else 0.0), 3),
+                                   "crowd_hot": crowd.hot.get(l, 0) > now,
                                    "connected": bool(getattr(chats[l], "connected", False)), "warm": j.warm,
                                    "ready": len(j.hist.get("users", [])) >= SN.MIN_HISTORY, "spikes": j.spikes}
                                for l, j in judges.items()}}
@@ -375,12 +470,15 @@ def promoted(state: dict, t1: dict, cfg: dict, now: float, live: set[str] | None
 def spike_catchups(state: dict, roster: dict, now: float, cfg: dict) -> list[dict]:
     """Tier-1 spikes no sentinel covered, on creators with saved VODs, old enough that the VOD has them
     (published + its chat replay caught up): what the catch-up path should draft now (pure but for files)."""
+    from . import vodaccess as VA
     wait = float(cfg.get("tier1_vod_wait_min", 4)) * 60
     done = set(state.get("spikes_done") or [])
+    restricted = VA.restricted_set(now)
     out = []
     for sp in load_spikes(now - 6 * 3600):
         c = roster.get(sp["login"]) or {}
-        if spike_key(sp) in done or sp.get("covered") or c.get("vods") is False or sp["login"].startswith(("kick:", "yt")):
+        if spike_key(sp) in done or sp.get("covered") or c.get("vods") is False or sp["login"].startswith("yt") \
+                or sp["login"].lower() in restricted:        # subscriber-only VODs: nothing to draft from
             continue
         if now - sp["end"] < wait:
             continue

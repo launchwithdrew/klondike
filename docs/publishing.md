@@ -31,8 +31,21 @@ apply; a clip that misses a gap is scheduled and the poster posts it when the sl
 warm up: 1 post a day per platform at first, full speed by day 10.
 
 **How drafts are judged:** payoff-first (setup 3–15 s + payoff + reaction ≤ 8 s, 15–35 s), only the
-streamer's speech scores (game dialogue is tagged by voice + subtitles and can't post on its own), drops
-keep their reason in `queue --all`. Publish re-checks the render against the censor list and warns when
+streamer's speech scores (game dialogue is tagged by voice + subtitles and can't post on its own; speech
+under loud game audio that the voice filter cut is recovered by an unfiltered second pass), drops
+keep their reason in `queue --all`. The picture counts too: `pic` (0–1) is how much moves on screen — menus,
+maps, shop and settings screens, dark or still frames score low and are penalised, and a moment with nothing
+happening (no streamer talk, reaction, chat or viewer clips, like plain driving) is cut again. Publish re-checks the render against the censor list and warns when
 the headline's words aren't in the transcript or viewer titles.
 
 **Never re-post:** the ledger refuses a slug or title that is already live on a platform.
+
+See [checking the engine’s calls](judging.md) for headline evidence and skip reasons.
+
+## Verify and review
+
+- Run `clipengine doctor --accounts` in agent mode to check the public profiles configured in your brand pack.
+- After posting in your browser, `clipengine posted` checks the live YouTube or TikTok author before recording it. For Instagram, open the post and compare its author to the configured username, then add `--confirmed`.
+- `clipengine review --id ID [--title "…" --quote "…"]` writes a portable HTML review for the draft. It includes frames, a payoff marker, the transcript, the score, safety flags, and the headline check.
+- `clipengine facecam-setup --channel LOGIN` proposes a refined webcam box and saves a check image. Approve a reviewed box with `--yes x,y,w,h`, or use `--no` for a creator with no webcam overlay.
+- `clipengine import-posts --from FILE` accepts live ledger records with creator and moment metadata. It also accepts a JSON object or list with `slug`, `creator`, `moment_at`, and a `links` object keyed by platform.

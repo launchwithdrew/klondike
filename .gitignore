@@ -21,3 +21,9 @@ __pycache__/
 .pytest_cache/
 *.ts
 .DS_Store
+
+# Local judging and training observations
+data/labels/
+data/judged.jsonl
+data/censor_caught.jsonl
+data/predictions.jsonl

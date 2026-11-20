@@ -15,9 +15,11 @@ all keep working:
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -118,12 +120,15 @@ def show() -> list[dict]:
     return items
 
 
-def mark(slug: str, platform: str, url: str) -> str:
+def mark(slug: str, platform: str, url: str, confirmed: bool = False) -> str:
+    from . import attention
+    from . import verify
+
     outbox, posted, ledger_p, _ = _dirs()
     if platform not in PLATFORMS:
         raise SystemExit(f"platform must be one of {', '.join(PLATFORMS)}")
-    if not url.startswith("http"):
-        raise SystemExit("--url must be the live post's link (https://…)")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
+        raise SystemExit("--slug must be the clip's slug")
     d = os.path.join(outbox, slug)
     meta = json.load(open(os.path.join(d, "post.json"))) if os.path.isdir(d) else {}
     clip = os.path.join(d, "clip.mp4")
@@ -131,8 +136,18 @@ def mark(slug: str, platform: str, url: str) -> str:
     ledger = _ledger()
     if _live(platform, slug, sha, ledger):
         return f"{slug} on {platform}: already recorded as live"
+    event_key = f"post-verification:{slug}:{platform}"
+    attention_root = os.path.join(REPO, "runs")
+    try:
+        verification = verify.post(platform, url, confirmed)
+    except ValueError as exc:
+        attention.event("overdue", f"verify {slug} on {platform}: {exc}", key=event_key, root=attention_root)
+        raise SystemExit(f"POST NOT RECORDED: {exc}") from None
     rec = {"platform": platform, "slug": slug, "sha256": sha, "title": meta.get("title", slug), "url": url,
-           "status": "live", "posted_by": "agent", "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+           "status": "live", "verified_by": verification, "posted_by": "agent", "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    for field in ("login", "moment_at", "moment_start_at", "moment_end_at"):
+        if meta.get(field):
+            rec[field] = meta[field]
     if meta.get("moment_at"):
         try:
             m = dt.datetime.fromisoformat(meta["moment_at"].replace("Z", "+00:00"))
@@ -140,8 +155,17 @@ def mark(slug: str, platform: str, url: str) -> str:
         except ValueError:
             pass
     with open(ledger_p, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        ledger = _ledger()
+        if _live(platform, slug, sha, ledger):
+            return f"{slug} on {platform}: already recorded as live"
         fh.write(json.dumps(rec) + "\n")
     ledger.append(rec)
+    attention.event("resolved", "", key=event_key, root=attention_root)
+    from . import sentinel
+    for draft in sentinel.load_queue(attention_root):
+        if draft.get("slug") == slug and not draft.get("posted_at"):
+            sentinel.note(draft, posted_at=rec["at"])
     left = [p for p in (meta.get("platforms") or list(PLATFORMS)) if not _live(p, slug, sha, ledger)]
     if os.path.isdir(d) and not left:
         os.makedirs(posted, exist_ok=True)
@@ -164,7 +188,7 @@ def _sync(paths: list[str], msg: str) -> None:
     if g("diff", "--cached", "--quiet").returncode == 0:
         return
     g("-c", "user.name=clipengine", "-c", "user.email=clipengine@users.noreply.github.com", "commit", "-qm", msg)
-    g("pull", "-q", "--rebase", "--autostash")
+    g("pull", "-q", "--no-rebase", "--no-edit")
     g("push", "-q")
 
 
@@ -275,7 +299,7 @@ def to_measure(now: float | None = None, ledger: list[dict] | None = None, perf:
 
 
 def show_measure(now: float | None = None, limit: int = 15) -> list[dict]:
-    items = to_measure(now)
+    items = to_measure(now, lookback_h=float("inf"))
     if not items:
         print("to-measure: nothing due")
         return items

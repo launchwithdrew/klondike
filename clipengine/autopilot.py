@@ -201,7 +201,15 @@ def show_sentinels() -> list[dict]:
     """`clipengine sentinels`: the health lines (tier 2: full sentinels), plus one recording line each."""
     from . import sentinel as SN
     if any(os.path.isdir(d) for d in glob.glob(os.path.join(RUNS, "sentinel-*"))):
-        print("tier 2  full sentinels (recording + audio + viewer clips):")
+        try:
+            from . import ops as _O
+            _st = _O._state()
+            _cap = _st.get("cap") or _O.config()["max_sentinels"]
+            _why = _st.get("cap_why") or "steady"
+        except Exception:
+            _cap, _why = "?", ""
+        print(f"tier 2  full sentinels (recording + audio + viewer clips) — up to {_cap} on this machine"
+              + (f" ({_why})" if _why and _why != "steady" else "") + ":")
     rows = SN.health()
     since = _json(os.path.join(RUNS, ".cycle.json")).get("cycle_at") or time.time() - 600
     for s in rows:
@@ -370,10 +378,12 @@ def show_schedule(refresh: bool = True) -> dict:
 
 # ---- catch-up ---------------------------------------------------------------------------------------
 
-def catchup_targets(roster: dict, sentinel_cover: dict | None = None) -> list[str]:
-    """Roster creators whose saved streams can be scanned (VODs on, clipping allowed)."""
+def catchup_targets(roster: dict, sentinel_cover: dict | None = None, restricted: set[str] | None = None) -> list[str]:
+    """Roster creators whose saved streams can be scanned (VODs on and not subscriber-only, clipping allowed)."""
+    from . import vodaccess as VA
+    restricted = VA.restricted_set() if restricted is None else restricted
     return [l for l, c in roster.items() if c.get("vods") is not False and policy(l, roster) != "never"
-            and not l.startswith("yt")]
+            and not l.startswith("yt") and l.lower() not in restricted]
 
 
 def maybe_catchup(state: dict, now: float, cfg: dict) -> str | None:
@@ -427,6 +437,7 @@ def _overlaps_any(login: str, s: float, e: float, rows: list[dict]) -> bool:
 def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, now: float | None = None) -> dict | None:
     """A probed scan candidate as a queue line `publish-queued` can publish (pure but for the grade config)."""
     from . import grade as G
+    from . import judge as JG
     if not c.get("probed") or c.get("hard_fail"):
         return None
     created = _epoch(vod["created_at"])
@@ -438,13 +449,16 @@ def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, no
     crowd = c.get("crowd") or {}
     return {"id": f"{login}-v{dt.datetime.fromtimestamp(s, dt.timezone.utc):%H%M%S}", "login": login,
             "rec": os.path.dirname(scan_dir), "start": round(s, 1), "stop": round(e, 1),
-            "at": dt.datetime.fromtimestamp(created + c["peak_s"], dt.timezone.utc).isoformat(), "p": None,
+            "at": dt.datetime.fromtimestamp(created + c["peak_s"], dt.timezone.utc).isoformat(),
+            "drafted_at": dt.datetime.now(dt.timezone.utc).isoformat(), "p": None,
             "engine": eng["score"], "best": best, "flags": c.get("flags") or [], "unsafe": sig.get("unsafe") or "",
             "chat": c.get("top_text", "") or (f"🔥 {crowd.get('views')} viewer-clip views" if crowd else ""),
             "said": (c.get("transcript_text") or "")[:140], "sheet": None, "status": "new",
             "via": "catch-up (saved stream)" + (" 🔥" if crowd else ""),
             "scan": scan_dir, "pick": c["rank"], "vod": vod["id"],
-            "vod_start": w["start_s"], "vod_stop": w["end_s"], "thumbs": c.get("thumbs") or []}
+            "vod_start": w["start_s"], "vod_stop": w["end_s"], "thumbs": c.get("thumbs") or [],
+            "liveliness": c.get("liveliness"), "frames_assessed": c.get("liveliness") is not None,
+            "judgment": JG.score_snapshot(eng, sig), "titles": sig["titles"]}
 
 
 def _sheet(thumbs: list[str], out: str) -> str | None:
@@ -478,12 +492,22 @@ def catchup(since: float, until: float, logins: list[str] | None = None, keep: i
             via: str | None = None) -> list[dict]:
     """Scan the saved streams of [since, until] and queue the best moments. Returns the queued entries."""
     from . import pipeline as P
+    from . import vodaccess as VA
     from .publish import creators
     roster = creators()
     targets = logins or catchup_targets(roster)
     queued = []
     print(f"[catchup] {_hm(since)} → {_hm(until)}: {', '.join(targets) or 'no roster creators'}", flush=True)
     for login in targets:
+        if login.startswith("kick:"):                        # Kick: viewers' clips + the saved broadcast (kick.py)
+            try:
+                from . import kick as K
+                queued += K.catchup(login, since, until, keep=keep, via=via or "catch-up (saved stream)")
+            except Exception as exc:
+                print(f"[catchup] {login}: {str(exc)[:100]}", flush=True)
+            continue
+        if VA.restricted(login):
+            continue                                   # subscriber-only VODs (learned): nothing to scan
         try:
             vods = vods_overlapping(login, since, until)
         except Exception as exc:
@@ -499,6 +523,11 @@ def catchup(since: float, until: float, logins: list[str] | None = None, keep: i
                 res = P.scan(v["id"], scan_dir, v["a"], v["b"], top=12, probe=probe)
             except Exception as exc:
                 msg = str(exc)
+                if VA.is_restricted_error(exc):        # subscriber-only VODs: remember, skip quietly from now on
+                    VA.mark(login, v["id"])
+                    print(f"[catchup] {login}: saved streams are subscriber-only — skipped from now on "
+                          "(a full sentinel records them live)", flush=True)
+                    break
                 if "no chat" not in msg:
                     AT.event("failure", f"catch-up scan of {login} failed ({msg[:60]})", key=f"catchup:{login}:{v['id']}")
                 print(f"[catchup] {login} {v['id']}: {msg[:100]}", flush=True)
@@ -606,6 +635,16 @@ def sweep(since: float, until: float, logins: list[str] | None = None) -> list[d
     queued = []
     print(f"[sweep] {_hm(since)} → {_hm(until)}: {len(targets)} creator(s)", flush=True)
     for login in targets:
+        if login.startswith("kick:"):                        # Kick: no chat replay — its viewers' clips are the scan
+            try:
+                from . import kick as K
+                got = K.catchup(login, since, until, keep=int(cfg.get("sweep_keep", 2)),
+                                min_views=int(cfg.get("sweep_min_views", 25)), via="catch-up (sweep)")
+                print(f"[sweep] {login}: {len(got)} viewer-clipped moment(s) drafted", flush=True)
+                queued += got
+            except Exception as exc:
+                print(f"[sweep] {login}: couldn't read Kick ({str(exc)[:80]})", flush=True)
+            continue
         try:
             vods = vods_overlapping(login, since, until)
         except Exception as exc:
@@ -639,6 +678,13 @@ def catchup_spikes(spikes: list[dict], pad_before: float = 60.0, pad_after: floa
     out = []
     for sp in spikes:
         print(f"[catchup] tier-1 spike on {sp['login']} at {_hm(sp['fire'])} (p {sp.get('p', 0):.2f})", flush=True)
+        if sp["login"].startswith("kick:"):
+            from . import kick as K
+            try:
+                out += K.catchup_spike(sp)
+            except Exception as exc:
+                print(f"[catchup] {sp['login']}: {str(exc)[:100]}", flush=True)
+            continue
         out += catchup(sp["start"] - pad_before, sp["stop"] + pad_after, [sp["login"]], keep=1, probe=3,
                        via="catch-up (tier-1 chat spike)")
     return out
@@ -696,6 +742,29 @@ def autopilot_start(every_min: float | None = None, sessions: bool = False) -> s
             + f" — log {os.path.relpath(LOG, REPO)}; `clipengine attention` says what needs you")
 
 
+def _log_tail(path: str, n: int = 40) -> list[str]:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 20000))
+            return [l.decode("utf-8", "replace").rstrip() for l in fh.read().splitlines()[-n:]]
+    except OSError:
+        return []
+
+
+def uptime(now: float | None = None, hours: float = 24.0, root: str | None = None) -> dict:
+    """Autopilot deaths and dark periods observed in this report window."""
+    now = time.time() if now is None else now
+    st = _json(os.path.join(root, "autopilot.json") if root else APSTATE)
+    since = now - hours * 3600
+    recent = [d for d in st.get("deaths") or [] if since <= d.get("at", 0) <= now]
+    gaps = [max(0.0, d["at"] - max(since, d.get("dark_from", d["at"]))) / 60 for d in recent]
+    running = _alive(_read_pid(os.path.join(root, "autopilot.pid"))) if root else autopilot_status()["running"]
+    return {"deaths": len(recent), "dark_min": round(sum(gaps)), "running": running,
+            "dark_periods": [round(minutes) for minutes in gaps if minutes > 15],
+            "causes": [d.get("cause") or "unknown" for d in recent]}
+
+
 def autopilot_died() -> bool:
     """Started and never stopped on purpose (stop removes the pid file), but its process is gone."""
     return os.path.exists(PID) and not _alive(_read_pid(PID))
@@ -728,8 +797,16 @@ def revive_if_dead(by: str, now: float | None = None, min_gap_s: float = 900) ->
             os.remove(PID)                                 # so start() doesn't think it is still running
         except OSError:
             pass
+        last = _log_tail(LOG, 40)
+        cause = next((l for l in reversed(last) if any(k in l for k in ("Traceback", "Error", "error", "Killed",
+                                                                          "restarting", "MemoryError"))), "")
+        dark_from = float(st.get("last_cycle_at") or st.get("started_at") or now)
+        deaths = (st.get("deaths") or [])[-19:] + [{"at": now, "dark_from": dark_from, "by": by,
+                                                     "cause": cause[:200], "last": last[-5:]}]
+        _write_ap(deaths=deaths)
         msg = autopilot_start(st.get("every"), bool(st.get("sessions")))
-        AT.event("failure", f"autopilot had stopped unexpectedly — restarted by the {by} sentinel",
+        AT.event("failure", f"autopilot had stopped unexpectedly — restarted by the {by} sentinel after "
+                 f"{(now - dark_from) / 60:.0f} min dark" + (f"; last: {cause[:100]}" if cause else ""),
                  key=f"ap-revive:{int(now) // 900}")
         return msg
     finally:

@@ -232,7 +232,8 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
            censor: bool = True, mute_audio: bool = False, layout: str = "single",
            title: str | None = None, quote: str | None = None, extra_censor: set[str] | None = None,
            drop_captions: list[tuple[float, float]] | None = None, login: str | None = None,
-           facecam: list[float] | None = None, captions_later: bool = False) -> dict:
+           facecam: list[float] | None = None, captions_later: bool = False,
+           payoff_s: float | None = None) -> dict:
     """Render [start_s, end_s] (VOD seconds) of `source` (a .ts whose first
     frame is VOD second source_t0). `words` are VOD-time word dicts.
 
@@ -371,26 +372,56 @@ def render(source: str, source_t0: float, start_s: float, end_s: float,
     # -t as an OUTPUT option: as an input option it is ignored for .ts
     # sources once a filter graph is attached (test caught 17.4 s for 10 s)
     cmd += ["-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", render_preset(), "-crf", "20", "-r", "30",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-f", "mp4", out + ".part"]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg failed: " + p.stderr[-1500:])
+    os.replace(out + ".part", out)            # a killed encode never leaves a finished-looking clip
     transcript = {"clip_start_vod_s": start_s, "clip_end_vod_s": end_s,
                   "segments": [{"start": c["start"], "end": c["end"], "text": c["text"],
                                 "words": [{"w": c["text"], "start": c["start"], "end": c["end"]}]}
                                for c in cards],
                   "bleep_intervals": rel_bleeps}
     json.dump(transcript, open(base + ".transcript.json", "w"), indent=2)
-    return {"out": out, "cards": len(cards), "censored": sum("***" in c["text"] for c in cards),
+    rep_audit = audit(out, end_s - start_s, payoff_s, max((c["end"] for c in cards_burn), default=None))
+    return {"out": out, "cards": len(cards), "audit": rep_audit, "censored": sum("***" in c["text"] for c in cards),
             "bleeps": rel_bleeps, "watermark": use_wm, "crop": crop if layout == "single" else layout,
             "layout": layout, "facecam": fc_info, "title": title, "quote": quote, "card_slot": slot,
             "captions_later": later, "card_box": [card_y, card_h] if card_png else None}
+
+
+SHORT_TOLERANCE_S = 1.5
+
+
+def audit(out: str, want_s: float, payoff_s: float | None = None, captions_end_s: float | None = None) -> dict:
+    """The receipt every render gets (M4): file length vs the window asked for, the payoff inside the file, and
+    captions ending before the file does. A render short by more than SHORT_TOLERANCE_S fails loudly here,
+    before anyone looks at it."""
+    try:
+        got = float((ffprobe(out).get("format") or {}).get("duration") or 0)
+    except Exception:
+        got = 0.0
+    problems = []
+    if got < want_s - SHORT_TOLERANCE_S:
+        problems.append(f"file is {got:.1f} s of {want_s:.1f} s")
+    if payoff_s is not None and not (0 <= payoff_s <= got):
+        problems.append(f"payoff at {payoff_s:.1f} s is outside the file")
+    if captions_end_s is not None and captions_end_s > got + 0.25:
+        problems.append(f"captions run to {captions_end_s:.1f} s, past the end")
+    line = (f"audit: {got:.1f}/{want_s:.1f} s" + (f", payoff at {payoff_s:.1f} s inside" if payoff_s is not None
+            and not any("payoff" in p for p in problems) else "") + (" ✓" if not problems else " ✗ " + "; ".join(problems)))
+    res = {"ok": not problems, "duration": round(got, 2), "want": round(want_s, 2), "problems": problems, "line": line}
+    if problems and got < want_s - SHORT_TOLERANCE_S:
+        raise RuntimeError(f"render failed its audit — {line} (the payoff may be lost; re-run it)")
+    return res
 
 
 def render_preset() -> str:
     """x264 preset: veryfast, or the ops profile's (lite: ultrafast) — config/ops.json "render_preset" wins."""
     try:
         from . import ops as O
+        if O._state().get("degraded"):
+            return "ultrafast"                  # the machine is strained even at the fewest scouts
         return O.config().get("render_preset") or "veryfast"
     except Exception:
         return "veryfast"
@@ -422,7 +453,8 @@ def card_position(bp: dict, slot: dict, card_h: int, card_mid: int) -> int:
 
 
 def burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: dict, trim_start: float = 0.0,
-              dur: float | None = None, censor: bool = True, captions: str | None = None) -> dict:
+              dur: float | None = None, censor: bool = True, captions: str | None = None,
+              payoff_s: float | None = None) -> dict:
     """The last step of a pre-rendered draft: overlay the headline card on the finished clip (captions,
     bleeps, logo already in it), optionally trimmed. One short encode; audio is copied when not trimmed."""
     from . import brand as B
@@ -469,7 +501,9 @@ def burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: di
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg (card) failed: " + p.stderr[-1500:])
-    return {"out": out, "card": bool(card_png), "title": title, "quote": quote}
+    want = dur if dur else max(0.0, float((ffprobe(pre).get("format") or {}).get("duration") or 0) - trim_start)
+    rep_audit = audit(out, want, payoff_s, max((c["end"] for c in cards), default=None) if cap and cap.get("cards") else None)
+    return {"out": out, "card": bool(card_png), "title": title, "quote": quote, "audit": rep_audit}
 
 
 def ffprobe(path: str) -> dict:

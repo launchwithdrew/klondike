@@ -47,143 +47,120 @@ def _ts(iso):
 
 # ---- report ---------------------------------------------------------------------------------------
 
-YT_PARTNER = {"subs": 1000, "shorts_views_90d": 10_000_000}
-TIKTOK_PROGRAM = {"followers": 10_000}
-MAX_LINES, MAX_LINE = 12, 130          # ~400 tokens (test_budget_report_queue_and_diagnose)
-
-
-def _n(x: float) -> str:
-    x = float(x)
-    return f"{x / 1e6:.1f}M" if x >= 1e6 else f"{x / 1e3:.1f}k" if x >= 1e4 else f"{x:,.0f}"
-
-
 def money_line(now: float | None = None, repo: str | None = None) -> str:
-    """Progress to YouTube Partner (1,000 subs + 10M Shorts views in 90 days) and TikTok's creator
-    program (about 10k followers), from follower counts the agent records and our view reads."""
-    repo = repo or REPO
-    now = now or time.time()
-    fol: dict[str, tuple[float, int]] = {}
-    for r in _rows(os.path.join(repo, "data", "followers.jsonl")):
-        t = _ts(r.get("at")) or 0
-        if r.get("platform") and r.get("followers") is not None and t >= fol.get(r["platform"], (-1, 0))[0]:
-            fol[r["platform"]] = (t, int(r["followers"]))
-    live = {r["slug"]: _ts(r.get("at")) or 0 for r in _rows(os.path.join(repo, "ledger.jsonl"))
-            if r.get("status") == "live" and r.get("platform") == "youtube"}
-    yt_views: dict[str, tuple[float, int]] = {}
-    for r in _rows(os.path.join(repo, "data", "performance.jsonl")):
-        if r.get("platform") == "youtube" and r.get("views") is not None and now - live.get(r.get("slug"), 0) <= 90 * 86400:
-            t = _ts(r.get("checked_at")) or 0
-            if t >= yt_views.get(r["slug"], (-1, 0))[0]:
-                yt_views[r["slug"]] = (t, int(r["views"]))
-    shorts = sum(v for _, v in yt_views.values())
-    if not fol:
-        return (f"money: Shorts {_n(shorts)}/10M views (90 d) — record followers: "
-                "`clipengine followers --platform P --count N`")
-    yt = fol.get("youtube", (0, None))[1]
-    tk = fol.get("tiktok", (0, None))[1]
-    parts = [f"YouTube Partner {'?' if yt is None else _n(yt)}/1,000 subs + {_n(shorts)}/10M Shorts views (90 d)"
-             + (" ✓" if (yt or 0) >= YT_PARTNER["subs"] and shorts >= YT_PARTNER["shorts_views_90d"] else "")]
-    parts.append(f"TikTok {'?' if tk is None else _n(tk)}/10k followers" + (" ✓" if (tk or 0) >= TIKTOK_PROGRAM["followers"] else ""))
-    if fol.get("instagram"):
-        parts.append(f"IG {_n(fol['instagram'][1])}")
-    return "money: " + " · ".join(parts)
+    from pathlib import Path
+    from . import brief
+
+    root = Path(repo or REPO)
+    ledger = [row for row in brief.rows(root / "ledger.jsonl") if row.get("status") == "live"]
+    line, _ = brief.money(root, time.time() if now is None else now, ledger,
+                          brief.rows(root / "data" / "performance.jsonl"))
+    return line
 
 
 def report_text(days: float = 1.0, now: float | None = None) -> str:
-    """The report as text, nothing printed — what a daily-report trigger sends (ops calls this)."""
-    now = now or time.time()
-    since, before = now - days * 86400, now - 2 * days * 86400
-    ledger = [r for r in _rows(os.path.join(REPO, "ledger.jsonl")) if r.get("status") == "live"]
-    perf = _rows(os.path.join(REPO, "data", "performance.jsonl"))
-    latest: dict[tuple, dict] = {}
+    """Five sentences, followed by the measurements behind the day's work."""
+    from pathlib import Path
+
+    from . import __version__, autopilot, brief, campaigns, handpost, judge, learn, scouts, sentinel, untrusted
+
+    now = time.time() if now is None else now
+    since = now - days * brief.DAY
+    root = Path(REPO)
+    runs = root / "runs"
+    roster = brief.read(root / "config" / "creators.json", {}).get("creators") or {}
+    ledger = [row for row in brief.rows(root / "ledger.jsonl") if row.get("status") == "live"]
+    perf = brief.rows(root / "data" / "performance.jsonl")
+    recent = [row for row in ledger if since <= (_ts(row.get("at")) or 0) <= now]
+    recent_keys = {(row.get("slug"), row.get("platform")): row for row in recent}
+    latest = {}
     for r in perf:
-        if r.get("views") is None:
-            continue
-        k = (r["slug"], r["platform"])
-        if k not in latest or (_ts(r.get("checked_at")) or 0) >= (_ts(latest[k].get("checked_at")) or 0):
-            latest[k] = r
-    titles = {r["slug"]: r.get("title", r["slug"]) for r in ledger}
-    urls = {(r["slug"], r["platform"]): r.get("url", "") for r in ledger}
-    from . import __version__
-    lines = [f"REPORT — last {days:g} day(s) · engine v{__version__}"]
-    for plat in ("youtube", "instagram", "tiktok"):
-        now_posts = [r for r in ledger if r["platform"] == plat and (_ts(r.get("at")) or 0) >= since]
-        prev_posts = [r for r in ledger if r["platform"] == plat and before <= (_ts(r.get("at")) or 0) < since]
-        reads = [latest[(r["slug"], plat)] for r in now_posts if (r["slug"], plat) in latest]
-        all_views = [v["views"] for (s, p), v in latest.items() if p == plat]
-        med = st.median(all_views) if all_views else 0
-        shares = [x.get("shares") for x in reads if x.get("shares") is not None]
-        watch = [x.get("watch_s") for x in reads if x.get("watch_s") is not None]
-        lines.append(f"  {plat:<10} {len(now_posts)} posts (prev {len(prev_posts)}) · {sum(x['views'] for x in reads):,} views on them"
-                     + (f" · typical post {med:,.0f}" if all_views else "")
-                     + (f" · {sum(shares):,} shares" if shares else "")
-                     + (f" · watch {st.median(watch):.1f} s" if watch else ""))
-    recent = [(v["views"], s, p) for (s, p), v in latest.items()
-              if any(r["slug"] == s and (_ts(r.get("at")) or 0) >= since for r in ledger)]
-    pick = max(recent) if recent else max(((v["views"], s, p) for (s, p), v in latest.items()), default=None)
-    if pick:
-        v, s, p = pick
-        lines.append(f"  {'best' if recent else 'best ever'}: \"{titles.get(s, s)[:50]}\" — {v:,} views on {p} {urls.get((s, p), '')}")
-    new_posts = sorted((r for r in ledger if (_ts(r.get("at")) or 0) >= since), key=lambda r: -(_ts(r.get("at")) or 0))
-    if new_posts:
-        lines.append("  posted: " + " · ".join(f"{r['platform'][:2]} {r.get('url') or r['slug']}" for r in new_posts[:3])
-                     + (f" · +{len(new_posts) - 3} more" if len(new_posts) > 3 else ""))
-    try:
-        w = json.load(open(os.path.join(REPO, "data", "weights.json")))
-        learned = w.get("summary") or next(iter(w.get("report") or []), "")
-        if learned:
-            lines.append("  " + (learned if learned.startswith("learned") else "learned: " + learned))
-        top = sorted((w.get("streamers") or {}).items(), key=lambda x: -x[1])[:3]
-        if top:
-            lines.append("  streamers doing best for you: " + ", ".join(f"{l} {f:.1f}×" for l, f in top))
-    except (OSError, ValueError):
-        pass
-    try:
-        from . import campaigns as CP
-        if os.path.realpath(CP.REPO) == os.path.realpath(REPO):
-            t = CP.totals(since)
-            if CP.pools() or t["submitted_all"] or t["paid"]:
-                lines.append(f"  pools: {t['submitted']} submitted (all-time {t['submitted_all']}) · "
-                             f"${t['paid']:,.2f} paid (${t['paid_since']:,.2f} this period)")
-    except Exception:
-        pass
-    lines.append("  " + money_line(now))
-    todo = []
-    try:
-        from .sentinel import load_queue
-        rows = load_queue(os.path.join(REPO, "runs"))
-        period = [r for r in rows if (r.get("stop") or 0) >= since]
-        skipped = sum(1 for r in period if r.get("status") == "skipped")
-        unsafe = sum(1 for r in period if r.get("unsafe"))
-        if skipped or unsafe:
-            lines.append(f"  dropped: {skipped} draft(s) skipped after a look, {unsafe} unsafe")
-        q = [r for r in rows if r.get("status") == "new"]
-        if q:
-            todo.append(f"{len(q)} draft(s) in `clipengine queue`")
-    except Exception:
-        pass
-    try:
-        from .handpost import to_measure
-        m = to_measure(now, ledger=ledger, perf=perf)
-        if m:
-            todo.append(f"{len(m)} post(s) to measure (`to-measure`)")
-    except Exception:
-        pass
-    try:
-        from . import campaigns as CP
-        if os.path.realpath(CP.REPO) == os.path.realpath(REPO):
-            n = len(CP.to_submit(now))
-            if n:
-                todo.append(f"{n} to submit to pools (`to-submit`)")
-    except Exception:
-        pass
-    if todo:
-        lines.append("  to do: " + " · ".join(todo))
-    if not ledger:
-        lines.append("  nothing posted yet — the first clips are the hardest; run `clipengine cycle`")
-    lines = [l if len(l) <= MAX_LINE else l[:MAX_LINE - 1] + "…" for l in lines]
-    if len(lines) > MAX_LINES:
-        lines = lines[:MAX_LINES - 1] + [lines[-1]]
+        at = _ts(r.get("checked_at")) or 0
+        key = r.get("slug"), r.get("platform")
+        if key in recent_keys and r.get("views") is not None and at <= now and at >= latest.get(key, (0, {}))[0]:
+            latest[key] = (at, r)
+    snapshots = [r for _, r in latest.values()]
+    first = "Nothing went live in this period"
+    if recent:
+        count = len({row["slug"] for row in recent})
+        platforms = len(recent_keys)
+        first = f"Posted {count} clip{'s' if count != 1 else ''} across {platforms} platform post{'s' if platforms != 1 else ''}"
+        if snapshots:
+            first += f" with {sum(r['views'] for r in snapshots):,} measured views"
+            shares = [r["shares"] for r in snapshots if r.get("shares") is not None]
+            watch = [r["watch_s"] for r in snapshots if r.get("watch_s") is not None]
+            first += (f", {sum(shares):,} shares" if shares else "") + (f", watch {st.median(watch):.1f} s" if watch else "")
+            best = max(snapshots, key=lambda r: r["views"])
+            link = recent_keys[(best["slug"], best["platform"])].get("url")
+            first += f" ({link})" if link else ""
+        else:
+            first += " and analytics reads are pending"
+    scout = scouts.cached_report(days * 24, now, str(runs), roster)
+    miss = scout["best_miss"]
+    if miss:
+        why = untrusted.clean(miss["why"], 75)
+        second = f"The biggest miss was a viewer clip from {miss['login']} with {miss['views']:,} views because {why}"
+    elif scout["total"]:
+        second = "Scouts caught every observed viewer-clip moment in this period"
+    else:
+        second = "No viewer-clip misses were observed in the sampled feed"
+    weights = brief.read(root / "data" / "weights.json", {})
+    learned = weights.get("summary") or next(iter(weights.get("report") or []), "")
+    third = untrusted.clean(learned, 105) if learned else "Learning is waiting for measured posts"
+    planned = brief.read(runs / ".cycle.json", {}).get("watch_today") or []
+    fourth = (f"Today the scouts are watching {', '.join(planned[:3])}" if planned
+              else "Today the scouts will watch the configured roster as creators go live")
+    money, tasks = brief.money(root, now, ledger, perf)
+    measure = handpost.to_measure(now, ledger=ledger, perf=perf, lookback_h=float("inf"))
+    overdue = [post for post in measure if post["missing"]]
+    if tasks:
+        fifth = tasks[0]
+    elif overdue:
+        fifth = f"Please measure {overdue[0]['slug']} on {overdue[0]['platform']}"
+    elif measure:
+        fifth = f"Please record the next analytics read for {measure[0]['slug']}"
+    else:
+        fifth = "No owner action is due this morning"
+    note = " ".join(sentence.rstrip(".!?") + "." for sentence in (first, second, third, fourth, fifth))
+
+    up = autopilot.uptime(now, hours=days * 24, root=str(runs))
+    periods = ", ".join(f"{n}m" for n in up["dark_periods"]) or "none"
+    causes = ", ".join(untrusted.clean(cause, 64) for cause in up["causes"]) or "none"
+    running = "running" if up["running"] else "stopped"
+    uptime = (f"engine v{__version__} · uptime: {running} · {up['deaths']} deaths · {up['dark_min']}m dark"
+              f" · >15m: {periods} · causes: {causes}")
+    lead = f"{100 * scout['first'] / scout['caught']:.0f}%" if scout["caught"] else "–"
+    recall = f"{100 * scout['caught'] / scout['total']:.0f}%" if scout["total"] else "–"
+    trained = brief.read(root / "config" / "sentinel_model.json", {}).get("eval") or {}
+    held_out = trained.get("held_out_recall_top10")
+    training = f"{100 * held_out:.0f}%" if held_out is not None else "–"
+    fires = trained.get("false_fires_per_hour")
+    train_rate = f" at {fires:g} false/h" if fires is not None else ""
+    scout_line = (f"scouts: {scout['caught']}/{scout['total']} caught · first {lead} (target ≥50%) · "
+                  f"live recall {recall} · train {training}{train_rate}")
+    if scout["week_reason"]:
+        scout_line += f" · week miss: {untrusted.clean(scout['week_reason'], 55)}"
+    drafts = sentinel.load_queue(str(runs))
+    speed, pipeline = brief.timing(drafts, ledger, since, now)
+    lines = [note, uptime, scout_line, speed, pipeline, *brief.recording(runs, since, now), money]
+    if tasks:
+        lines.append("Enrolment tasks · " + " · ".join(tasks))
+    recurring = judge.recurring_reasons(now)
+    if recurring:
+        lines.append("named detector test due: " + untrusted.clean(", ".join(recurring), 100))
+    extras = [learn.forecast_summary(str(root / "data" / "predictions.jsonl"), now),
+              scouts.category_shape(now, str(runs)), brief.series_line(root, ledger), brief.rights_line(roster, now)]
+    if os.path.realpath(campaigns.REPO) == os.path.realpath(REPO):
+        totals = campaigns.totals(since)
+        if campaigns.pools() or totals["submitted_all"] or totals["paid"]:
+            extras.append(f"pools: {totals['submitted']} submitted · ${totals['paid']:,.2f} paid")
+    extras = [line for line in extras if line]
+    remaining = 12 - len(lines)
+    if remaining > 0 and extras:
+        lines.extend(extras[:remaining - 1])
+        lines.append(" · ".join(extras[remaining - 1:]))
+    elif extras:
+        lines[-1] += " · " + " · ".join(extras)
     return "\n".join(lines)
 
 

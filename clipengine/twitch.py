@@ -100,22 +100,47 @@ def _curl(url: str, data: bytes | None, headers: dict, timeout: float) -> bytes 
     import subprocess
     if not shutil.which("curl"):
         return None
+    import tempfile
     cmd = ["curl", "-sS", "--fail", "--compressed", "--max-time", str(int(timeout))]
-    for k, v in headers.items():
-        cmd += ["-H", f"{k}: {v}"]
-    if data:
-        cmd += ["-X", "POST", "--data-binary", "@-"]
+    # headers go through a private file, never the command line (a login token would show in `ps`)
+    fd, hfile = tempfile.mkstemp(prefix="hdr-")
     try:
-        p = subprocess.run(cmd + [url], input=data, capture_output=True, timeout=timeout + 10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return p.stdout if p.returncode == 0 and p.stdout else None
+        os.chmod(hfile, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("".join(f"{k}: {v}\n" for k, v in headers.items()))
+        cmd += ["-H", f"@{hfile}"]
+        if data:
+            cmd += ["-X", "POST", "--data-binary", "@-"]
+        try:
+            p = subprocess.run(cmd + [url], input=data, capture_output=True, timeout=timeout + 10)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return p.stdout if p.returncode == 0 and p.stdout else None
+    finally:
+        try:
+            os.remove(hfile)
+        except OSError:
+            pass
 
 
-def gql(query: str, variables: dict | None = None) -> dict:
+AUTH_ENV = "TWITCH_AUTH_TOKEN"
+
+
+def auth_token() -> str | None:
+    """Optional: the channel's own Twitch login token, from the environment only (never a file, log or
+    commit). Used for playback tokens alone: with Turbo or a sub, Twitch serves the stream without ads and
+    sub-only VODs open. Unset = logged-out playback, as before."""
+    t = (os.environ.get(AUTH_ENV) or "").strip()
+    return t if re.fullmatch(r"[A-Za-z0-9]{20,64}", t) else None
+
+
+def gql(query: str, variables: dict | None = None, playback: bool = False) -> dict:
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
-    out = json.loads(http(GQL_URL, data=body, headers={
-        "Client-ID": CLIENT_ID, "Content-Type": "application/json"}))
+    headers = {"Client-ID": CLIENT_ID, "Content-Type": "application/json"}
+    tok = auth_token() if playback else None
+    if tok:
+        headers["Authorization"] = f"OAuth {tok}"
+    out = json.loads(http(GQL_URL, data=body, headers=headers))
     if out.get("errors") and not out.get("data"):
         raise RuntimeError(f"GQL error: {str(out['errors'])[:300]}")
     return out.get("data") or {}
@@ -399,7 +424,7 @@ def playlists(vod_id: str) -> dict:
     """{'video': Playlist, 'audio': Playlist|None, 'video_label': str}."""
     vod_id = parse_vod_id(vod_id)
     tok = (gql(_TOKEN_QUERY, {"isLive": False, "login": "", "isVod": True,
-                              "vodID": vod_id, "playerType": "site"})
+                              "vodID": vod_id, "playerType": "site"}, playback=True)
            .get("videoPlaybackAccessToken") or {})
     if not tok.get("value"):
         raise RuntimeError(f"no playback token for VOD {vod_id} — deleted, expired or sub-only")
@@ -407,7 +432,13 @@ def playlists(vod_id: str) -> dict:
         "allow_source": "true", "allow_audio_only": "true", "allow_spectre": "false",
         "player": "twitchweb", "playlist_include_framerate": "true",
         "token": tok["value"], "sig": tok["signature"]})
-    master = http(f"https://usher.ttvnw.net/vod/{vod_id}.m3u8?{qs}").decode()
+    try:
+        master = http(f"https://usher.ttvnw.net/vod/{vod_id}.m3u8?{qs}").decode()
+    except RuntimeError as exc:
+        if "403" in str(exc):                # the VOD exists but its playlist is for subscribers only
+            from .vodaccess import SubOnlyVod
+            raise SubOnlyVod(f"VOD {vod_id} is subscriber-only (playlist 403)") from exc
+        raise
     lines = master.splitlines()
     variants, audio = [], None
     for i, line in enumerate(lines):

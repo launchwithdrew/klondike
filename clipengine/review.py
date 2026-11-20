@@ -129,3 +129,79 @@ Nothing here is posted or approved.</p>
 {''.join(cards)}
 </main></body></html>"""
     open(path, "w", encoding="utf-8").write(doc)
+
+
+def draft_page(entry: dict, title: str | None = None, quote: str | None = None) -> str:
+    """Build a self-contained local review beside the draft, using escaped evidence."""
+    import base64
+    import html
+    import re
+    from pathlib import Path
+
+    from . import judge
+    from . import sentinel
+    from . import untrusted
+
+    def text(value):
+        return html.escape(str(value))
+
+    def evidence(value, limit=160):
+        return text(untrusted.quote(str(value), limit))
+
+    tags = []
+    path = entry.get("sheet")
+    if path and Path(path).is_file():
+        data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        tags.append(f'<img src="data:image/jpeg;base64,{data}" alt="Draft contact sheet">')
+    elif entry.get("thumbs"):
+        for source in entry["thumbs"]:
+            if re.fullmatch(r"data:image/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+", source):
+                tags.append(f'<img src="{source}" alt="Draft frame">')
+    if not tags:
+        tags.append("<p>Frames unavailable</p>")
+    start = entry["start"]
+    duration = max(0.0, entry["stop"] - start)
+    payoff = entry.get("payoff")
+    timeline = "Payoff timestamp unavailable"
+    if payoff is not None and duration > 0:
+        offset = min(duration, max(0, payoff - start))
+        timeline = (f'<meter min="0" max="{duration:.2f}" value="{offset:.2f}"></meter>'
+                    f'<p>Payoff +{offset:.1f}s of {duration:.1f}s</p>')
+    words = judge._draft_words(entry)
+    stretches = judge.stretches(words)
+    if stretches:
+        transcript = "".join(f"<p>+{max(0, row['start'] - start):.1f}s · {text(row['spk'])} "
+                             f"{evidence(row['text'], 500)}</p>" for row in stretches)
+    else:
+        spoken, _ = judge.draft_evidence(entry)
+        transcript = f"<p>{evidence(spoken, 650) if spoken else 'Transcript unavailable'}</p>"
+    check = "<p>Pass --title to check a proposed headline.</p>"
+    if title:
+        preview = judge.check_headline(entry, title, quote)
+        issues = preview["problems"] + [f"unsupported claim: {term}" for term in preview["unsupported"]]
+        headline_result = '; '.join(issues) or 'Supported by the draft evidence'
+        check = (f"<p>{text(title)}</p><p>{text(headline_result)}</p>"
+                 f"<p>First CAPS run: {text(preview['first_caps_run'] or 'none')}</p>")
+    assessed = entry.get("frames_assessed", entry.get("liveliness") is not None)
+    safety = evidence(entry["unsafe"]) if entry.get("unsafe") else "No text flag recorded"
+    if not assessed:
+        safety += " · frames unassessed"
+    confidence = evidence("; ".join(entry.get("flags") or []))
+    title_html = text(entry["id"])
+    ident = re.sub(r"[^a-zA-Z0-9_.-]", "_", entry["id"]).strip(".") or "draft"
+    target = Path(entry["rec"]) / "drafts" / f"{ident}.review.html"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"""<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draft {title_html}</title>
+<style>body{{font:16px/1.5 system-ui;margin:auto;max-width:44rem;padding:1rem;background:#f7f8fa;color:#151923}}
+section{{background:white;border:1px solid #d9dde5;border-radius:.6rem;padding:.8rem;margin:1rem 0}}
+h1,h2,p{{margin:.4rem 0}}img,meter{{width:100%;height:auto}}img{{margin:.25rem 0}}meter{{height:1rem}}</style>
+<h1>{title_html}</h1><section><h2>Frames</h2>{''.join(tags)}{timeline}</section>
+<section><h2>Score and safety</h2><p>Engine {text(entry.get('engine', 'unknown'))} · best {text(entry.get('best', 'unknown'))}</p>
+<p>{text(entry.get('parts') or (entry.get('judgment') or {}).get('parts') or 'Score parts unavailable')}</p>
+<p>{safety}</p><p>{confidence}</p></section>
+<section><h2>Transcript</h2>{transcript}</section><section><h2>Headline check</h2>{check}</section>
+""", encoding="utf-8")
+    sentinel.mark_seen(entry)
+    return str(target)

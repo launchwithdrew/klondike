@@ -396,6 +396,48 @@ def for_clip(source: str, login: str | None, start: float = 0.0, end: float | No
     return {**res, "box": None, "source": "none", "why": res.get("why", "")}
 
 
+# ---------------------------------------------------------------- suggestions for unchecked creators
+
+SUGGEST_AFTER_S = 180          # recording needed before a sentinel looks for the webcam
+SUGGEST_STATE = os.path.join(REPO, "runs", "facecam_suggest.json")
+
+
+def unchecked(login: str | None) -> bool:
+    """No "facecam" setting at all on this creator in config/creators.json (a box, or false)."""
+    c = (_load(CREATORS).get("creators") or {}).get((login or "").lower())
+    return c is not None and "facecam" not in c
+
+
+def suggest(login: str, rec_dir: str, now: float | None = None, state_path: str | None = None,
+            detect=None) -> dict | None:
+    """A webcam box for a creator nobody has checked: detect + refine on the recording's first minutes and
+    a check image. At most once per creator per day; never writes config (the agent looks, then adds it).
+    Returns {"box", "confidence", "check_image", "text"} or None (already suggested today / nothing found)."""
+    import time as _time
+    now = now or _time.time()
+    day = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%d")
+    path = state_path or SUGGEST_STATE
+    st = _load(path)
+    if st.get(login.lower()) == day:
+        return None
+    res, _, frames = (detect or from_recording)(rec_dir, SUGGEST_AFTER_S / 60, 24)
+    st[login.lower()] = day                                  # one try a day, found or not
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(st, open(path, "w"), indent=1)
+    if not res.get("box") or res.get("confidence", 0) < GOOD or len(frames) < 2:
+        return None
+    box = [round(float(v), 3) for v in refine(res["box"], frames)]
+    img = os.path.join(rec_dir, "facecam-suggest.jpg")
+    try:
+        check_image(frames[len(frames) // 2], {"box": box, "confidence": res["confidence"]}, img)
+    except Exception:
+        return None
+    shown = os.path.relpath(img, REPO) if os.path.abspath(img).startswith(REPO) else img
+    text = (f"{login}: suggested webcam box [{', '.join(f'{v:g}' for v in box)}] — look at {shown}, "
+            "then add it to config/creators.json")
+    return {"box": box, "confidence": res["confidence"], "check_image": img, "text": text}
+
+
 # ---------------------------------------------------------------- CLI helpers
 
 def check_image(frame: np.ndarray, res: dict, out: str) -> str:
@@ -561,3 +603,70 @@ def cli(rec: str | None = None, channel: str | None = None, out: str | None = No
     elif frames:
         print(f"  check image: {out}")
     return {**res, "login": login, "check_image": out if frames else None}
+
+
+def setup_channel(channel: str, approved: str | None = None, no_camera: bool = False) -> bool:
+    """Show a refined box and persist it only after an explicit answer."""
+    import re
+    import sys
+
+    login = channel.strip().casefold()
+    if not re.fullmatch(r"(?:[\w-]+:)?@?[\w.-]+", login):
+        raise SystemExit("facecam-setup: invalid channel")
+    box = False if no_camera else None
+    if approved is not None:
+        try:
+            parsed = json.loads(approved if approved.startswith("[") else f"[{approved}]")
+            x, y, w, h = map(float, parsed)
+        except (ValueError, TypeError):
+            raise SystemExit("facecam-setup: --yes expects x,y,width,height") from None
+        if not (x >= 0 and y >= 0 and w > 0 and h > 0 and x + w <= 1.00001 and y + h <= 1.00001):
+            raise SystemExit("facecam-setup: the box must fit inside the frame (coordinates 0–1)")
+        box = [x, y, w, h]
+    if box is None:
+        if not available():
+            raise SystemExit("facecam-setup: OpenCV is missing. Run bash setup/setup.sh")
+        info, frames = from_channel(login)
+        proposed = info.get("box")
+        if proposed and len(frames) >= 2:
+            proposed = refine(proposed, frames)
+        if frames:
+            name = re.sub(r"[^a-z0-9_-]", "-", login)
+            image = os.path.join(REPO, "runs", f"facecam-setup-{name}.jpg")
+            os.makedirs(os.path.dirname(image), exist_ok=True)
+            check_image(frames[len(frames) // 2], {**info, "box": proposed}, image)
+            print(f"facecam {login}: {proposed or 'no box found'} · check image: {image}")
+        if not sys.stdin.isatty():
+            if proposed:
+                print(f"confirm: clipengine facecam-setup --channel {login} --yes {','.join(map(str, proposed))}")
+            print(f"no webcam: clipengine facecam-setup --channel {login} --no")
+            return False
+        if not proposed:
+            print("No box found. Use --no if this channel has no webcam.")
+            return False
+        try:
+            answer = input("Use this box? [yes/no, Enter leaves it unchanged] ").strip().lower()
+        except EOFError:
+            return False
+        if answer not in ("y", "yes", "n", "no"):
+            return False
+        box = proposed if answer in ("y", "yes") else False
+    try:
+        with open(CREATORS) as stream:
+            config = json.load(stream)
+    except FileNotFoundError:
+        config = {}
+    except ValueError:
+        raise SystemExit("facecam-setup: fix invalid JSON in config/creators.json before saving") from None
+    if not isinstance(config, dict) or not isinstance(config.get("creators", {}), dict):
+        raise SystemExit("facecam-setup: config/creators.json must contain a creators object")
+    roster = config.setdefault("creators", {})
+    roster.setdefault(login, {})["facecam"] = box
+    parent = os.path.dirname(CREATORS)
+    os.makedirs(parent, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=parent, prefix=".creators-", delete=False) as temp:
+        json.dump(config, temp, indent=2)
+        temp.write("\n")
+    os.replace(temp.name, CREATORS)
+    print(f"saved facecam {login}: {box if box else 'no webcam'}")
+    return True

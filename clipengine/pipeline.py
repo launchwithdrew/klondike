@@ -100,7 +100,7 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
     to_probe = cands[:probe]
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         fetched = list(ex.map(fetch_audio, to_probe))
-    probes = [(c, A.probe_audio(path, first, ws, we, c["peak_s"], model), path, first, ws)
+    probes = [(c, A.probe_audio(path, first, ws, we, c["peak_s"], model, login=vod.login), path, first, ws)
               for c, path, first, ws, we in fetched]   # ASR is CPU-bound: one at a time, all cores
     prof = None
     try:                                     # who is talking: the session's voices across every candidate
@@ -157,6 +157,7 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
     # thumbnails from the lowest-quality stream: start, peak, middle, end of
     # the chosen window — the pause menus / settings screens / loading
     # screens a transcript can't see (e.g. an on-screen mode change)
+    thumb_pl = None
     try:
         thumb_pl = T.load_playlist(pls["thumb_url"])
 
@@ -170,6 +171,32 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
             list(ex.map(thumbs, to_probe))
     except Exception as exc:  # thumbnails are a convenience, never a blocker
         log(f"thumbnails skipped: {exc}")
+        thumb_pl = None
+    # the picture: menus, maps, static or dark screens and how much moves (liveliness), from the lowest
+    # quality stream of each probed window — the same frame checks a sentinel draft gets
+    if thumb_pl is not None:
+        from . import grade as G
+        from . import vision as VI
+
+        def look(c):
+            if not c.get("probed"):
+                return
+            w = c["window"]
+            path = os.path.join(tmp_dir, f"pic_{int(c['peak_s'])}.ts")
+            try:
+                first = T.download_window(thumb_pl, w["start_s"], w["end_s"], path, pad_s=1)
+                vis = VI.check(path, max(0.0, w["start_s"] - first), w["end_s"] - w["start_s"])
+            except Exception as exc:
+                log(f"  {c['peak']}: frame check skipped ({str(exc)[:60]})")
+                return
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
+            if vis["frames"]:
+                c["liveliness"] = vis["liveliness"]
+                c["flags"] = G.merge_vision_flags(c.get("flags") or [], vis["flags"])
+        with cf.ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(look, to_probe))
     for c in cands[probe:]:
         c.update({"probed": False, "score": 0.0, "game": vod.game_at(c["peak_s"])})
     # never re-clip a moment that is already published (data/clipped.jsonl)
@@ -304,6 +331,17 @@ def grab_thumbs(pl, times: list[float], stem: str) -> list[str]:
     return out
 
 
+def _checkpoint(path: str, vod_id: str, s: float, e: float) -> dict:
+    """The stages a render already finished for exactly this VOD window (else a fresh checkpoint)."""
+    try:
+        ck = json.load(open(path))
+        if ck.get("vod") == vod_id and abs(ck.get("s", -1) - s) < 0.01 and abs(ck.get("e", -1) - e) < 0.01:
+            return ck
+    except (OSError, ValueError):
+        pass
+    return {"vod": vod_id, "s": s, "e": e}
+
+
 def render_pick(scan_dir: str, pick: int, out_dir: str | None = None, header: str | None = None,
                 hook: str | None = None, crop: str | None = None, start: float | None = None,
                 end: float | None = None, retime: bool = True, watermark: str | None = V.WATERMARK,
@@ -332,25 +370,38 @@ def render_pick(scan_dir: str, pick: int, out_dir: str | None = None, header: st
     os.makedirs(out_dir, exist_ok=True)
     name = f"{res['vod']['login']}_{T.fmt(s).replace(':', '')}"
     t0 = time.time()
-    pls = T.playlists(vod_id)
     src = os.path.join(out_dir, name + ".src.ts")
-    first = T.download_window(pls["video"], s, e, src, pad_s=2)
+    ck_path = os.path.join(out_dir, name + ".checkpoint.json")
+    ck = _checkpoint(ck_path, vod_id, s, e)              # a killed render resumes from its last finished stage
+    if ck.get("first") is not None and os.path.exists(src):
+        first = ck["first"]
+        log("resuming: the video window is already downloaded")
+    else:
+        pls = T.playlists(vod_id)
+        first = T.download_window(pls["video"], s, e, src + ".part", pad_s=2)
+        os.replace(src + ".part", src)
+        ck = {**ck, "first": first}
+        json.dump(ck, open(ck_path, "w"))
     t_dl = time.time() - t0
     words = A.all_words(json.load(open(os.path.join(scan_dir, "probe", f"words_{int(c['peak_s'])}.json"))))
     t0 = time.time()
     timing = None
-    if retime and words:
+    if retime and words and ck.get("words") is not None:
+        words, timing = ck["words"], ck.get("timing")
+        log("resuming: words already re-timed")
+    elif retime and words:
         # v1 v5 lesson: small's word times run 0.2-1.2 s early on in-game
         # dialogue; tiny's land on the audio bursts. Keep small's words,
         # take tiny's times where the tokens agree.
         x = A.decode_pcm(src, s - first, e - s)
-        tiny = A.all_words(A.transcribe(x, "tiny", offset=s))
+        tiny = A.all_words(A.transcribe(x, "tiny", offset=s, prompt=A.vocab_prompt(login=res["vod"]["login"])))
         clip_words = [w for w in words if s <= w["start"] < e]
         new, n_ok, n = retime_words(clip_words, tiny)
         if n and n_ok >= 0.5 * n:
             words = [w for w in words if not (s <= w["start"] < e)] + new
             words.sort(key=lambda w: w["start"])
         timing = f"{n_ok}/{n}"
+        json.dump({**ck, "words": words, "timing": timing}, open(ck_path, "w"))
     t_retime = time.time() - t0
     t0 = time.time()
     out = os.path.join(out_dir, name + ".mp4")
@@ -380,6 +431,10 @@ def render_pick(scan_dir: str, pick: int, out_dir: str | None = None, header: st
         sil = V.silences(out, 0, e - s)
         bleep_ok = all(any(a0 - 0.1 <= a and b <= b0 + 0.1 for a0, b0 in sil) for a, b in info["bleeps"])
     os.remove(src)
+    try:
+        os.remove(ck_path)                       # done: nothing left to resume
+    except OSError:
+        pass
     report = {**info, "pick": pick, "window": [s, e], "header": header, "hook": hook,
               "timing_matched": timing, "bleeps_verified_silent": bleep_ok,
               "ffprobe": probe, "frames": strip,

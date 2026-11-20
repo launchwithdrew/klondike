@@ -106,7 +106,7 @@ def audit(mp4: str, listen: bool = True, model_name: str = "tiny") -> dict:
         for m in _WORD_RE.finditer(seg.get("text", "")):
             if is_profane(m.group(0)) and m.group(0) not in caps:
                 caps.append(m.group(0))
-    heard = []
+    heard, note = [], None
     if listen and os.path.exists(mp4):
         from . import audio as A
         try:
@@ -119,8 +119,13 @@ def audit(mp4: str, listen: bool = True, model_name: str = "tiny") -> dict:
                     continue
                 heard.append({"w": m.group(0), "start": round(w["start"], 2), "end": round(w["end"], 2)})
         except Exception as exc:
-            return {"ok": not caps, "captions": caps, "audio": [], "bleeps": bleeps, "note": f"audio not checked: {exc}"}
-    return {"ok": not caps and not heard, "captions": caps, "audio": heard, "bleeps": bleeps}
+            note = f"audio not checked: {exc}"
+    if caps or heard:
+        from . import judge as JG
+        for word in sorted({w.lower().strip("'") for w in [*caps, *(w["w"] for w in heard)]}):
+            JG._append(JG._path("censor_caught.jsonl"), {"word": word, "at": JG._now_iso()})
+    return {"ok": not caps and not heard, "captions": caps, "audio": heard, "bleeps": bleeps,
+            **({"note": note} if note else {})}
 
 
 def bleep_file(mp4: str, intervals: list[list[float]], pad: float = 0.08) -> list[list[float]]:

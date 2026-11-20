@@ -43,7 +43,7 @@ def live_variant(login: str, quality: str = "best", tries: int = 6) -> str:
     last = None
     for _ in range(tries):
         tok = T.gql(T._TOKEN_QUERY, {"isLive": True, "login": login.lower(), "isVod": False,
-                                     "vodID": "", "playerType": "site"}).get("streamPlaybackAccessToken")
+                                     "vodID": "", "playerType": "site"}, playback=True).get("streamPlaybackAccessToken")
         if not tok or not tok.get("value"):
             raise RuntimeError(f"{login} is not live")
         qs = urllib.parse.urlencode({"allow_source": "true", "allow_audio_only": "true",
@@ -418,7 +418,7 @@ def render_live(rec_dir: str, top: int = 3, out_dir: str | None = None, model: s
         src = os.path.join(out_dir, f"_src_{int(b['start'])}.ts")
         first = cut_source(rec_dir, b["start"] - 4, b["end"] + 4, src)
         x = A.decode_pcm(src, 0, None)
-        tr = A.transcribe(x, model, offset=first)
+        tr = A.transcribe(x, model, offset=first, prompt=A.vocab_prompt(login=login))
         words = A.real_words(tr)
         s, e = b["start"], b["end"]
         inside = [w for w in words if s <= w["start"] <= e]
@@ -457,7 +457,9 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
             from . import ops as O
             model = O.whisper_model()
         x = A.decode_pcm(src, 0, None)
-        words = A.real_words(A.transcribe(x, model, offset=first))
+        with open(os.path.join(rec_dir, "recording.json")) as stream:
+            login = json.load(stream).get("login")
+        words = A.real_words(A.transcribe(x, model, offset=first, prompt=A.vocab_prompt(login=login)))
     else:
         say("reusing the draft's transcript (no second transcription)")
         words = [dict(w) for w in words]

@@ -49,15 +49,23 @@ the **queue** — the only part that needs you.
 .venv/bin/python -m clipengine autopilot start            # cycle every 5 min in the background (no tokens)
 .venv/bin/python -m clipengine attention                  # ONE line of what needs you, or nothing
 ```
-`autopilot start --sessions` runs only inside the streamers' usual hours (`clipengine schedule` shows them);
-`autopilot status` / `stop`. `attention` lists overdue posts first, then clips due, failures (a sentinel died,
-a recording hole, a draft failed), new drafts and the daily report; `attention --seen` marks it read. To get it
-on the user's phone, add to `config/ops.json`:
+`--sessions` runs only in the streamers' usual hours (`clipengine schedule`); `autopilot status` / `stop`.
+`attention`: urgent drafts, overdue posts, clips due, failures, new drafts, the daily report (`--seen` marks it
+read). To get it on the user's phone, add to `config/ops.json`:
 `"notify_cmd": "curl -s -d \"$CLIPENGINE_ATTENTION\" ntfy.sh/<a-long-random-topic>"` (they subscribe to that
 topic in the ntfy app), or `"notify_url"` for a webhook that takes `{"text": ...}`. If nothing ran for a while,
 the next cycle scans the saved streams of that time and queues their best moments, so nothing is lost.
+**Other sources:** `kick:<slug>` runs on audio + viewers' clips (Kick refuses chat to outside clients;
+`kick-check` says `READY (audio mode)`); `yt:@handle` uses live chat when YouTube serves it, else audio.
+Streamers with subscriber-only saved streams are noticed by themselves and get a full sentinel when live.
 A streamer who doesn't allow clipping: `"policy": "never"` in `config/creators.json`.
-Backups: `clipengine backup` (brand, config, data, ledger) and `clipengine restore FILE`.
+Backups: `clipengine backup` / `restore FILE`.
+
+**Be first:** 🔥URGENT drafts (can clear TikTok/Instagram, or viewers are clipping it) lead `queue` and
+`attention` — open them first; check `attention` every 5 min while streams are live.
+**Safe to run without asking:** `doctor`, `cycle`, `attention`, `queue`, `sentinels`, `radar`, `scouts`,
+`report`, `to-post`, `to-measure`, `facecam`, `publish(-queued)` without `--post`. Ask first: `--post`, `posted`,
+`views`, `restore`, `stop --all`.
 
 ## The queue: your one judgment call
 Each line is a moment a sentinel caught, already cut, transcribed, safety-checked and scored. For each:
@@ -75,6 +83,9 @@ Each line is a moment a sentinel caught, already cut, transcribed, safety-checke
    `--taste no` never posts it (a skip, reason `taste`, that `learn` counts against the streamer); a drop
    without `--taste` is refused.
 4. Not worth it: `.venv/bin/python -m clipengine skip --id ID`.
+
+The score already looks at the picture (`pic` on the draft's line: how much moves on screen) — menus, maps and
+plain driving with nothing said rank low — but only your look at the contact sheet catches the rest.
 
 Only winners post: each platform has a minimum score and a daily budget, new accounts warm up slowly,
 and below every bar the engine says `NOT POSTED`. That's it working — move on.

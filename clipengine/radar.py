@@ -13,7 +13,8 @@ and scores each streamer as an *opportunity* (0–100):
   history    their clips' views with us vs our median            (20)
   priority   roster priority (config/creators.json)              (15)
 
-Streamers off the roster appear when they earn it. It also lists the hottest
+Streamers off the roster appear when they earn it. Live Kick and YouTube streams of the game are listed too
+(rows marked "kick" / "yt", action "start" with the command), each source failing as ONE quiet line. It also lists the hottest
 viewer-clipped *moments* across the whole category — the crowd has already
 voted on those — with the exact command to cut each one.
 
@@ -50,8 +51,14 @@ DEFAULTS = {
     "kick_category": None,        # Kick's subcategory slug; default made from "game"
     "kick_min_viewers": 500,
     "kick_retry_min": 30,         # after Kick fails, don't ask again for this long (one quiet line meanwhile)
+    "youtube": True,              # also list live YouTube streams of the game (see youtube.py; unverified via API)
+    "youtube_query": "GTA 6",     # what YouTube's live search is asked
+    "youtube_min_viewers": 1000,
+    "youtube_every_min": 20,      # ask YouTube at most this often (the Data API's daily quota); rows reused between
+    "youtube_retry_min": 30,      # after YouTube fails (bot check, quota), don't ask again for this long
 }
 KICK_STATE = os.path.join(REPO, "runs", "kick-radar.json")
+YT_STATE = os.path.join(REPO, "runs", "youtube-radar.json")
 
 _STREAMS = """query($name: String!, $first: Int, $langs: [String!]) { game(name: $name) {
   streams(first: $first, options: {languages: $langs}) { edges { node {
@@ -124,7 +131,45 @@ def kick_streams(cfg: dict, now: float | None = None) -> tuple[list[dict], str]:
     if not res["ok"]:
         return [], f"kick: unreachable ({res['why']})"
     rows = [r for r in res["rows"] if r["viewers"] >= cfg.get("kick_min_viewers", 0)]
-    return rows, f"kick: {len(rows)} live over {cfg.get('kick_min_viewers', 0):,} viewers ({res['via']}, unverified)"
+    unver = ", unverified" if res["via"].startswith("official") else ""      # the website listing was verified Nov 19
+    return rows, f"kick: {len(rows)} live over {cfg.get('kick_min_viewers', 0):,} viewers ({res['via']}{unver})"
+
+
+def youtube_streams(cfg: dict, now: float | None = None) -> tuple[list[dict], str]:
+    """Live YouTube streams of the game as radar rows, plus ONE status line ("youtube: 12 live over 1,000 viewers
+    (live search page, unverified)", "youtube: bot check"). Never raises; asks YouTube at most every
+    `youtube_every_min` (the rows are reused in between) and waits `youtube_retry_min` after a failure."""
+    import time
+    if not cfg.get("youtube"):
+        return [], ""
+    now = now or time.time()
+    try:
+        st = json.load(open(YT_STATE))
+    except (OSError, ValueError):
+        st = {}
+    retry = cfg.get("youtube_retry_min", 30) * 60
+    if st.get("failed_at") and now - st["failed_at"] < retry:
+        left = int((retry - (now - st["failed_at"])) // 60) + 1
+        return [], f"youtube: {st.get('why', '?')} — next try in {left} min"
+    if st.get("ok_at") and now - st["ok_at"] < cfg.get("youtube_every_min", 20) * 60:
+        res = {"ok": True, "rows": st.get("rows") or [], "via": st.get("via", "") + ", cached"}
+    else:
+        try:
+            from . import youtube as Y
+            res = Y.category_streams(cfg.get("youtube_query") or cfg["game"], cfg["languages"], key=Y.api_key())
+        except Exception as exc:                   # the radar never dies over YouTube
+            res = {"ok": False, "rows": [], "why": str(exc)[:40]}
+        try:
+            os.makedirs(os.path.dirname(YT_STATE), exist_ok=True)
+            json.dump({"ok_at": now, "rows": res["rows"], "via": res.get("via", "")} if res["ok"]
+                      else {"failed_at": now, "why": res["why"]}, open(YT_STATE, "w"))
+        except OSError:
+            pass
+    if not res["ok"]:
+        return [], f"youtube: {res['why']}"
+    rows = [r for r in res["rows"] if r["viewers"] >= cfg.get("youtube_min_viewers", 0)]
+    unver = "" if res["via"].startswith("live search page") else ", unverified"
+    return rows, f"youtube: {len(rows)} live over {cfg.get('youtube_min_viewers', 0):,} viewers ({res['via']}{unver})"
 
 
 def category_clips(cfg: dict) -> list[dict]:
@@ -173,8 +218,12 @@ def _event_boost(login: str, now: dt.datetime) -> float:
 
 
 def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learned: dict,
-                    cfg: dict, now: dt.datetime) -> list[dict]:
-    """Opportunity score per live streamer (pure: no network)."""
+                    cfg: dict, now: dt.datetime, restricted: set[str] | None = None) -> list[dict]:
+    """Opportunity score per live streamer (pure: no network). `restricted`: creators whose saved streams
+    are subscriber-only (default: data/vod_access.json) — like "vods": false, they're recorded live."""
+    if restricted is None:
+        from . import vodaccess as VA
+        restricted = VA.restricted_set()
     w = cfg["weights"]
     heat: dict[str, float] = {}
     for c in clips:
@@ -185,7 +234,9 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
     rows = []
     for s in streams:
         kick = s.get("platform") == "kick"
-        if s["viewers"] < (cfg.get("kick_min_viewers", 0) if kick else cfg["min_viewers"]):
+        yt = s.get("platform") == "yt"
+        if s["viewers"] < (cfg.get("kick_min_viewers", 0) if kick else cfg.get("youtube_min_viewers", 0) if yt
+                           else cfg["min_viewers"]):
             continue
         r = roster.get(s["login"], {})
         f = factors.get(s["login"])
@@ -201,8 +252,8 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
         score = round(sum(parts.values()), 1)
         rows.append({**s, "score": score, "parts": {k: round(v, 1) for k, v in parts.items()},
                      "heat_vpm": round(heat.get(s["login"], 0.0), 1), "on_roster": bool(r),
-                     "vods": r.get("vods"), "policy": str(r.get("policy") or "allowed").lower(),
-                     **({"platform": "kick", "cmd": f"start --channel {s['login']}"} if kick else {})})
+                     "vods": False if restricted and s["login"].lower() in restricted else r.get("vods"), "policy": str(r.get("policy") or "allowed").lower(),
+                     **({"platform": s["platform"], "cmd": f"start --channel {s['login']}"} if kick or yt else {})})
     # creators who don't allow clipping (config/creators.json "policy": "never") are listed last
     return sorted(rows, key=lambda r: (r["policy"] == "never", -r["score"]))
 
@@ -258,7 +309,7 @@ def _action(row: dict, cfg: dict) -> str:
         return "never"
     if row["score"] < cfg["act_score"]:
         return "watch"
-    if row.get("platform") == "kick":           # no VOD scanning on Kick: a sentinel records it live
+    if row.get("platform") in ("kick", "yt"):   # no VOD scanning on Kick / YouTube: a sentinel records it live
         return "start"
     if row["vods"] is True:
         return "scan"
@@ -279,6 +330,8 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
     now = dt.datetime.now(dt.timezone.utc)
     streams, clips = live_streams(cfg), category_clips(cfg)
     kick_rows, kick_line = kick_streams(cfg, now.timestamp())
+    yt_rows, yt_line = youtube_streams(cfg, now.timestamp())
+    kick_rows = kick_rows + yt_rows               # other platforms: rows marked by "platform"
     rows = score_streamers(streams + kick_rows, clips, creators(), learned_weights(), cfg, now)
     for r in rows[:show]:
         r["action"] = _action(r, cfg)
@@ -292,16 +345,17 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
         moments.sort(key=lambda m: (bool(m["unsafe"]) or bool(m["published"]), -m["vpm"]))
     res = {"at": now.isoformat(), "game": cfg["game"], "streamers": rows, "moments": moments,
            "live_count": len(streams) + len(kick_rows), "live_logins": [s["login"] for s in streams + kick_rows],
-           "kick": kick_line}
+           "kick": kick_line, "youtube": yt_line, "viewer_clips": clips}
     if quiet:
         return res
 
     print(f"RADAR {now:%H:%M} UTC — {cfg['game']} ({','.join(cfg['languages'])}): "
-          f"{len(streams)} live, {len(clips)} viewer clips today" + (f"\n{kick_line}" if kick_line else "") + "\n")
+          f"{len(streams)} live, {len(clips)} viewer clips today" + (f"\n{kick_line}" if kick_line else "")
+          + (f"\n{yt_line}" if yt_line else "") + "\n")
     print(f"{'score':>5}  {'streamer':<18}{'viewers':>9}{'clip v/min':>11}  action   (audience/heat/history/priority)")
     for r in rows[:show]:
         p = r["parts"]
-        tag = ("" if r["on_roster"] else "  NEW") + ("  kick" if r.get("platform") == "kick" else "")
+        tag = ("" if r["on_roster"] else "  NEW") + (f"  {r['platform']}" if r.get("platform") else "")
         print(f"{r['score']:5.0f}  {r['login']:<18}{r['viewers']:>9,}{r['heat_vpm']:>11.1f}  {r['action']:<8} "
               f"({p['audience']:.0f}/{p['heat']:.0f}/{p['history']:.0f}/{p['priority']:.0f}){tag}")
         if r.get("cmd") and r["action"] != "never":

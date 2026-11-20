@@ -121,8 +121,36 @@ def disable() -> None:
     print("insights: off")
 
 
+# The write-only channel: a Google Form (anyone can submit, nobody can read anyone else's). Set by the
+# release once it exists; a channel's config/insights.json "form" overrides it. Only Google Forms are accepted.
+FORM: dict = {"url": "", "fields": {"payload": "", "contributor": "", "date": ""}}
+_FORM_RX = r"https://docs\.google\.com/forms/d/e/[A-Za-z0-9_-]+/formResponse"
+
+
+def _form(cfg: dict) -> dict | None:
+    import re
+    f = {**FORM, **(cfg.get("form") or {})}
+    fields = f.get("fields") or {}
+    if re.fullmatch(_FORM_RX, str(f.get("url") or "")) and all(fields.get(k) for k in ("payload", "contributor", "date")):
+        return f
+    return None
+
+
+def _send(form: dict, p: dict, contributor: str) -> bool:
+    import urllib.parse
+    import urllib.request
+    fld = form["fields"]
+    body = urllib.parse.urlencode({fld["payload"]: json.dumps(p, separators=(",", ":")),
+                                   fld["contributor"]: contributor, fld["date"]: p["date"]}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(form["url"], data=body, method="POST"), timeout=20) as r:
+            return 200 <= r.status < 400
+    except Exception:
+        return False
+
+
 def submit(quiet: bool = False) -> str:
-    """Keep today's anonymous numbers locally. Nothing is sent until a write-only channel exists."""
+    """Keep today's anonymous numbers locally; when the write-only channel exists, send what's kept."""
     cfg = config()
     if not cfg.get("enabled"):
         return "insights: off"
@@ -130,5 +158,20 @@ def submit(quiet: bool = False) -> str:
     out = os.path.join(LOCAL, "outbox")
     os.makedirs(out, exist_ok=True)
     json.dump(p, open(os.path.join(out, f"{p['date']}.json"), "w"))
-    return (f"insights: kept on this machine ({len(p['outcomes'])} outcomes, {len(p['fired'])} firings) — "
-            "sharing opens in a later release; nothing was sent")
+    form = _form(cfg)
+    if not form:
+        return (f"insights: kept on this machine ({len(p['outcomes'])} outcomes, {len(p['fired'])} firings) — "
+                "sharing opens in a later release; nothing was sent")
+    sent_dir = os.path.join(LOCAL, "sent")
+    os.makedirs(sent_dir, exist_ok=True)
+    sent = 0
+    for fn in sorted(os.listdir(out)):
+        path = os.path.join(out, fn)
+        try:
+            day = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        if _send(form, day, cfg.get("contributor") or "anonymous"):
+            os.replace(path, os.path.join(sent_dir, fn))
+            sent += 1
+    return f"insights: sent {sent} day(s) of anonymous numbers" + ("" if sent else " — the form didn't answer; kept for later")

@@ -25,8 +25,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(REPO, "runs")
 NOTIFY_EVERY_S = 60
 
-# lower = shown first. Overdue posts first (item 11), then due posts, failures, drafts, the daily report.
-PRIO = {"overdue": 0, "due": 1, "failure": 2, "draft": 3, "report": 4}
+# lower = shown first. Overdue posts first (item 11), then due posts, failures, drafts, setup looks
+# (a suggested webcam box), the daily report.
+PRIO = {"overdue": 0, "due": 1, "failure": 2, "draft": 3, "setup": 4, "report": 5}
 
 
 def _paths(root: str | None = None) -> tuple[str, str]:
@@ -53,7 +54,7 @@ def event(kind: str, text: str, key: str | None = None, root: str | None = None,
     """Report something that went wrong (any process may call this; it only appends one line)."""
     p = _paths(root)[1]
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    rec = {"at": now or time.time(), "kind": kind if kind in PRIO else "failure", "key": key or f"{kind}:{text[:60]}",
+    rec = {"at": now or time.time(), "kind": kind if kind in PRIO or kind == "resolved" else "failure", "key": key or f"{kind}:{text[:60]}",
            "text": " ".join(str(text).split())[:200]}
     with open(p, "a") as fh:
         fh.write(json.dumps(rec) + "\n")
@@ -86,7 +87,10 @@ def pending(root: str | None = None) -> list[dict]:
     seen = st.get("seen_keys") or {}
     items = {i["key"]: i for i in (st.get("current") or []) if i.get("key") not in seen}
     for e in _events(st.get("seen_at", 0), root):
-        items[e["key"]] = e                               # the newest report of the same thing wins
+        if e["kind"] == "resolved":
+            items.pop(e["key"], None)
+        else:
+            items[e["key"]] = e                           # newest report of the same thing wins
     return sorted(items.values(), key=lambda i: (PRIO.get(i.get("kind"), 9), -float(i.get("score") or 0),
                                                   i.get("at", 0)))
 
@@ -100,9 +104,18 @@ def line(items: list[dict] | None = None, root: str | None = None) -> str:
     by: dict[str, list[dict]] = {}
     for i in items:
         by.setdefault(i.get("kind", "failure"), []).append(i)
-    if by.get("overdue"):
-        parts.append(f"⏰ {len(by['overdue'])} OVERDUE post(s): " + ", ".join(i["text"] for i in by["overdue"][:3])
+    if by.get("urgent"):
+        parts.append(f"🔥 {len(by['urgent'])} URGENT draft(s) — be first: " + ", ".join(i["text"] for i in by["urgent"][:3])
+                     + " → clipengine queue")
+    overdue = by.get("overdue") or []
+    posts = [i for i in overdue if not str(i.get("key", "")).startswith("measure:")]
+    measures = [i for i in overdue if str(i.get("key", "")).startswith("measure:")]
+    if posts:
+        parts.append(f"⏰ {len(posts)} OVERDUE post(s): " + ", ".join(i["text"] for i in posts[:3])
                      + " → clipengine to-post")
+    if measures:
+        parts.append(f"⏰ {len(measures)} OVERDUE analytics read(s): " + ", ".join(i["text"] for i in measures[:3])
+                     + " → clipengine to-measure")
     if by.get("due"):
         parts.append(f"{len(by['due'])} clip(s) due to post: " + ", ".join(i["text"] for i in by["due"][:3])
                      + " → clipengine to-post")
@@ -112,6 +125,8 @@ def line(items: list[dict] | None = None, root: str | None = None) -> str:
     if by.get("draft"):
         best = by["draft"][0]
         parts.append(f"{len(by['draft'])} new draft(s) worth a look — best {best['text']} → clipengine queue")
+    if by.get("setup"):                                   # a one-time look, e.g. a suggested webcam box
+        parts.append("🎥 " + "; ".join(i["text"] for i in by["setup"][:2]))
     if by.get("report"):
         parts.append("daily report: " + by["report"][0]["text"])
     return "attention: " + " · ".join(parts)

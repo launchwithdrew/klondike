@@ -22,7 +22,7 @@ _SEXUAL = [
     r"\bnut(ted|ting)?\b", r"\bsmash(ed|ing)?\b", r"\bhook ?up\w*", r"\bonlyfans\b", r"\bporn\w*", r"\bbang(ed|ing)\b",
     r"\bfucking each other\b", r"\bprison wife\b", r"\bmain bitch\b", r"\bside (bitch|chick|piece)\b",
     r"\bso (fucking |f\*+ing )?hot\b", r"\b(that|her|them|dat) ass\b", r"\bass was\b", r"\bjiggl\w*", r"\bcondom\w*", r"\berect\w*", r"\bmoan\w*", r"\bgy+a+t+\b", r"\brizz\w*", r"\bgoon\w*",
-    r"\bthongs?\b", r"\bbikini\w*", r"\bdump ?truck\w*", r"\bcaked?( up)?\b", r"\bbussy\b", r"\bthicc\w*",
+    r"\btwe{2,}k(?:ing|in)\b", r"\bthongs?\b", r"\bbikini\w*", r"\bdump ?truck\w*", r"\bcaked?( up)?\b", r"\bbussy\b", r"\bthicc\w*",
     "\U0001F351", "\U0001F975", "\U0001F346", "\U0001F4A6",            # peach, hot face, eggplant, droplets
 ]
 _RE = re.compile("|".join(_SEXUAL), re.I)
@@ -49,7 +49,7 @@ def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: li
     # chat jokes about everything, so one word is noise — but several people on it is the moment's topic
     chat_msgs = sum(1 for c in chat_lines or [] if _RE.search(c or ""))
     chat_hot = len(chat) >= 3 or chat_msgs >= max(3, 0.03 * len(chat_lines or []))
-    flagged = len(said) >= 2 or bool(named) or chat_hot
+    flagged = "prison wife" in said or len(said) >= 2 or bool(named) or chat_hot
     why = []
     if said:
         why.append("said: " + ", ".join(said[:5]))
@@ -66,22 +66,75 @@ this that these those he she they them his her their him i me my we our you your
 got get gets gone goes go going after before into off than then very really gta gta6 6 vi""".split())
 
 
+_NUMBERS = {word: number for number, word in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+    "seventeen eighteen nineteen".split())}
+_NUMBERS.update({word: number * 10 for number, word in enumerate(
+    "twenty thirty forty fifty sixty seventy eighty ninety".split(), 2)})
+_SCALES = {"hundred": 100, "thousand": 1000, "million": 1000000, "billion": 1000000000}
+_DIGIT = re.compile(r"(?<![a-z0-9])\d+(?:,\d{3})*(?:\.\d+)?(?![a-z0-9])", re.I)
+
+
+def _spoken_numbers(text: str) -> set[str]:
+    """Normalize digit and spoken cardinal amounts without accepting a substring of a larger amount."""
+    tokens = re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?|[a-z]+|[^\s-]", text.lower())
+    values = set()
+    index = 0
+    while index < len(tokens):
+        word = tokens[index]
+        index += 1
+        if word[0].isdigit():
+            values.add(word.replace(",", ""))
+            continue
+        if word not in _NUMBERS:
+            continue
+        subtotal, total = _NUMBERS[word], 0
+        previous = word
+        while index < len(tokens):
+            word = tokens[index]
+            if word == "and" and previous in _SCALES and index + 1 < len(tokens) and tokens[index + 1] in _NUMBERS:
+                index += 1
+                continue
+            if word in _SCALES:
+                if word == "hundred":
+                    subtotal *= 100
+                else:
+                    total += subtotal * _SCALES[word]
+                    subtotal = 0
+            elif word in _NUMBERS and (previous in _SCALES or _NUMBERS[previous] >= 20 > _NUMBERS[word]):
+                subtotal += _NUMBERS[word]
+            else:
+                break
+            previous = word
+            index += 1
+        values.add(str(total + subtotal))
+    return values
+
+
 def headline_support(title: str, transcript: str = "", titles: list[str] | None = None,
                      names: list[str] | None = None) -> list[str]:
-    """Key words of our headline that appear in neither what was said nor the viewers' clip titles —
-    a nudge to re-check it says what is ON SCREEN (rules/headlines.md). Empty = every key word is backed.
-    Word stems match ("arrested" ~ "arrest"); emoji, numbers, stop words and names are skipped."""
-    norm = lambda t: re.findall(r"[a-z']+", (t or "").lower())
-    have = set(norm(transcript)) | set(norm(" ".join(titles or [])))
+    """Claim words and exact digit amounts missing from speech or viewer-clip titles."""
+    def words(text):
+        return re.findall(r"[a-z']+", (text or "").lower())
+
+    evidence = [transcript or "", *(titles or [])]
+    have = {w.strip("'") for text in evidence for w in words(text)}
     stems = {w[:5] for w in have if len(w) >= 4}
-    skip = {n.lower() for n in names or []}
+    skip = {word for name in names or [] for word in words(name)}
     missing = []
-    for w in norm(title):
-        w = w.strip("'")
-        if len(w) < 4 or w in _STOP or w in skip or w.endswith("'s") and w[:-2] in skip:
+    non_claims = {"all", "any", "did", "doe", "new", "now", "not", "one", "see", "too", "try", "wow", "yes", "you"}
+    for word in words(title):
+        word = word.strip("'")
+        if len(word) < 3 or word in _STOP or word in non_claims or word in skip or word.removesuffix("'s") in skip:
             continue
-        if w in have or w[:5] in stems:
+        if word in have or word[:5] in stems or word + "s" in have or word.removesuffix("s") in have:
             continue
-        if w not in missing:
-            missing.append(w)
+        if word not in missing:
+            missing.append(word)
+    amounts = set().union(*map(_spoken_numbers, evidence))
+    amount_title = re.sub(r"\bgta\s*6\b", "", title, flags=re.I)
+    for m in _DIGIT.finditer(amount_title):
+        amount = m.group()
+        if amount.replace(",", "") not in amounts and amount not in missing:
+            missing.append(amount)
     return missing

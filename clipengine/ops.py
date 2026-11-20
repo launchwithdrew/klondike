@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import glob
 import json
+import re
 import os
 import shutil
 import signal
@@ -359,6 +360,56 @@ def _free_gb() -> float:
     return shutil.disk_usage(REPO).free / 1e9
 
 
+def _mem_available_gb() -> float | None:
+    """Memory free for new work (Linux: MemAvailable; macOS: free + inactive + speculative pages)."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1e6
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        page = int(re.search(r"page size of (\d+)", out).group(1))
+        pages = sum(int(re.search(rf"{k}:\s+(\d+)", out).group(1)) for k in ("Pages free", "Pages inactive", "Pages speculative"))
+        return pages * page / 1e9
+    except Exception:
+        return None
+
+
+MIN_CORES = 4
+MIN_FREE_RAM_GB = 4.0
+
+
+def scout_cap(state: dict, cfg: dict, load_per_core: float | None, mem_gb: float | None, holes: int,
+              live_roster: int, now: float) -> tuple[int, str]:
+    """How many full scouts this machine runs now (pure but for state). Starts at max_sentinels; one more when
+    there's room (load < 0.6 per core, 3 GB+ free, no recording holes last cycle) and more roster streamers are
+    live than scouts; one fewer when it's strained (load > 0.85 per core, < 1.5 GB free, or holes). At most
+    one step per 10 min, between 2 and max_sentinels_cap. "adaptive_sentinels": false pins max_sentinels."""
+    base = int(cfg["max_sentinels"])
+    if cfg.get("adaptive_sentinels", True) is False:
+        return base, "fixed (adaptive_sentinels: false)"
+    hi = max(base, int(cfg.get("max_sentinels_cap", 10)))
+    cap = min(hi, max(2, int(state.get("cap") or base)))
+    if now - float(state.get("cap_at") or 0) < 600:
+        return cap, state.get("cap_why") or "steady"
+    strained = [w for w, bad in (("CPU busy", load_per_core is not None and load_per_core > 0.85),
+                                 ("memory low", mem_gb is not None and mem_gb < 1.5),
+                                 (f"{holes} recording hole(s)", holes > 0)) if bad]
+    room = (load_per_core is not None and load_per_core < 0.6 and mem_gb is not None and mem_gb >= 3 and not holes)
+    why = "steady"
+    state["degraded"] = bool(strained) and cap <= 2      # at the floor and still strained: lite renders too
+    if strained and cap > 2:
+        cap, why = cap - 1, "fewer: " + ", ".join(strained)
+    elif room and live_roster > cap and cap < hi:
+        cap, why = cap + 1, f"more: room (load {load_per_core:.2f}/core, {mem_gb:.0f} GB free)"
+    if why != "steady":
+        state["cap_at"] = now
+    state["cap"], state["cap_why"] = cap, why
+    return cap, why
+
+
 def _prune(cfg: dict) -> list[str]:
     """Free disk: drafts older than draft_keep_h, then recordings of stopped sentinels — never what a queued
     draft (status new) still needs: its draft files, and the recording around its window."""
@@ -442,10 +493,13 @@ def _git(*a: str) -> bool:
 
 
 def plan_sentinels(rows: list[dict], moments: list[dict], roster: dict, top: int,
-                   promoted: list[str] | None = None, live_extra: set[str] | None = None) -> list[str]:
-    """Who should have a sentinel (tier 2), in order (pure):
-    1. roster creators with no saved VODs ("vods": false) the moment they're live — anything before their
-       recording starts is gone for good, so they beat radar heat;
+                   promoted: list[str] | None = None, live_extra: set[str] | None = None,
+                   restricted: set[str] | None = None) -> list[str]:
+    """Who should have a sentinel (tier 2), in order (pure but for data/vod_access.json when `restricted`
+    isn't given):
+    1. roster creators with no saved VODs ("vods": false, or subscriber-only VODs — learned, vodaccess.py)
+       the moment they're live — anything before their recording starts is gone for good, so they beat
+       radar heat;
     2. creators whose tier-1 chat is hot right now (`promoted`, hottest first) — a moment is building;
     3. the radar's picks (action scan/record);
     4. free slots go to the streamers of the hottest viewer-clipped moments, then the rest by radar score.
@@ -453,7 +507,10 @@ def plan_sentinels(rows: list[dict], moments: list[dict], roster: dict, top: int
     from . import autopilot as AP
     live = {r["login"] for r in rows} | set(live_extra or ())
     ok = lambda l: l in live and AP.policy(l, roster) != "never"
-    first = [l for l, c in roster.items() if c.get("vods") is False and ok(l)]
+    if restricted is None:
+        from . import vodaccess as VA
+        restricted = VA.restricted_set()
+    first = [l for l, c in roster.items() if (c.get("vods") is False or l.lower() in restricted) and ok(l)]
     prom = [l for l in (promoted or []) if ok(l)]
     picked = [r["login"] for r in rows if r.get("action") in ("scan", "record", "start") and ok(r["login"])]
     hot = [m["login"] for m in moments if not m.get("unsafe") and not m.get("published") and ok(m["login"])]
@@ -482,40 +539,54 @@ def _note_live(state: dict, rows: list[dict], roster: dict, now: float) -> None:
 
 
 def _missed_minutes(state: dict, rows: list[dict], roster: dict, now: float) -> list[str]:
-    """Live-only creators: name, once per stream, the minutes that aired before their recording started."""
+    """Keep the period before a live-only recording starts visible until a first segment arrives."""
     import datetime as _dt
+
+    from . import attention as AT
     from . import live as L
-    out, named = [], state.setdefault("missed_named", [])
+    from . import vodaccess as VA
+    out = []
+    named = state.setdefault("missed_named", [])
+    waiting = state.setdefault("missed_waiting", [])
+    restricted = VA.restricted_set(now)
     for r in rows:
-        c = roster.get(r["login"]) or {}
-        if c.get("vods") is not False or not r.get("started"):
+        login, started = r["login"], r.get("started")
+        if not started or ((roster.get(login) or {}).get("vods") is not False and login.lower() not in restricted):
             continue
-        key = f"{r['login']}@{r['started']}"
+        key = f"{login}@{started}"
         if key in named:
             continue
-        s0 = _dt.datetime.fromisoformat(r["started"].replace("Z", "+00:00")).timestamp()
-        d = sentinel_dir(r["login"])
         try:
-            first = next((x["t"] for x in L.load_index(d) if x["t"] >= s0 - 60), now)
+            s0 = _dt.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+            first = next((row["t"] for row in L.load_index(sentinel_dir(login)) if row["t"] >= s0 - 60), None)
         except (OSError, ValueError):
-            first = now
-        missed = (first - s0) / 60
-        named.append(key)
-        state["missed_named"] = named[-50:]
-        if missed >= 2:
-            line = (f"{r['login']} (no VOD) went live {_dt.datetime.fromtimestamp(s0, _dt.timezone.utc):%H:%M} UTC, "
-                    f"recording from {_dt.datetime.fromtimestamp(first, _dt.timezone.utc):%H:%M} — "
-                    f"{missed:.0f} min before that are lost")
-            out.append(line)
-            from . import attention as AT
-            AT.event("failure", line, key=f"missed:{key}")
+            continue
+        if first is None:
+            if now - s0 < 60 or key in waiting:
+                continue
+            waiting.append(key)
+            line = f"{login} (no VOD) has waited {(now - s0) / 60:.0f} min for its first recorded segment"
+        else:
+            named.append(key)
+            missing = first - s0
+            if missing <= 0:
+                if key in waiting:
+                    AT.event("resolved", "", key=f"missed:{key}", now=now)
+                continue
+            span = f"{missing / 60:.0f} min" if missing >= 120 else f"{missing:.0f} s"
+            line = f"{login} (no VOD) lost {span} before the first recorded segment"
+        AT.event("failure", line, key=f"missed:{key}", now=now)
+        out.append(line)
+    state["missed_named"] = named[-50:]
+    state["missed_waiting"] = waiting[-50:]
     return out
 
 
 def _attention_items(rows: list[dict], cfg: dict, state: dict, now: float) -> list[dict]:
     """The state half of the attention line, as of this cycle."""
-    items = [{"kind": "draft", "key": f"draft:{r['id']}", "text": f"{r['id']} {r.get('best', 0):.0f}",
-              "score": r.get("best", 0)} for r in rows]
+    from .sentinel import is_urgent
+    items = [{"kind": "urgent" if is_urgent(r) or r.get("angle_urgent") else "draft", "key": f"draft:{r['id']}",
+              "text": f"{r['id']} {r.get('best', 0):.0f}", "score": r.get("best", 0)} for r in rows]
     from . import handpost as HP
     if HP.enabled():
         for it in HP.due(now):
@@ -536,6 +607,11 @@ def _attention_items(rows: list[dict], cfg: dict, state: dict, now: float) -> li
                 items.append({"kind": "overdue" if late else "due",
                               "key": f"{'overdue' if late else 'due'}:{it['slug']}:{p}",
                               "text": f"{it['slug']} {p}" + (f" ({(now - ts) / 60:.0f} min late)" if late else "")})
+    for item in HP.to_measure(now, lookback_h=float("inf")):
+        if item["missing"]:
+            slug, platform = item["slug"], item["platform"]
+            items.append({"kind": "overdue", "key": f"measure:{slug}:{platform}",
+                          "text": f"measure {slug} on {platform}"})
     if state.get("report_text") and state.get("report_day"):
         items.append({"kind": "report", "key": f"report:{state['report_day']}", "text": state["report_text"]})
     return items
@@ -591,11 +667,19 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
     from . import autopilot as AP
     from .publish import creators
     cfg = config()
-    top = top or cfg["max_sentinels"]
     state = _state()
     lines, notes = [], []
     now = time.time()
     roster = creators()
+    if not top:
+        try:
+            lpc = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
+        except OSError:
+            lpc = None
+        top, cap_why = scout_cap(state, cfg, lpc, _mem_available_gb(), int(state.get("last_holes") or 0),
+                                 int(state.get("live_roster") or 0), now)
+        if cap_why.startswith(("more", "fewer")):
+            notes.append(f"full scouts → {top} ({cap_why})")
 
     # 0. auto-update (public copies): once an hour, take a new release — tested here, rolled back if it fails
     line = auto_update(state, cfg)
@@ -635,11 +719,13 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
         try:
             from . import radar as R
             res = R.run(None, None, show=top + 3, quiet=True)
+            from . import scouts
+            scouts.remember(res.get("viewer_clips") or [], now, RUNS)
             live = set(res.get("live_logins") or [r["login"] for r in res["streamers"]])   # every live stream, not only ranked ones
             from .live import source_name as _sn0
             live |= {_sn0(l) for l in live if l.startswith("kick:")}      # a Kick sentinel runs as kick-<slug>
-            # Kick rows off the roster are listed for a person to judge (kick.py is unverified): no automatic sentinel
-            plan_rows = [r for r in res["streamers"] if r.get("platform") != "kick" or r["login"] in roster]
+            # Kick / YouTube rows off the roster are listed for a person to judge: no automatic sentinel
+            plan_rows = [r for r in res["streamers"] if r.get("platform") not in ("kick", "yt") or r["login"] in roster]
             if any(k.startswith("kick:") for k in roster):     # Kick creators: their own live check
                 from . import kick as K
                 from .live import source_name as _sn
@@ -660,6 +746,7 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
                 prom = []
                 notes.append(f"tier 1 failed: {str(exc)[:60]}")
             want = plan_sentinels(plan_rows, res["moments"], roster, top, promoted=prom, live_extra=live)
+            state["watch_today"] = want
             for l in prom:
                 if l in want and l not in {s_["login"] for s_ in all_sentinels() if s_["alive"] and not s_["stopped"]}:
                     notes.append(f"{l} promoted to tier 2 (chat heating up)")
@@ -692,12 +779,17 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             notes.append(f"radar failed: {str(exc)[:80]}")
             AT.event("failure", f"radar failed ({str(exc)[:80]})", key=f"radar:{int(now) // 1800}")
     alive = [s for s in all_sentinels() if s["alive"] and not s["stopped"]]
+    try:
+        state["live_roster"] = len(set(live) & set(roster))
+    except NameError:
+        pass
     holes = []
     for s in all_sentinels():
         for g in AP.holes_since(s["dir"], prev_cycle - 60):
             holes.append(g)
             AT.event("failure", f"{s['login']}'s recording has a {g['len']:.0f} s hole at "
                      f"{AP._hm(g['t'])} — {g['cause']}", key=f"hole:{s['login']}:{int(g['t'])}")
+    state["last_holes"] = sum(1 for g in holes if not str(g.get("cause", "")).startswith("ad"))
     lines.append("sentinels: " + (", ".join(
         f"{s['login']} ({s['beat'].get('moments', 0)} moments)" for s in alive) or "none running")
         + (f"  [{'; '.join(notes)}]" if notes else "")
@@ -776,7 +868,7 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
     for l in lines:
         print(l)
     # 5. the only part that needs judgment
-    rows = SN.show_queue() if not quiet_queue else []
+    rows = SN.show_queue(seen=False) if not quiet_queue else []
     if not rows:
         print("queue: empty — nothing needs you")
     # 6. attention: one line of what needs the agent, and the notify hook when it gained something new
@@ -830,6 +922,33 @@ def doctor(accounts: bool = False) -> bool:
     check("logo", os.path.isfile(B.asset(B.load(fresh=True)["logo"].get("file", ""))),
           "clipengine init makes one (brand/kit/logo.png), or set logo.file in brand/brand.json")
     check("fonts", os.path.exists(os.path.join(REPO, "assets", "fonts", "NotoColorEmoji.ttf")), "git pull (assets/ is in the repo)")
+    # R2 / W4: headroom against the profile, stated rather than discovered
+    cores = os.cpu_count() or 1
+    try:
+        lpc = os.getloadavg()[0] / cores
+    except OSError:
+        lpc = None
+    mem = _mem_available_gb()
+    from . import autopilot as _AP
+    buf = _AP.buffer_hours(config(), _free_gb(), _AP.explicit_buffer())
+    small = cores < MIN_CORES or (mem is not None and mem < MIN_FREE_RAM_GB)
+    print(f"  {'!' if small else '\u2713'} machine: {cores} cores, load {lpc:.2f}/core" if lpc is not None else
+          f"  {'!' if small else '\u2713'} machine: {cores} cores", end="")
+    print(f", {mem:.1f} GB memory free" if mem is not None else "", end="")
+    print(f", {_free_gb():.0f} GB disk free, recording buffer {buf:g} h per sentinel")
+    if small:
+        print(f"    below the comfortable minimum ({MIN_CORES} cores, {MIN_FREE_RAM_GB:g} GB free): expect slow scans — "
+              "set \"profile\": \"lite\" in config/ops.json, or use a bigger machine")
+    if buf < 3:
+        print("    the recording buffer is under 3 h (disk): a moment found later than that can only be re-cut from the "
+              "saved stream (VOD creators) — free disk space for a longer buffer")
+    from . import twitch as _TW
+    if _TW.auth_token():
+        print("  \u2713 recording logged in (TWITCH_AUTH_TOKEN): ad-free if the account has Turbo or a sub to that "
+              "channel; sub-only VODs open")
+    else:
+        print("  \u00b7 recording logged out: ad breaks become gaps (optional: set TWITCH_AUTH_TOKEN in the environment "
+              "\u2014 docs/troubleshooting.md)")
     cdp = config().get("browser_cdp_url")
     from . import handpost as _HP
     if _HP.enabled():
@@ -847,7 +966,11 @@ def doctor(accounts: bool = False) -> bool:
         check("posting machine (signed-in chrome-profile/)", _posting_machine(),
               "the channel owner signs in once: cd engine && node post.mjs --login (or use your own browser: "
               "docs/troubleshooting.md)")
-    if accounts and _posting_machine() and not _HP.enabled():
+    if accounts and _HP.enabled():
+        from . import verify
+        for platform, handle, ok, reason in verify.public_accounts():
+            check(f"{platform} public profile @{handle or '(missing)'}", ok, reason)
+    elif accounts and _posting_machine():
         r = subprocess.run(["node", "post.mjs", "--check"], cwd=os.path.join(REPO, "engine"), capture_output=True,
                            text=True, timeout=180)
         try:

@@ -88,23 +88,25 @@ SLANG = ["bro", "chat", "W", "L", "rizz", "aura", "gyatt", "ohio", "sigma", "gla
          "lock in", "no cap", "on God", "bussin", "deadass", "opps", "NPC", "speedrun", "goated"]
 
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def vocabulary() -> dict:
     """{"names": roster display names, "game": game terms, "slang": [...]} — defaults in code."""
     import json as _json
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     names, game, slang = [], [], list(SLANG)
     try:
-        cr = _json.load(open(os.path.join(repo, "config", "creators.json"))).get("creators", {})
+        cr = _json.load(open(os.path.join(REPO, "config", "creators.json"))).get("creators", {})
         names = sorted({c.get("name") for c in cr.values() if c.get("name")})
     except (OSError, ValueError):
         pass
     try:
-        cat = _json.load(open(os.path.join(repo, "config", "radar.json"))).get("game", "")
+        cat = _json.load(open(os.path.join(REPO, "config", "radar.json"))).get("game", "")
     except (OSError, ValueError):
         cat = ""
     game = list(GAME_TERMS.get(cat, []))
     try:
-        extra = _json.load(open(os.path.join(repo, "config", "grading.json"))).get("vocabulary") or {}
+        extra = _json.load(open(os.path.join(REPO, "config", "grading.json"))).get("vocabulary") or {}
         game += [x for x in extra.get("game_terms", []) if x not in game]
         slang += [x for x in extra.get("slang", []) if x not in slang]
         names += [x for x in extra.get("names", []) if x not in names]
@@ -113,30 +115,47 @@ def vocabulary() -> dict:
     return {"names": names, "game": game, "slang": slang}
 
 
-def vocab_prompt(max_chars: int = 600) -> str:
+def creator_vocab(login: str | None) -> list[str]:
+    if not login:
+        return []
+    import json
+    try:
+        with open(os.path.join(REPO, "config", "creators.json")) as stream:
+            entries = json.load(stream).get("creators", {})
+        terms = entries.get(login.casefold(), {}).get("vocab", [])
+    except (OSError, ValueError):
+        return []
+    if not isinstance(terms, list):
+        return []
+    return list(dict.fromkeys(term.strip() for term in terms if isinstance(term, str) and term.strip()))
+
+
+def vocab_prompt(max_chars: int = 600, login: str | None = None) -> str:
     """Whisper's initial prompt: spellings it should prefer (it biases, it does not force)."""
     v = vocabulary()
-    text = ", ".join(v["game"] + v["names"] + v["slang"])
+    text = ", ".join(dict.fromkeys(creator_vocab(login) + v["game"] + v["names"] + v["slang"]))
     return text[:max_chars].rsplit(",", 1)[0] + "." if len(text) > max_chars else text + "."
 
 
-def misheard_names(words: list[dict], vocab: dict | None = None, cutoff: float = 0.72) -> list[tuple[str, str]]:
+def misheard_names(words: list[dict], vocab: dict | None = None, cutoff: float = 0.72, *, login: str | None = None) -> list[tuple[str, str]]:
     """Capitalised words in a transcript that look like a known name but aren't it: [("Lucy a", "Lucia")].
     Shown on the draft so the operator can pass --fix "heard=>said"."""
     import difflib
     v = vocab or vocabulary()
-    known = [n for n in v["names"] + v["game"] if len(n) >= 4]
+    custom = creator_vocab(login)
+    known = [n for n in custom + v["names"] + v["game"] if len(n) >= 4]
+    custom_keys = {re.sub(r"[^a-z0-9 ]", "", n.lower()) for n in custom if len(n) >= 4}
     exact = {re.sub(r"[^a-z0-9 ]", "", n.lower()) for n in known}
     toks = [w["w"].strip() for w in words]
     out: list[tuple[str, str]] = []
     for i, t in enumerate(toks):
         core = re.sub(r"[^\w' ]", "", t)
-        if not core or not core[0].isupper() or len(core) < 3:
+        if not core or len(core) < 3 or (not core[0].isupper() and not custom_keys):
             continue
         if core.lower() in exact:
             continue                                   # said right ("Lucia a new haircut")
         nxt = re.sub(r"[^\w' ]", "", toks[i + 1]) if i + 1 < len(toks) else ""
-        if nxt and (t.endswith((".", "?", "!", ",")) or not (nxt[0].isupper() or len(nxt) <= 2)):
+        if nxt and (t.endswith((".", "?", "!", ",")) or not (custom_keys or nxt[0].isupper() or len(nxt) <= 2)):
             nxt = ""                                   # two-word names: "Vice Sitty", "Lucy a"
         for span in ((core + " " + nxt) if nxt else "", core):
             k = span.lower().strip()
@@ -144,7 +163,8 @@ def misheard_names(words: list[dict], vocab: dict | None = None, cutoff: float =
                 continue
             if k in exact or (" " not in k and any(k in e.split() for e in exact)):
                 break
-            m = difflib.get_close_matches(k, list(exact), n=1, cutoff=0.85 if len(k) <= 5 else cutoff)
+            choices = exact if core[0].isupper() else custom_keys
+            m = difflib.get_close_matches(k, sorted(choices), n=1, cutoff=0.85 if len(k) <= 5 else cutoff)
             if m:
                 right = next(n for n in known if re.sub(r"[^a-z0-9 ]", "", n.lower()) == m[0])
                 if (span, right) not in out and span.lower() != right.lower():
@@ -160,16 +180,22 @@ def _prompt_echo(text: str, prompt: str) -> bool:
     return sum(1 for t in terms if len(t) > 3 and t in low) >= 4
 
 
-def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:
-    """faster-whisper on a PCM array. Times are shifted by `offset` so they
-    can be expressed in VOD seconds. Same JSON shape as v1 caption.py
-    (segments[].words[].w/start/end) so caption_logic and HyperFrames keep
-    working."""
-    if prompt == "":
-        prompt = vocab_prompt()
+# First pass: Silero VAD, gentler than faster-whisper's defaults (threshold 0.5, 2 s silence, 0.4 s pad),
+# which cut a streamer talking under loud game audio. A clip that still comes back with too few words for
+# how long it is loud gets a second pass without the filter (see needs_second_pass).
+VAD_GENTLE = {"threshold": 0.3, "min_silence_duration_ms": 1000, "speech_pad_ms": 800}
+LOUD_DB = -45.0              # a second louder than this is "loud" (game audio, voice, music — not silence)
+SECOND_PASS_WPS = 0.3        # fewer real words than this per loud second → re-run without the VAD
+SECOND_PASS_MIN_P = 0.5      # ... and keep that run only if its words are this confident on average
+
+
+def _whisper(x: np.ndarray, model_name: str, offset: float, prompt: str | None, vad) -> dict:
+    kw = {"vad_filter": vad is not False}
+    if isinstance(vad, dict):
+        kw["vad_parameters"] = vad
     segs, info = model(model_name).transcribe(
-        x, language="en", word_timestamps=True, vad_filter=True,
-        condition_on_previous_text=False, initial_prompt=prompt or None)
+        x, language="en", word_timestamps=True, condition_on_previous_text=False,
+        initial_prompt=prompt or None, **kw)
     out = []
     for s in segs:
         if prompt and _prompt_echo(s.text, prompt):
@@ -182,6 +208,49 @@ def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, pr
     return {"model": model_name, "language": info.language,
             "language_probability": round(info.language_probability, 2),
             "segments": out}
+
+
+def loud_seconds(x: np.ndarray) -> float:
+    sec = frame_db(x, 1.0)
+    return float((sec > LOUD_DB).sum()) if len(sec) else 0.0
+
+
+def needs_second_pass(x: np.ndarray, tr: dict) -> bool:
+    """Too few words for how long the clip is loud (or none): the VAD may have cut speech under game audio."""
+    loud = loud_seconds(x)
+    return loud >= 4 and len(real_words(tr)) < SECOND_PASS_WPS * loud
+
+
+# what Whisper "hears" in noise without a VAD: YouTube outros
+_OUTRO = re.compile(r"\b(subscrib\w*|like button|thanks? (you )?for watching|next video|see you (in the )?next)\b", re.I)
+
+
+def better_pass(first: dict, second: dict) -> bool:
+    """Keep the unfiltered run only if it found clearly more words, confidently (not hallucinated noise)."""
+    a, b = real_words(first), real_words(second)
+    if any(_OUTRO.search(s["text"]) for s in second["segments"]):
+        return False                     # one hallucinated outro means the rest is likely noise too
+    if len(b) < len(a) + 3:
+        return False
+    return float(np.mean([w.get("p", 1) for w in b])) >= SECOND_PASS_MIN_P
+
+
+def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:
+    """faster-whisper on a PCM array. Times are shifted by `offset` so they
+    can be expressed in VOD seconds. Same JSON shape as v1 caption.py
+    (segments[].words[].w/start/end) so caption_logic and HyperFrames keep
+    working. `pass` says which run the words came from: "vad" or "no-vad" (speech the filter cut)."""
+    if prompt == "":
+        prompt = vocab_prompt()
+    tr = _whisper(x, model_name, offset, prompt, VAD_GENTLE)
+    tr["pass"] = "vad"
+    if needs_second_pass(x, tr):
+        tr2 = _whisper(x, model_name, offset, prompt, False)
+        if better_pass(tr, tr2):
+            tr2["pass"] = "no-vad"
+            tr2["first_pass_words"] = len(real_words(tr))
+            return tr2
+    return tr
 
 
 def all_words(tr: dict) -> list[dict]:
@@ -233,7 +302,8 @@ class Probe:
 
 
 def probe_audio(audio_path: str, file_t0: float, win_start: float, win_end: float,
-                peak_s: float, model_name: str = "small", transcript: dict | None = None) -> Probe:
+                peak_s: float, model_name: str = "small", transcript: dict | None = None,
+                login: str | None = None) -> Probe:
     """Measure + transcribe [win_start, win_end] (VOD seconds) of an audio
     file whose first sample is VOD second file_t0. Pass `transcript` to
     reuse an earlier one (re-scoring without re-running Whisper)."""
@@ -247,7 +317,7 @@ def probe_audio(audio_path: str, file_t0: float, win_start: float, win_end: floa
     p.mute_map = [bool(v < MUTE_DB) for v in sec_db]
     if muted > 0.9:
         return p
-    tr = transcript or transcribe(x, model_name, offset=win_start)
+    tr = transcript or transcribe(x, model_name, offset=win_start, prompt=vocab_prompt(login=login))
     p.transcript = tr
     p.words = real_words(tr)
     # excitement: loudest 1 s around the chat peak (moment is usually

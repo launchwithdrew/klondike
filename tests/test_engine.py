@@ -1035,7 +1035,8 @@ def test_http_falls_back_to_curl_when_reads_keep_getting_cut(monkeypatch):
 
 def test_agent_posting_lists_due_clips_and_records_posts(tmp_path, monkeypatch):
     import json as _json
-    from clipengine import handpost as HP
+    from clipengine import handpost as HP, verify
+    monkeypatch.setattr(verify, "post", lambda *a: "oembed")
     monkeypatch.setattr(HP, "REPO", str(tmp_path))
     d = tmp_path / "outbox" / "kai_moment"; d.mkdir(parents=True)
     (d / "clip.mp4").write_bytes(b"video")
@@ -1127,7 +1128,8 @@ def test_engine_poster_and_stats_stand_down_when_the_agent_posts():
 
 def test_agent_posts_sync_through_git_in_our_op(tmp_path, monkeypatch):
     import json as _json
-    from clipengine import handpost as HP, repo as RP
+    from clipengine import handpost as HP, repo as RP, verify
+    monkeypatch.setattr(verify, "post", lambda *a: "oembed")
     monkeypatch.setattr(HP, "REPO", str(tmp_path))
     monkeypatch.setattr(RP, "sync", lambda: True)
     d = tmp_path / "outbox" / "s"; d.mkdir(parents=True); (d / "clip.mp4").write_bytes(b"v")
@@ -1613,9 +1615,10 @@ def test_attention_items_mark_overdue_posts(tmp_path, monkeypatch):
     monkeypatch.setattr(HP, "enabled", lambda: True)
     monkeypatch.setattr(HP, "due", lambda now=None: [{"slug": "clip-a", "file": str(d / "clip.mp4"),
                                                       "now": ["tiktok", "youtube"], "later": {}}])
+    monkeypatch.setattr(HP, "to_measure", lambda *a, **kw: [])
     items = O._attention_items([{"id": "streamera-1", "best": 80}], {}, {"report_day": "d", "report_text": "REPORT"}, now)
     kinds = {i["key"]: i["kind"] for i in items}
-    assert kinds == {"draft:streamera-1": "draft", "overdue:clip-a:tiktok": "overdue", "overdue:clip-a:youtube": "overdue",
+    assert kinds == {"draft:streamera-1": "urgent", "overdue:clip-a:tiktok": "overdue", "overdue:clip-a:youtube": "overdue",
                      "report:d": "report"}
 
 
@@ -1786,7 +1789,7 @@ def test_queue_shows_the_score_parts_and_hides_drops_and_sexual_chat(tmp_path, c
     SN.show_queue(str(tmp_path))
     lines = capsys.readouterr().out.splitlines()
     # the sheet's path depends on where the repo sits: budget the line before it, and line 1 whole
-    assert len(lines) == 2 and lines[0].startswith("x-1") and len(lines[0]) <= 220
+    assert len(lines) == 2 and lines[0].startswith("x-1") and "seen " in lines[0] and len(lines[0]) <= 220
     assert len(lines[1].split("  sheet ")[0]) <= 165
     assert "payoff +10s" in lines[1] and "re .70" in lines[1] and "game dialogue" in lines[1]
     SN.show_queue(str(tmp_path), all_=True)
@@ -1800,7 +1803,7 @@ def test_sexual_chat_from_several_people_flags_the_moment_and_headlines_are_chec
     assert SF.screen("we got to go", chat_lines=chat_lines)["flagged"]
     assert not SF.screen("we got to go", chat_lines=["sex?"] + ["lmao"] * 30)["flagged"]
     assert SF.headline_support("Streamer gets ARRESTED by a fake cop 😭", "bro I'm getting arrested right now",
-                               ["he got caught"], names=["Streamer"]) == ["fake"]
+                               ["he got caught"], names=["Streamer"]) == ["fake", "cop"]
     assert SF.headline_support("Streamer finds a HELICOPTER", "what is that", [], names=["streamer"]) == ["finds", "helicopter"]
 
 
@@ -2558,6 +2561,7 @@ def test_publish_queued_taste_no_skips_the_draft(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="taste: no"):
         M.main(["publish-queued", "--id", "streamera-1", "--title", "X 😭", "--line", "l", "--taste", "no", "--no-push"])
     last = _json.loads(open(rec / "queue.jsonl").read().splitlines()[-1])
+    assert last.pop("judged_at")
     assert last == {"id": "streamera-1", "status": "skipped", "reason": "taste"}
     assert _json.loads(open(PB.TASTE).read())["ref"] == "streamera-1"
 
@@ -2648,7 +2652,7 @@ def test_radar_lists_kick_rows_and_one_quiet_line_when_unreachable(tmp_path, mon
     monkeypatch.setattr(PB, "load_clipped", lambda: [])
     monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": True, "via": "official API", "why": "",
                                                                 "rows": K.rows_from_listing(KICK_OFFICIAL, ["en"])})
-    cfg = {**R.config(), "act_score": 10}
+    cfg = {**R.config(), "act_score": 10, "youtube": False}
     monkeypatch.setattr(R, "config", lambda: cfg)
     res = R.run(show=10)
     out = capsys.readouterr().out
@@ -2675,7 +2679,7 @@ def test_kick_check_says_exactly_what_worked(monkeypatch):
     from clipengine import kick as K
     monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": True, "via": "kick.com/stream/livestreams/en",
                                                                 "why": "", "rows": K.rows_from_listing(KICK_WEBSITE)})
-    monkeypatch.setattr(K, "live_status", lambda src: {"live": True, "viewers": 800, "chatroom_id": 42,
+    monkeypatch.setattr(K, "live_status", lambda src, creds=None: {"live": True, "viewers": 800, "chatroom_id": 42,
                                                        "playback_url": "https://x.playback.live-video.net/m.m3u8"})
     master = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000\n480p.m3u8\n"
               "#EXT-X-STREAM-INF:BANDWIDTH=6000000\n1080p.m3u8\n")
@@ -2687,6 +2691,8 @@ def test_kick_check_says_exactly_what_worked(monkeypatch):
             return b"#EXTM3U\n#EXTINF:2.0,\nseg1.ts\n"
         if url.endswith("seg1.ts"):
             return b"\0" * 1_500_000
+        if "/clips?" in url:
+            return json.dumps(KICK_CLIPS).encode()
         raise AssertionError(url)
     monkeypatch.setattr(K.T, "http", fake)
 
@@ -2702,6 +2708,7 @@ def test_kick_check_says_exactly_what_worked(monkeypatch):
     assert res["ok"] and line.startswith("kick-check: OK")
     assert "record ✓ got a 1.5 MB segment" in line and "chat ✓ 37 messages in 60 s" in line
     assert "listing ✓ 2 live" in line and "\n" not in line
+    assert "route ✓ website only (no KICK_CLIENT_ID" in line and "clips ✓ 3 viewer clip(s)" in line
     # nothing reachable: says where it stopped
     monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": False, "via": "", "why": "403", "rows": []})
     monkeypatch.setattr(K.T, "http", lambda url, **k: (_ for _ in ()).throw(RuntimeError("x (HTTP Error 403: Forbidden)")))
@@ -2789,6 +2796,10 @@ def test_a_dead_autopilot_is_revived_by_a_sentinel_once(tmp_path, monkeypatch):
     assert AP.autopilot_died()
     assert AP.revive_if_dead("streamera", now=1_800_000_000) == "started" and started == [(5, True)]
     assert "restarted by the streamera sentinel" in AT.line()
+    st = json.load(open(tmp_path / "ap.json"))
+    assert len(st["deaths"]) == 1 and st["deaths"][0]["by"] == "streamera"          # the death is on record
+    up = AP.uptime(now=1_800_000_100)
+    assert up["deaths"] == 1 and up["dark_min"] >= 0 and len(up["causes"]) == 1
     (tmp_path / "autopilot.pid").write_text("999999")
     assert AP.revive_if_dead("streamerb", now=1_800_000_060) is None      # within 15 min: not again
     os.remove(tmp_path / "autopilot.pid")                                 # stopped on purpose
@@ -2804,3 +2815,1024 @@ def test_chat_spamming_gyat_on_a_big_stream_flags_the_moment():
     assert SF.screen("", chat_lines=["LMAO", "W", "gyat"] * 100)["flagged"]                      # 1/3 of chat: flagged
     assert not SF.screen("", chat_lines=["LMAO", "W", "nice drive"] * 200 + ["gyat"])["flagged"]   # one joke: noise
 
+
+def test_viewers_clipping_a_watched_stream_becomes_a_spike_and_makes_it_hot(monkeypatch):
+    import datetime as dt
+    from clipengine import tier1 as T1, twitch as T
+    now = 1_800_000_000.0
+    iso = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    users = [{"login": "streamera", "clips": {"edges": [
+                {"node": {"slug": "a", "title": "he did WHAT", "createdAt": iso(now - 120), "viewCount": 40}},   # fresh
+                {"node": {"slug": "b", "title": "old", "createdAt": iso(now - 7200), "viewCount": 9000}},        # old
+                {"node": {"slug": "c", "title": "meh", "createdAt": iso(now - 60), "viewCount": 3}}]}},          # no views
+             {"login": "streamerb", "clips": {"edges": []}}]
+    monkeypatch.setattr(T, "gql", lambda q, v: {"users": users})
+    w = T1.CrowdWatch()
+    w.logins = ["streamera", "streamerb", "kick:streamerc"]
+    got = w.poll(now)
+    assert [g["login"] for g in got] == ["streamera"] and got[0]["kind"] == "crowd" and got[0]["views"] == 40
+    assert got[0]["start"] < now - 120 < got[0]["stop"]                       # the window holds the moment
+    assert w.hot["streamera"] > now                                           # cycle promotes it to a sentinel
+    assert w.poll(now + 60) == []                                             # fired once per clip
+
+
+def test_scouts_report_says_if_we_were_first_and_why_we_missed():
+    from clipengine import scouts as SC
+    clip = {"login": "streamera", "t": 1000.0, "views": 500, "title": "x", "slug": "s"}
+    d = {"login": "streamera", "start": 900.0, "stop": 980.0, "_ready": 950.0, "id": "streamera-1", "status": "new"}
+    m = SC.match(clip, [d], [], recorded=True)
+    assert m["caught"] and m["lead_s"] == 50                                  # our draft was ready 50 s before
+    assert SC.match(clip, [{**d, "_ready": 1300.0}], [], True)["lead_s"] == -300   # five minutes late
+    assert "didn't fire" in SC.match(clip, [], [], recorded=True)["why"]
+    assert "saw a spike" in SC.match(clip, [], [{"login": "streamera", "t": 990}], recorded=False)["why"]
+    assert "no scout" in SC.match(clip, [], [], recorded=False)["why"]
+
+
+def test_login_token_is_used_only_for_playback_and_never_on_a_command_line(monkeypatch):
+    from clipengine import twitch as T
+    seen = []
+    monkeypatch.setattr(T, "http", lambda url, data=None, headers=None, **k: seen.append(dict(headers or {})) or b'{"data": {}}')
+    monkeypatch.delenv(T.AUTH_ENV, raising=False)
+    T.gql("query { x }", playback=True)
+    assert "Authorization" not in seen[-1]                                    # unset: logged out, as before
+    monkeypatch.setenv(T.AUTH_ENV, "abcdefghijklmnopqrstuvwxyz0123")
+    T.gql("query { x }")
+    assert "Authorization" not in seen[-1]                                    # never on other requests
+    T.gql("query { x }", playback=True)
+    assert seen[-1]["Authorization"] == "OAuth abcdefghijklmnopqrstuvwxyz0123"
+    monkeypatch.setenv(T.AUTH_ENV, "not a token; rm -rf /")
+    assert T.auth_token() is None                                             # junk is ignored
+    calls = []
+    monkeypatch.setattr(T.shutil if hasattr(T, "shutil") else __import__("shutil"), "which", lambda c: "/usr/bin/curl")
+    import subprocess as sp
+    monkeypatch.setattr(sp, "run", lambda cmd, **k: calls.append(cmd) or type("P", (), {"returncode": 1, "stdout": b""})())
+    T._curl("https://example.invalid", None, {"Authorization": "OAuth secret123secret123secret"}, 5)
+    assert calls and not any("secret123" in a for a in calls[0])               # header file, not argv
+
+
+def test_full_scout_cap_grows_with_room_and_shrinks_under_strain():
+    from clipengine import ops as O
+    cfg = {"max_sentinels": 5, "max_sentinels_cap": 7}
+    st, now = {}, 1_800_000_000.0
+    assert O.scout_cap(st, cfg, 0.3, 8.0, 0, 12, now)[0] == 6                 # room + demand: one more
+    assert O.scout_cap(st, cfg, 0.3, 8.0, 0, 12, now + 60)[0] == 6            # one step per 10 min
+    assert O.scout_cap(st, cfg, 0.3, 8.0, 0, 12, now + 700)[0] == 7
+    assert O.scout_cap(st, cfg, 0.3, 8.0, 0, 12, now + 1400)[0] == 7          # never past max_sentinels_cap
+    cap, why = O.scout_cap(st, cfg, 0.95, 8.0, 0, 12, now + 2100)
+    assert cap == 6 and "CPU busy" in why                                      # strained: one fewer
+    cap, why = O.scout_cap(st, cfg, 0.3, 8.0, 2, 12, now + 2800)
+    assert cap == 5 and "hole" in why                                          # recorder holes: back off
+    assert O.scout_cap(st, cfg, 0.3, 8.0, 0, 3, now + 3500)[0] == 5           # no demand: stay
+    assert O.scout_cap({}, {**cfg, "adaptive_sentinels": False}, 0.1, 30, 0, 40, now)[0] == 5
+    assert O.scout_cap({}, cfg, None, None, 0, 40, now)[0] == 5               # can't measure: don't grow
+
+
+def test_urgent_drafts_go_first_and_say_so():
+    from clipengine import sentinel as SN, attention as AT
+    assert SN.is_urgent({"best": 80, "status": "new"})                              # can clear TikTok/Instagram
+    assert SN.is_urgent({"best": 62, "status": "new", "parts": "sp 4s ch .5 au .9 re .3 cr 2"})   # viewers clipping
+    assert SN.is_urgent({"best": 62, "status": "new", "via": "catch-up (crowd)"})
+    assert not SN.is_urgent({"best": 62, "status": "new", "parts": "sp 4s ch .5 au .9 re .3 cr –"})
+    assert not SN.is_urgent({"best": 90, "status": "new", "unsafe": "chat: gyat"})  # never an unsafe one
+    assert not SN.is_urgent({"best": 90, "status": "skipped"})
+    line = AT.line([{"kind": "draft", "key": "d1", "text": "streamera-1 66"},
+                    {"kind": "urgent", "key": "d2", "text": "streamerb-2 81"}])
+    assert line.index("URGENT") < line.index("new draft")                          # urgent first on the line
+
+
+def test_insights_send_only_to_a_google_form_once_one_exists(tmp_path, monkeypatch):
+    from clipengine import insights as IN
+    monkeypatch.setattr(IN, "LOCAL", str(tmp_path / "ins"))
+    monkeypatch.setattr(IN, "payload", lambda: {"date": "2026-11-19", "outcomes": [], "fired": []})
+    posted = []
+    monkeypatch.setattr(IN, "_send", lambda form, p, c: posted.append((form["url"], p["date"], c)) or True)
+    fields = {"payload": "entry.1", "contributor": "entry.2", "date": "entry.3"}
+    monkeypatch.setattr(IN, "config", lambda: {"enabled": True, "contributor": "c1",
+                                               "form": {"url": "https://evil.example/collect", "fields": fields}})
+    assert "nothing was sent" in IN.submit() and posted == []                  # not a Google Form: refused
+    monkeypatch.setattr(IN, "config", lambda: {"enabled": True, "contributor": "c1", "form": {
+        "url": "https://docs.google.com/forms/d/e/AbC_123-x/formResponse", "fields": fields}})
+    assert "sent 1 day" in IN.submit() and posted[0][1:] == ("2026-11-19", "c1")
+    assert not os.listdir(tmp_path / "ins" / "outbox")                        # moved to sent/
+    monkeypatch.setattr(IN, "config", lambda: {"enabled": False})
+    assert IN.submit() == "insights: off"                                      # opt-in only
+
+
+def test_every_render_gets_an_audit_and_a_short_one_fails_loudly(src, tmp_path):
+    out = str(tmp_path / "a.mp4")
+    words = [{"w": " no", "start": 100.5, "end": 100.8}, {"w": " way", "start": 101.0, "end": 101.3}]
+    info = V.render(src, 100.0, 100.0, 103.0, words, out, layout="stack", watermark=None, payoff_s=1.0)
+    assert info["audit"]["ok"] and "payoff at 1.0 s inside" in info["audit"]["line"]
+    assert not V.audit(out, 3.0, payoff_s=9.0)["ok"]                              # payoff outside: flagged
+    with pytest.raises(RuntimeError):
+        V.audit(out, 10.0)                                                          # 3 s file for a 10 s window
+
+
+def test_a_killed_render_resumes_from_its_finished_stages(tmp_path):
+    from clipengine import pipeline as P
+    ck = tmp_path / "x.checkpoint.json"
+    ck.write_text(json.dumps({"vod": "123", "s": 10.0, "e": 40.0, "first": 8.0, "words": [{"w": " hi", "start": 11, "end": 12}],
+                              "timing": "3/4"}))
+    got = P._checkpoint(str(ck), "123", 10.0, 40.0)
+    assert got["first"] == 8.0 and got["words"] and got["timing"] == "3/4"         # same window: resume
+    assert "first" not in P._checkpoint(str(ck), "123", 10.0, 41.0)                # another window: start fresh
+    assert "first" not in P._checkpoint(str(tmp_path / "none.json"), "123", 10.0, 40.0)
+
+
+
+# ---- Kick official API route (api.kick.com/public/v1, documented shape; no keys on the build machine) -----
+KICK_OFFICIAL_CHANNELS = {"data": [
+    {"broadcaster_user_id": 11, "slug": "streamera", "stream_title": "GTA 6 day 3",
+     "category": {"id": 777, "name": "Grand Theft Auto VI"}, "channel_description": "",
+     "stream": {"is_live": True, "viewer_count": 5123, "start_time": "2026-11-19T12:00:00Z", "language": "en",
+                "is_mature": False, "url": "", "key": ""}},
+    {"broadcaster_user_id": 12, "slug": "streamerb", "stream_title": "", "category": {"id": 15, "name": "Just Chatting"},
+     "stream": {"is_live": False, "viewer_count": 0, "start_time": "0001-01-01T00:00:00Z", "url": "", "key": ""}}],
+    "message": "OK"}
+
+
+def test_kick_official_route_live_status_and_roster(monkeypatch):
+    import json as _json
+    from clipengine import kick as K
+    K._TOKENS.clear()
+    calls = []
+
+    def fake(url, data=None, headers=None, timeout=60, attempts=4):
+        calls.append(url)
+        if url == K.TOKEN_URL:
+            return b'{"access_token": "tok", "token_type": "Bearer", "expires_in": 3600}'
+        if "/public/v1/channels?" in url:
+            assert headers["Authorization"] == "Bearer tok"
+            return _json.dumps(KICK_OFFICIAL_CHANNELS).encode()
+        if "kick.com/api/v2/channels/streamera" in url:
+            return _json.dumps(_KICK_CHANNEL).encode()
+        raise RuntimeError(f"request failed after retries: {url} (HTTP Error 403: Forbidden)")
+    monkeypatch.setattr(K.T, "http", fake)
+    creds = ("id", "sec")
+    st = K.live_status("kick:streamera", creds=creds)
+    assert st["live"] and st["route"] == "official API" and st["viewers"] == 5123
+    assert st["playback_url"].endswith("x.m3u8") and st["chatroom_id"] == 777     # the website adds what only it has
+    off = K.live_status("kick:streamerb", creds=creds)
+    assert not off["live"] and off["route"] == "official API"
+    assert not any("api/v2/channels/streamerb" in u for u in calls)              # offline: no website call
+    assert calls.count(K.TOKEN_URL) == 1                                         # the token is reused
+    # one official call answers the whole roster
+    n = len(calls)
+    assert K.live_roster({"kick:streamera": {}, "kick:streamerb": {}, "twitchone": {}}, creds=creds) == {"kick:streamera"}
+    assert len(calls) == n + 1 and "slug=streamera&slug=streamerb" in calls[-1]
+    # kick.com refuses this machine (Cloudflare): live status still works, recording says exactly why not
+    monkeypatch.setattr(K, "channel", lambda s: (_ for _ in ()).throw(RuntimeError("x (HTTP Error 403: Forbidden)")))
+    st = K.live_status("kick:streamera", creds=creds)
+    assert st["live"] and st["playback_url"] is None and "official API gives no playback URL" in st["playback_note"]
+    monkeypatch.setattr(K, "live_status", lambda s, creds=True: st)
+    with pytest.raises(RuntimeError, match="can't be recorded here: the official API gives no playback URL"):
+        K.variant("kick:streamera")
+
+
+def test_kick_official_route_falls_back_to_the_website(monkeypatch):
+    import json as _json
+    from clipengine import kick as K
+    K._TOKENS.clear()
+
+    def fake(url, data=None, headers=None, timeout=60, attempts=4):
+        if url == K.TOKEN_URL:
+            raise RuntimeError("request failed after retries: x (HTTP Error 401: Unauthorized)")
+        if "kick.com/api/v2/channels/streamera" in url:
+            return _json.dumps(_KICK_CHANNEL).encode()
+        raise AssertionError(url)
+    monkeypatch.setattr(K.T, "http", fake)
+    st = K.live_status("kick:streamera", creds=("id", "bad"))
+    assert st["live"] and st["route"] == "website (official API 401)"
+    assert K.live_status("kick:streamera", creds=None)["route"] == "website"
+    assert K.route_note(("a", "b")).startswith("official API (KICK_CLIENT_ID/SECRET set)")
+    assert "no playback URL" in K.route_note(("a", "b"))
+
+
+# ---- Kick viewers' clips + saved broadcasts: trimmed from real kick.com/api/v2 answers (Nov 19 2026), renamed ----
+KICK_CLIPS = {"clips": [
+    {"id": "clip_01M7TN7D3KM8RQMB8TX8NJYPC6", "livestream_id": "138917712", "category_id": "15", "channel_id": 4242,
+     "title": "huh", "views": 14, "view_count": 14, "duration": 53, "started_at": "0001-01-01T00:00:00Z",
+     "created_at": "2026-11-19T19:42:10.952249Z", "vod_starts_at": 0, "is_mature": False,
+     "channel": {"id": 4242, "username": "StreamerA", "slug": "streamera"}},
+    {"id": "clip_01M7TN7D3KM8RQMB8TX8NJYPC7", "livestream_id": "138917712", "title": "no way", "views": 3,
+     "view_count": 3, "duration": 30, "created_at": "2026-11-19T19:42:40.1Z", "vod_starts_at": 0},
+    {"id": "clip_01M7TN7D3KM8RQMB8TX8NJYPC8", "livestream_id": "138742125", "title": "old stream", "views": 40,
+     "view_count": 40, "duration": 180, "created_at": "2026-11-19T19:41:55.269961Z", "vod_starts_at": 0}],
+    "nextCursor": '{"view":0,"id":"clip_01M7SNG6WJ6TM1W70CAZT1S4N2"}'}
+KICK_VIDEOS = [
+    {"id": 138917712, "slug": "c9e68dbb-gta-6-day-1", "channel_id": 4242, "created_at": "2026-11-19 18:43:50",
+     "session_title": "GTA 6 MARATHON DAY 1", "is_live": True, "start_time": "2026-11-19 18:43:46",
+     "source": "https://stream.kick.com/abc/ivs/v1/1/X/2026/11/19/18/43/Y/media/hls/master.m3u8",
+     "duration": 0, "language": "English", "viewer_count": 19043,
+     "categories": [{"id": 9, "name": "Grand Theft Auto VI", "slug": "grand-theft-auto-vi"}]},
+    {"id": 138742125, "slug": "x", "channel_id": 4242, "created_at": "2026-11-19 03:11:30", "session_title": "day 0",
+     "is_live": False, "start_time": "2026-11-19 03:11:26", "duration": 54431000,
+     "source": "https://stream.kick.com/abc/ivs/v1/1/X/2026/11/19/3/11/Z/media/hls/master.m3u8",
+     "categories": [{"id": 15, "name": "Just Chatting", "slug": "just-chatting"}]}]
+
+
+def _kick_ts(s):
+    import datetime as _d
+    return _d.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def test_kick_clips_and_videos_parse_and_only_live_clips_become_moments():
+    from clipengine import kick as K
+    clips, vods = K.clip_rows(KICK_CLIPS), K.video_rows(KICK_VIDEOS)
+    assert [c["views"] for c in clips] == [3, 14, 40] and clips[0]["livestream_id"] == "138917712"
+    live, old = vods
+    assert live["live"] and live["start"] == _kick_ts("2026-11-19T18:43:46Z") and live["game"] == "Grand Theft Auto VI"
+    assert old["length_s"] == 54431.0 and old["source"].startswith("https://stream.kick.com/")
+    now = _kick_ts("2026-11-19T19:45:00Z")
+    ms = K.live_clip_moments(clips, vods, min_views=10, now=now)
+    # the two clips of the live broadcast merge into one moment; the clip cut now from the OLD broadcast is ignored
+    assert len(ms) == 1 and ms[0]["vod"]["id"] == "138917712" and ms[0]["views"] == 17 and ms[0]["clips"] == 2
+    assert ms[0]["end"] == _kick_ts("2026-11-19T19:42:40.1Z")
+    assert K.live_clip_moments(clips, vods, min_views=20, now=now) == []
+
+
+def test_kick_clips_become_tier1_crowd_spikes(monkeypatch):
+    from clipengine import kick as K, tier1 as TR
+    K._LIVE_ID.clear()
+    monkeypatch.setattr(K, "_get_json", lambda url, headers=None, timeout=10:
+                        KICK_VIDEOS if url.endswith("/videos") else KICK_CLIPS)
+    now = _kick_ts("2026-11-19T19:45:00Z")
+    nodes = K.crowd_nodes("kick:streamera", now)
+    assert [n["viewCount"] for n in nodes] == [3, 14]                          # only the live broadcast's clips
+    cw = TR.CrowdWatch()
+    cw.logins = ["kick:streamera"]
+    monkeypatch.setattr(TR, "crowd_spike", TR.crowd_spike)
+    import clipengine.twitch as T
+    monkeypatch.setattr(T, "gql", lambda *a, **k: {"users": []})
+    got = cw.poll(now)
+    assert len(got) == 1 and got[0]["login"] == "kick:streamera" and got[0]["kind"] == "crowd" and got[0]["views"] == 14
+    assert cw.hot["kick:streamera"] > now and cw.poll(now) == []              # fired once
+    # Kick spikes are drafted by catch-up now (they used to be skipped)
+    assert "kick:" not in TR.spike_catchups.__code__.co_consts
+
+
+def test_kick_vod_segments_and_catchup_draft_from_the_saved_broadcast(tmp_path, monkeypatch):
+    from clipengine import kick as K, autopilot as AP
+    media = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\n0.ts\n#EXTINF:2.000,\n1.ts\n#EXTINF:2.000,\n2.ts\n"
+    segs = K.vod_segments(media, "https://stream.kick.com/v/1080p60/playlist.m3u8", 1000.0)
+    assert segs[2] == (1004.0, 2.0, "https://stream.kick.com/v/1080p60/2.ts")
+    master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=8000000\n1080p60/playlist.m3u8\n"
+    vod = {"id": "9", "start": 1000.0, "source": "https://stream.kick.com/v/master.m3u8"}
+    got = []
+
+    def http(u):
+        got.append(u)
+        return {"https://stream.kick.com/v/master.m3u8": master.encode(),
+                "https://stream.kick.com/v/1080p60/playlist.m3u8": media.encode()}.get(u, b"TS")
+    assert K.vod_to_rec(vod, 1004.5, 1005.5, str(tmp_path), http=http) == 2
+    from clipengine import live as L
+    idx = L.load_index(str(tmp_path))
+    assert [r["t"] for r in idx] == [1002.0, 1004.0] and got[-1].endswith("/2.ts")
+    K.vod_to_rec(vod, 1004.5, 1005.5, str(tmp_path), http=http)               # again: nothing fetched twice
+    assert len(L.load_index(str(tmp_path))) == 2
+    # catch-up: viewers' clips of the live broadcast -> drafted through the sentinel's draft_moment
+    monkeypatch.setattr(K, "_get_json", lambda url, headers=None, timeout=10:
+                        KICK_VIDEOS if url.endswith("/videos") else KICK_CLIPS)
+    monkeypatch.setattr(AP, "_queue_rows", lambda root=None: [])
+    monkeypatch.setattr(K, "vod_to_rec", lambda v, a, b, rec, http=None: 3)
+    drafted = []
+    now = _kick_ts("2026-11-19T19:45:00Z")
+    out = K.catchup("kick:streamera", now - 3600, now, now=now,
+                    draft=lambda rec, login, m, wait_s=0: drafted.append((rec, login, m)) or {"id": "x"})
+    rec, login, m = drafted[0]
+    assert out == [{"id": "x"}] and login == "kick-streamera" and rec.endswith("runs/catchup-kick-streamera")
+    assert m["crowd_end"] == _kick_ts("2026-11-19T19:42:40.1Z") and m["source"].startswith("catch-up") and m["p"] == 0.0
+    assert m["game"] == "Grand Theft Auto VI"
+    # a draft already in the queue over that stretch: not drafted again
+    monkeypatch.setattr(AP, "_queue_rows", lambda root=None: [{"login": "kick-streamera", "start": m["start"],
+                                                                "stop": m["stop"]}])
+    assert K.catchup("kick:streamera", now - 3600, now, now=now, draft=lambda *a, **k: {"id": "y"}) == []
+    # the saved broadcast's video unreadable from here: one line, no crash, nothing queued
+    monkeypatch.setattr(AP, "_queue_rows", lambda root=None: [])
+    monkeypatch.setattr(K, "vod_to_rec", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("blocked")))
+    assert K.catchup("kick:streamera", now - 3600, now, now=now, draft=lambda *a, **k: {"id": "z"}) == []
+
+
+def test_autopilot_routes_kick_catchup_sweep_and_spikes_to_kick(monkeypatch):
+    from clipengine import autopilot as AP, kick as K, publish as PB, ops as O
+    calls = []
+    monkeypatch.setattr(K, "catchup", lambda src, a, b, keep=3, min_views=10, via="", **k: calls.append((src, keep, min_views, via)) or [{"id": "k"}])
+    monkeypatch.setattr(K, "catchup_spike", lambda sp: calls.append(("spike", sp["login"])) or [{"id": "s"}])
+    monkeypatch.setattr(PB, "creators", lambda: {"kick:streamera": {}})
+    monkeypatch.setattr(O, "config", lambda: {"sweep_keep": 2, "sweep_min_views": 25})
+    assert AP.catchup(0, 100) == [{"id": "k"}]
+    assert AP.sweep(0, 100) == [{"id": "k"}]
+    assert AP.catchup_spikes([{"login": "kick:streamera", "fire": 50, "start": 20, "stop": 60, "p": 0.9}]) == [{"id": "s"}]
+    assert calls == [("kick:streamera", 3, 10, "catch-up (saved stream)"), ("kick:streamera", 2, 25, "catch-up (sweep)"),
+                     ("spike", "kick:streamera")]
+
+
+def test_kick_check_ready_in_audio_mode_when_kick_refuses_chat(monkeypatch):
+    from clipengine import kick as K
+    monkeypatch.setattr(K, "category_streams", lambda *a, **k: {"ok": True, "via": "kick.com/stream/livestreams/en",
+                                                                "why": "", "rows": K.rows_from_listing(KICK_WEBSITE)})
+    monkeypatch.setattr(K, "live_status", lambda src, creds=None: {"live": True, "viewers": 800, "chatroom_id": 42,
+                                                                   "playback_url": "https://x.playback.live-video.net/m.m3u8"})
+    monkeypatch.setattr(K, "best_variant", lambda m, b: "https://x/v.m3u8")
+    monkeypatch.setattr(K.T, "http", lambda url, **k: (json.dumps(KICK_CLIPS).encode() if "/clips?" in url else
+                                                       b"#EXTINF:2.0,\ns.ts\n" if url.endswith(".m3u8") else b"\0" * 9))
+
+    class Refused:
+        def __init__(self, src, room):
+            self.total, self.connected, self.stop_flag = 0, False, False
+            self.why, self.audio_only = "Kick chat refused this client (pusher 4001)", True
+        def start(self):
+            pass
+    monkeypatch.setattr(K, "KickChat", Refused)
+    line = K.check_line(K.check("Grand Theft Auto VI", ["en"], seconds=5, sleep=lambda s: None))
+    assert line.startswith("kick-check: READY (audio mode)") and "chat ✓ refused by Kick" in line
+    assert "audio + viewers' clips mode" in line
+    monkeypatch.setattr(K, "best_variant", lambda m, b: (_ for _ in ()).throw(RuntimeError("HTTP Error 403")))
+    line = K.check_line(K.check("Grand Theft Auto VI", ["en"], seconds=5, sleep=lambda s: None))
+    assert line.startswith("kick-check: NOT READY") and "record ✗ 403" in line
+
+
+# ---- YouTube discovery: trimmed from YouTube's real live search page (Nov 19 2026), names replaced -----------
+YT_SEARCH_PAGE = '<html><script nonce="x">var ytInitialData = ' + '{"contents": {"twoColumnSearchResultsRenderer": {"primaryContents": {"sectionListRenderer": {"contents": [{"itemSectionRenderer": {"contents": [{"videoRenderer": {"videoId": "AAAAAAAAAA1", "title": {"runs": [{"text": "🔴PLAYING GTA 6 RIGHT NOW GET IN HERE!"}]}, "viewCountText": {"runs": [{"text": "145,637"}, {"text": " watching"}]}, "badges": [{"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_LIVE_NOW", "label": "LIVE"}}, {"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_SIMPLE", "label": "New"}}], "ownerText": {"runs": [{"text": "StreamerA", "navigationEndpoint": {"browseEndpoint": {"browseId": "UC0000000000000000000000", "canonicalBaseUrl": "/@StreamerA"}}}]}}}, {"videoRenderer": {"videoId": "AAAAAAAAAA2", "title": {"runs": [{"text": "PLAYING GTA 6 FOR THE FIRST TIME (PART 3)"}]}, "viewCountText": {"runs": [{"text": "57,521"}, {"text": " watching"}]}, "badges": [{"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_LIVE_NOW", "label": "LIVE"}}, {"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_SIMPLE", "label": "New"}}], "ownerText": {"runs": [{"text": "Streamer B Live", "navigationEndpoint": {"browseEndpoint": {"browseId": "UC0000000000000000000000", "canonicalBaseUrl": "/@StreamerB.Live"}}}]}}}, {"videoRenderer": {"videoId": "AAAAAAAAAA3", "title": {"runs": [{"text": "🔴GTA 6 | DÍA 2 MODO HISTORIA EN DIRECTO !!"}]}, "viewCountText": {"runs": [{"text": "33,691"}, {"text": " watching"}]}, "badges": [{"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_LIVE_NOW", "label": "LIVE"}}, {"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_SIMPLE", "label": "New"}}], "ownerText": {"runs": [{"text": "StreamerC", "navigationEndpoint": {"browseEndpoint": {"browseId": "UC0000000000000000000000", "canonicalBaseUrl": "/@StreamerC"}}}]}}}, {"videoRenderer": {"videoId": "AAAAAAAAAA4", "title": {"runs": [{"text": "Minecraft but chill"}]}, "viewCountText": {"runs": [{"text": "4,643"}, {"text": " watching"}]}, "badges": [{"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_LIVE_NOW", "label": "LIVE"}}, {"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_SIMPLE", "label": "New"}}], "ownerText": {"runs": [{"text": "StreamerD", "navigationEndpoint": {"browseEndpoint": {"browseId": "UC0000000000000000000000", "canonicalBaseUrl": "/@StreamerD"}}}]}}}, {"videoRenderer": {"videoId": "AAAAAAAAAA5", "title": {"runs": [{"text": "GTA 6 Is ACTUALLY HERE!!!"}]}, "viewCountText": {"runs": [{"text": "1,743"}, {"text": " watching"}]}, "badges": [{"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_LIVE_NOW", "label": "LIVE"}}, {"metadataBadgeRenderer": {"style": "BADGE_STYLE_TYPE_SIMPLE", "label": "New"}}], "ownerText": {"runs": [{"text": "StreamerE", "navigationEndpoint": {"browseEndpoint": {"browseId": "UC0000000000000000000000", "canonicalBaseUrl": "javascript:alert(1)"}}}]}}}, {"videoRenderer": {"videoId": "AAAAAAAAAA6", "title": {"runs": [{"text": "GTA 6 trailer reaction"}]}, "viewCountText": {"runs": [{"text": "12K views"}, {"text": " watching"}]}, "badges": [], "ownerText": {"runs": [{"text": "StreamerF", "navigationEndpoint": {"browseEndpoint": {"browseId": "UC0000000000000000000000", "canonicalBaseUrl": "/@StreamerF"}}}]}}}]}}]}}}}}' + ';</script></html>'
+YT_BOT_PAGE = '<html><body>Sign in to confirm you’re not a bot</body></html>'
+YT_API_SEARCH = {"items": [{"id": {"kind": "youtube#video", "videoId": "BBBBBBBBBB1"}},
+                           {"id": {"kind": "youtube#video", "videoId": "BBBBBBBBBB2"}}]}
+YT_API_VIDEOS = {"items": [
+    {"id": "BBBBBBBBBB1", "snippet": {"channelId": "UCa", "channelTitle": "Streamer A", "title": "GTA VI day 2 LIVE",
+                                      "liveBroadcastContent": "live", "defaultAudioLanguage": "en-US"},
+     "liveStreamingDetails": {"concurrentViewers": "8120", "actualStartTime": "2026-11-19T17:00:00Z"}},
+    {"id": "BBBBBBBBBB2", "snippet": {"channelId": "UCb", "channelTitle": "Streamer B", "title": "GTA 6 en vivo",
+                                      "liveBroadcastContent": "live", "defaultAudioLanguage": "es"},
+     "liveStreamingDetails": {"concurrentViewers": "9000"}}]}
+YT_API_CHANNELS = {"items": [{"id": "UCa", "snippet": {"customUrl": "@streamera"}},
+                             {"id": "UCb", "snippet": {"customUrl": "@streamerb"}}]}
+
+
+def test_youtube_live_search_page_rows():
+    from clipengine import youtube as Y
+    rows = Y.search_rows(YT_SEARCH_PAGE, ["en"])
+    # live + GTA 6 + English-looking titles only; a non-plain handle never becomes a command
+    assert [r["login"] for r in rows] == ["yt:@streamera", "yt:@streamerb.live"]
+    assert rows[0]["viewers"] == 145637 and rows[0]["platform"] == "yt" and rows[0]["lang"] == "en?"
+    assert rows[0]["video_id"] == "AAAAAAAAAA1"
+    assert "yt:@streamerc" in [r["login"] for r in Y.search_rows(YT_SEARCH_PAGE, None)]   # no language asked
+    assert Y._viewers("1.2K watching") == 1200 and Y._viewers("145,637 watching") == 145637
+    assert not Y.looks_english("بث مباشر GTA 6") and Y.looks_english("GTA 6 MARATHON DAY 2 🌴")
+    assert Y.bot_wall(YT_BOT_PAGE) and not Y.bot_wall(YT_SEARCH_PAGE)
+
+
+def test_youtube_category_streams_api_then_page_and_quiet_failure(monkeypatch):
+    import json as _json
+    from clipengine import youtube as Y
+    calls = []
+
+    def fake(url, data=None, headers=None, timeout=60, attempts=4):
+        calls.append(url)
+        if "googleapis.com/youtube/v3/search?" in url:
+            assert "eventType=live" in url and "key=k1" in url and "relevanceLanguage=en" in url
+            return _json.dumps(YT_API_SEARCH).encode()
+        if "/v3/videos?" in url:
+            return _json.dumps(YT_API_VIDEOS).encode()
+        if "/v3/channels?" in url:
+            return _json.dumps(YT_API_CHANNELS).encode()
+        if "youtube.com/results?" in url:
+            return YT_SEARCH_PAGE.encode()
+        raise AssertionError(url)
+    monkeypatch.setattr(Y.T, "http", fake)
+    r = Y.category_streams("GTA 6", ["en"], key="k1")
+    assert r["ok"] and r["via"] == "Data API" and [x["login"] for x in r["rows"]] == ["yt:@streamera"]
+    assert r["rows"][0]["viewers"] == 8120 and r["rows"][0]["lang"] == "en" and r["rows"][0]["started"]
+    r = Y.category_streams("GTA 6", ["en"])                          # no key: the plain live search page
+    assert r["ok"] and r["via"] == "live search page" and "search_query=GTA+6" in calls[-1]
+    assert Y.api_key({"YOUTUBE_API_KEY": " k "}) == "k" and Y.api_key({}) is None
+
+    def quota(url, **k):
+        if "googleapis" in url:
+            raise RuntimeError(f"request failed after retries: {url} (HTTP Error 403: Forbidden)")
+        return YT_BOT_PAGE.encode()
+    monkeypatch.setattr(Y.T, "http", quota)
+    r = Y.category_streams("GTA 6", ["en"], key="k1")
+    assert not r["ok"] and r["rows"] == [] and r["why"] == "Data API 403 (quota or key refused), bot check"
+
+
+def test_radar_lists_youtube_rows_cached_and_one_quiet_line(tmp_path, monkeypatch, capsys):
+    from clipengine import radar as R, youtube as Y, publish as PB, ops as O
+    monkeypatch.setattr(R, "YT_STATE", str(tmp_path / "yt.json"))
+    monkeypatch.setattr(R, "live_streams", lambda cfg: [])
+    monkeypatch.setattr(R, "category_clips", lambda cfg: [])
+    monkeypatch.setattr(R, "learned_weights", lambda: {})
+    monkeypatch.setattr(PB, "creators", lambda: {})
+    monkeypatch.setattr(PB, "load_clipped", lambda: [])
+    n = []
+    monkeypatch.setattr(Y, "category_streams", lambda *a, **k: n.append(1) or
+                        {"ok": True, "via": "live search page", "why": "", "rows": Y.search_rows(YT_SEARCH_PAGE, ["en"])})
+    cfg = {**R.config(), "act_score": 10, "kick": False}
+    monkeypatch.setattr(R, "config", lambda: cfg)
+    res = R.run(show=10)
+    out = capsys.readouterr().out
+    row = res["streamers"][0]
+    assert row["login"] == "yt:@streamera" and row["platform"] == "yt" and row["action"] == "start"
+    assert "  NEW  yt" in out and "-> python -m clipengine start --channel yt:@streamera" in out
+    assert res["youtube"] == "youtube: 2 live over 1,000 viewers (live search page)"
+    assert "yt:@streamera" in res["live_logins"]
+    res = R.run(show=10, quiet=True)                                     # within youtube_every_min: reused, not asked
+    assert len(n) == 1 and res["youtube"] == "youtube: 2 live over 1,000 viewers (live search page, cached)"
+    # failure: one quiet line, and no second ask until youtube_retry_min has passed
+    monkeypatch.setattr(R, "YT_STATE", str(tmp_path / "yt2.json"))
+    monkeypatch.setattr(Y, "category_streams", lambda *a, **k: n.append(1) or {"ok": False, "rows": [], "why": "bot check", "via": ""})
+    res = R.run(show=10)
+    out = capsys.readouterr().out
+    assert res["youtube"] == "youtube: bot check" and out.count("youtube:") == 1 and res["streamers"] == []
+    assert R.run(show=10, quiet=True)["youtube"].startswith("youtube: bot check — next try in") and len(n) == 2
+
+
+def test_youtube_sessions_one_line_each_in_sources(tmp_path, monkeypatch, capsys):
+    from clipengine import youtube as YT
+    path = str(tmp_path / "data" / "sources.jsonl")
+    monkeypatch.setattr(YT, "sources_file", lambda: path)
+    YT.log_session("yt:@streamera", 1_800_000_000.0, "audio-only", 0, "no live chat on this stream",
+                   now=1_800_000_060.0, drafts=0)
+    YT.log_session("yt:@streamerb", 1_800_000_100.0, "chat", 120, now=1_800_000_200.0, drafts=1)
+    YT.log_session("yt:@streamera", 1_800_000_000.0, "chat", 3412, now=1_800_004_500.0, drafts=2)   # rewritten in place
+    rows = [json.loads(l) for l in open(path)]
+    assert len(rows) == 2 and rows[0]["chat_msgs"] == 3412 and rows[0]["mode"] == "chat" and "why" not in rows[0]
+    lines = YT.sources_lines(rows, now=1_800_004_550.0)
+    assert lines[0].startswith("yt:@streamerb") and "chat (120 msgs)" in lines[0] and "1 draft(s)" in lines[0]
+    assert "1h15m  chat (3,412 msgs)  2 draft(s)  · live now" in lines[1]
+    YT.show_sources()
+    assert "SOURCES" in capsys.readouterr().out
+    # the reader logs only when it is the real one (a sentinel's), never a test's fetch-injected reader
+    assert YT.YouTubeChat("yt:@streamera").log_session and not YT.YouTubeChat("yt:@x", fetch=lambda u, d=None: b"").log_session
+    # drafts counted from the sentinel's queue since the session started (drops left out)
+    from clipengine import live as L
+    q = tmp_path / "runs" / f"sentinel-{L.source_name('yt:@streamera')}"
+    q.mkdir(parents=True)
+    q.joinpath("queue.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"id": "a", "at": "2027-01-15T08:01:00+00:00", "status": "new"},
+        {"id": "b", "at": "2027-01-15T08:02:00+00:00", "status": "dropped"},
+        {"id": "c", "at": "2020-01-01T00:00:00+00:00", "status": "new"}]))
+    monkeypatch.setattr(YT, "_repo", lambda: str(tmp_path))
+    assert YT.drafts_since("yt:@streamera", 1_800_000_000.0) == 1
+
+
+def test_subscriber_only_vods_are_remembered_and_treated_as_live_only(tmp_path, monkeypatch):
+    """A VOD playlist that answers 403 marks the creator in data/ (never config): the planner gives them a
+    full sentinel when live (like "vods": false); catch-up, the sweep and tier-1 spike drafts skip them quietly."""
+    from clipengine import autopilot as AP, ops as O, pipeline as P, publish as PB, tier1 as TR, vodaccess as VA
+    monkeypatch.setattr(VA, "PATH", str(tmp_path / "data" / "vod_access.json"))
+    monkeypatch.setattr(AP, "RUNS", str(tmp_path))
+    monkeypatch.setattr(AP.AT, "RUNS", str(tmp_path))
+    monkeypatch.setattr("clipengine.autopilot.policy", lambda l, roster=None: "allowed")
+    roster = {"streamera": {"vods": True}, "streamerb": {}}
+    monkeypatch.setattr(PB, "creators", lambda: roster)
+    monkeypatch.setattr(AP, "vods_overlapping", lambda l, s, u: [{"id": "222", "created": 0.0, "length_s": 7200,
+                                                                   "a": 100.0, "b": 900.0}])
+    events, scans = [], []
+    monkeypatch.setattr(AP.AT, "event", lambda *a, **k: events.append(a))
+
+    def scan(vod, out, a, b, top=12, probe=6):
+        scans.append(vod)
+        raise VA.SubOnlyVod(f"VOD {vod} is subscriber-only (playlist 403)")
+    monkeypatch.setattr(P, "scan", scan)
+    assert AP.catchup(0, 1000, ["streamerb"]) == []
+    assert events == [] and VA.restricted("streamerb") and not VA.restricted("streamera")
+    assert json.load(open(VA.PATH))["streamerb"]["vod"] == "222"
+    assert AP.catchup(0, 1000, ["streamerb"]) == [] and scans == ["222"]          # quiet: not even tried again
+    assert AP.catchup_targets(roster) == ["streamera"]                               # sweep + catch-up skip them
+    # the planner: a full sentinel the moment they're live, ahead of radar heat
+    rows = [{"login": "streamera", "action": "scan", "score": 90}, {"login": "streamerb", "action": "watch", "score": 5}]
+    assert O.plan_sentinels(rows, [], roster, 1) == ["streamerb"]
+    assert O.plan_sentinels(rows, [], roster, 1, restricted=set()) == ["streamera"]
+    # tier-1 spikes on them are not sent to the VOD path
+    monkeypatch.setattr(TR, "load_spikes", lambda since: [{"login": "streamerb", "fire": 10.0, "end": 20.0},
+                                                          {"login": "streamera", "fire": 10.0, "end": 20.0}])
+    assert [s["login"] for s in TR.spike_catchups({}, roster, 10_000.0, {})] == ["streamera"]
+    # entries expire, so a creator who opens their VODs again is noticed
+    assert not VA.restricted("streamerb", now=VA._load()["streamerb"]["at"] + (VA.RECHECK_DAYS + 1) * 86400)
+
+
+def test_vod_playlist_403_raises_subscriber_only(monkeypatch):
+    from clipengine import vodaccess as VA
+    monkeypatch.setattr(T, "gql", lambda q, v=None, **k: {"videoPlaybackAccessToken": {"value": "x", "signature": "y"}})
+
+    def http(url, *a, **k):
+        raise RuntimeError(f"request failed after retries: {url[:100]} (HTTP Error 403: Forbidden)")
+    monkeypatch.setattr(T, "http", http)
+    with pytest.raises(VA.SubOnlyVod):
+        T.playlists("123456789")
+    assert VA.is_restricted_error(VA.SubOnlyVod("x")) and not VA.is_restricted_error(RuntimeError("no chat"))
+
+
+def _tr(words, p=0.9, text=None):
+    return {"segments": [{"start": 0, "end": 1, "text": text or " ".join(words),
+                          "words": [{"w": w, "start": i * 0.4, "end": i * 0.4 + 0.3, "p": p} for i, w in enumerate(words)]}]}
+
+
+def test_transcribe_reruns_without_vad_when_loud_speech_comes_back_empty(monkeypatch):
+    """The VAD cuts a streamer talking under loud game audio: the first pass is gentler, and a loud clip with
+    too few words is re-run unfiltered — kept only if that run is clearly better and confident."""
+    from clipengine import audio as A
+    import numpy as np
+    loud = (0.3 * np.sin(np.arange(16000 * 12) * 0.05)).astype(np.float32)        # 12 s of loud "game"
+    calls = []
+
+    def whisper(x, model_name, offset, prompt, vad):
+        calls.append(vad)
+        return _tr([]) if vad else _tr("no way bro they took my car did you see that".split())
+    monkeypatch.setattr(A, "_whisper", whisper)
+    tr = A.transcribe(loud, "small", prompt=None)
+    assert calls == [A.VAD_GENTLE, False] and tr["pass"] == "no-vad" and len(A.real_words(tr)) == 11
+    assert A.VAD_GENTLE["threshold"] < 0.5 and A.VAD_GENTLE["speech_pad_ms"] > 400   # gentler than the defaults
+    # quiet clip: no second pass; enough words: no second pass
+    calls.clear()
+    A.transcribe(np.zeros(16000 * 12, np.float32), "small", prompt=None)
+    assert calls == [A.VAD_GENTLE]
+    monkeypatch.setattr(A, "_whisper", lambda x, m, o, p, vad: calls.append(vad) or _tr(["word"] * 20))
+    calls.clear()
+    assert A.transcribe(loud, "small", prompt=None)["pass"] == "vad" and calls == [A.VAD_GENTLE]
+    # an unfiltered run that hallucinates (outro phrases / low confidence) is thrown away
+    assert not A.better_pass(_tr([]), _tr("thanks for watching please subscribe and hit like".split()))
+    assert not A.better_pass(_tr([]), _tr("uh the the a of it so".split(), p=0.3))
+    assert A.better_pass(_tr(["oh"]), _tr("he just jumped off the bridge".split()))
+
+
+def test_speech_under_game_audio_is_transcribed():
+    """Synthetic speech 9 dB under a synthetic game bed (tests/fixtures/make_speech_fixture.py): the old
+    default VAD returned no words at all; the gentle pass + unfiltered retry recovers the line."""
+    from clipengine import audio as A
+    try:
+        A.model("small")
+    except Exception:
+        pytest.skip("Whisper small not cached (bash setup/setup.sh)")
+    x = A.decode_pcm(os.path.join(ROOT, "tests", "fixtures", "speech_under_game.ogg"))
+    script = {"bro", "car", "see", "that", "jumped", "off", "bridge", "with", "the", "right", "now", "run", "get", "in", "boat"}
+    for attempt in range(2):     # Whisper's temperature fallback samples: ~1 run in 8 the retry is noise (and is rejected)
+        got = A.real_words(A.transcribe(x, "small"))
+        words = {w["w"].strip(" ,.!?").lower() for w in got}
+        if len(got) >= 12 and len(words & script) >= 6:
+            break
+    assert len(got) >= 12 and len(words & script) >= 6, words
+
+
+def test_unchecked_creator_gets_one_webcam_suggestion_a_day(tmp_path, monkeypatch):
+    """A creator with no "facecam" setting: the sentinel's first minutes give ONE attention item a day with a
+    detected + refined box and a check image; config is never written."""
+    from clipengine import attention as AT, facecam as FC
+    import numpy as np
+    if not FC.available():
+        pytest.skip("opencv missing")
+    creators = tmp_path / "creators.json"
+    creators.write_text(json.dumps({"creators": {"streamera": {}, "streamerb": {"facecam": [0, 0, 0.3, 0.3]},
+                                                 "streamerc": {"facecam": False}}}))
+    monkeypatch.setattr(FC, "CREATORS", str(creators))
+    assert FC.unchecked("streamera") and not FC.unchecked("streamerb") and not FC.unchecked("streamerc")
+    assert not FC.unchecked("nobody")
+    rng = np.random.default_rng(1)
+    frames = []
+    for _ in range(6):                                          # a bordered webcam over changing "gameplay"
+        f = rng.integers(0, 255, (FC.WORK_H, FC.WORK_W, 3), dtype=np.uint8)
+        f[40:200, 40:300] = 255
+        f[44:196, 44:296] = rng.integers(0, 255, (152, 252, 3), dtype=np.uint8)
+        frames.append(f)
+    calls = []
+
+    def detect(rec, minutes, n):
+        calls.append((minutes, n))
+        return {"box": [0.04, 0.07, 0.28, 0.3], "confidence": 0.9}, "streamera", frames
+    state = str(tmp_path / "suggest.json")
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    now = 1_763_500_000.0
+    sug = FC.suggest("streamera", str(rec), now=now, state_path=state, detect=detect)
+    assert calls == [(3.0, 24)] and len(sug["box"]) == 4 and os.path.exists(sug["check_image"])
+    assert sug["text"].startswith("streamera: suggested webcam box [") and "then add it to config/creators.json" in sug["text"]
+    assert FC.suggest("streamera", str(rec), now=now + 3600, state_path=state, detect=detect) is None   # once a day
+    assert len(calls) == 1
+    assert FC.suggest("streamera", str(rec), now=now + 86400, state_path=state, detect=detect)          # next day again
+    assert json.loads(creators.read_text())["creators"]["streamera"] == {}                            # config untouched
+    low = lambda r, m, n: ({"box": [0.1, 0.1, 0.2, 0.2], "confidence": 0.2}, None, frames)
+    assert FC.suggest("streamerd", str(rec), now=now, state_path=state, detect=low) is None             # not confident
+    AT.event("setup", sug["text"], key="facecam:streamera:x", root=str(tmp_path))
+    assert "🎥 streamera: suggested webcam box" in AT.line(root=str(tmp_path))
+
+
+def _frames(kind, n=120, seed=3):
+    import numpy as np
+    from clipengine import vision as VI
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:VI.H, 0:VI.W]
+    base = (120 + 70 * np.sin(xx / 5.0) + 30 * np.cos(yy / 4.0)).astype(np.float32)   # a textured scene
+    out = []
+    for i in range(n):
+        if kind == "menu":                       # one still screen
+            f = base.copy()
+        elif kind == "dark":
+            f = base * 0.08 + rng.normal(0, 4, base.shape)
+        else:                                    # gameplay: the picture keeps moving
+            f = np.roll(base, i, axis=1) + rng.normal(0, 2, base.shape)
+        out.append(np.clip(f, 0, 255).astype(np.uint8))
+    return np.array(out)
+
+
+def test_liveliness_tells_menus_and_dark_screens_from_gameplay():
+    from clipengine import vision as VI
+    play, menu, dark = (VI.live_features(_frames(k), 4.0) for k in ("play", "menu", "dark"))
+    assert play["motion"] > 8 and play["still"] == 0 and menu["still"] == 1.0 and menu["motion"] == 0
+    assert VI.liveliness(play) >= 0.85 and VI.liveliness(menu) == 0.0 and VI.liveliness(dark) < 0.2
+    assert VI.analyse_live(play)["flags"] == []
+    mf = VI.analyse_live(menu)["flags"]
+    assert any(f.startswith(("static (", "menu/map")) for f in mf) and any(f.startswith("dull picture") for f in mf)
+    assert any(f.startswith("dark (") for f in VI.analyse_live(dark)["flags"])
+    # a menu that opens and closes again is flicker, not a scene cut
+    import numpy as np
+    fr = _frames("play")
+    fr[40] = 10                                  # a one-frame flash
+    lf = VI.live_features(fr, 4.0)
+    assert lf["flicker_pm"] > 0 and lf["cuts_pm"] == 0
+    assert VI.combine(["cutscene? (12 shot cuts/min)", "static (menu/map/pause?)"], {"flags": ["dull picture (liveliness 0.10)"]}) == \
+        ["cutscene? (12 shot cuts/min)", "dull picture (liveliness 0.10)"]
+
+
+def test_dull_picture_and_nothing_happening_cut_the_engine_score():
+    from clipengine import grade as G
+    sig = {"chat_score": 4.0, "audio_factor": 1.0, "age_h": 0.0, "flags": [], "reaction": 0.0,
+           "speech": {"streamer_s": 12.0, "dur": 30.0, "game_share": 0.0, "game_dialogue": False}}
+    lively = G.engine_score({**sig, "liveliness": 0.95})["score"]
+    assert lively == G.engine_score(sig)["score"]                           # no picture measure: unchanged
+    menu = G.engine_score({**sig, "liveliness": 0.0, "flags": ["menu/map screens (80% of frames)"]})
+    assert menu["score"] < 0.15 * lively and any("dull picture" in w for w in menu["why"])
+    # plain driving: lively picture, but no streamer talk, reaction, chat or viewers
+    quiet = {**sig, "chat_score": 0.5, "liveliness": 0.95,
+             "speech": {"streamer_s": 2.0, "dur": 30.0, "game_share": 0.0, "game_dialogue": False}}
+    q = G.engine_score(quiet)
+    assert any("nothing happening" in w for w in q["why"])
+    assert not any("nothing happening" in w for w in G.engine_score({**quiet, "crowd_vpm": 20})["why"])   # viewers clip it
+    assert not any("nothing happening" in w for w in G.engine_score({**quiet, "reaction": 0.8})["why"])   # they scream
+    # the render's frame checks don't double a category the source frames already flagged
+    assert G.merge_vision_flags(["static (menu/map/pause?)"], ["static (menu/map/pause?)", "cutscene? (12 shot cuts/min)"]) == \
+        ["static (menu/map/pause?)", "cutscene? (12 shot cuts/min)"]
+    assert "pic .95" in G.parts_line(G.engine_score({**sig, "liveliness": 0.95}), {**sig, "liveliness": 0.95})
+
+
+def _queue_with_words(tmp_path, did="streamera-120000", words=None, **extra):
+    rec = tmp_path / "streamera-live"
+    rec.mkdir(exist_ok=True)
+    wf = rec / f"{did}.words.json"
+    wf.write_text(json.dumps({"words": words or [
+        {"w": " no", "start": 10.0, "end": 10.3, "spk": "streamer"}, {"w": " way", "start": 10.4, "end": 10.7, "spk": "streamer"},
+        {"w": " Jason,", "start": 12.0, "end": 12.4, "spk": "game"}, {"w": " run", "start": 12.5, "end": 12.8, "spk": "game"}]}))
+    e = {"id": did, "login": "streamera", "rec": str(rec), "start": 9.0, "stop": 30.0, "at": "2026-11-19T12:00:00+00:00",
+         "status": "new", "engine": 50, "best": 70, "words": str(wf), "speakers": {"streamer_s": 0.7, "other_s": 0.0,
+         "game_s": 0.8, "game_share": 0.53, "backend": "wespeaker"}, **extra}
+    with open(rec / "queue.jsonl", "a") as fh:
+        fh.write(json.dumps(e) + "\n")
+    return e
+
+
+def test_audit_speakers_shows_tagged_stretches_and_counts_verdicts(tmp_path, monkeypatch, capsys):
+    from clipengine import judge as JG
+    monkeypatch.setattr(JG, "DATA", str(tmp_path / "data"))
+    _queue_with_words(tmp_path)
+    _queue_with_words(tmp_path, "streamera-120500")
+    got = JG.audit_speakers(20, root=str(tmp_path))
+    out = capsys.readouterr().out
+    assert [s["spk"] for s in got[0]["stretches"]] == ["streamer", "game"]
+    assert "«no way»" in out and "«Jason, run»" in out and "none marked yet" in out
+    JG.mark_speakers("streamera-120000", "right", root=str(tmp_path))
+    JG.mark_speakers("streamera-120500", "wrong", root=str(tmp_path))
+    JG.mark_speakers("streamera-120500", "right", root=str(tmp_path))        # the latest verdict counts
+    assert JG.speaker_accuracy() == (2, 2)
+    assert "2/2 drafts marked right (100%)" in JG.accuracy_line()
+    with pytest.raises(SystemExit):
+        JG.mark_speakers("streamera-120000", "maybe", root=str(tmp_path))
+
+
+@pytest.mark.parametrize("transcript,titles,chat", [
+    ("I'm the prison wife in this scene.", [], []),
+    ("what just happened", ["TWEEKING in the hallway"], []),
+    ("wait a second", [], ["gyat", "🍑", "thong"] + ["wow"] * 40),
+])
+def test_synthetic_sexual_safety_pack_stays_out_of_default_queue(tmp_path, capsys, transcript, titles, chat):
+    import json
+    import time
+    from clipengine import safety, sentinel
+
+    result = safety.screen(transcript, titles, chat)
+    assert result["flagged"]
+    rec = tmp_path / "draft"; rec.mkdir()
+    row = {"id": "neutral-1", "status": "new", "start": time.time() - 30, "stop": time.time(),
+           "best": 99, "unsafe": result["why"]}
+    (rec / "queue.jsonl").write_text(json.dumps(row) + "\n")
+    assert sentinel.show_queue(str(tmp_path)) == []
+    sentinel.show_queue(str(tmp_path), all_=True)
+    assert "frames unassessed" in capsys.readouterr().out
+
+
+def test_exact_headline_amount_blocks_the_drop_and_override_is_logged(tmp_path, monkeypatch):
+    import datetime as dt
+    import json
+    from clipengine import judge, publish, safety
+
+    text = "the offer was five hundred and twenty-seven"
+    assert safety.headline_support("Streamera won $527", text, ["won"], names=["streamera"]) == []
+    assert safety.headline_support("Streamera won $507", text, ["won"], names=["streamera"]) == ["507"]
+    monkeypatch.setenv("CLIPENGINE_NO_AUDIT", "1")
+    monkeypatch.setattr(judge, "DATA", str(tmp_path))
+    drops = []
+    monkeypatch.setattr(publish, "drop", lambda *args, **kw: drops.append(args))
+    monkeypatch.setattr(publish, "record_clipped", lambda *args: None)
+    monkeypatch.setattr(publish.GT, "decide", lambda *a, **kw: {"youtube": {"action": "now", "at": None}})
+    monkeypatch.setattr(publish.GT, "summary", lambda *a: "youtube")
+    out = tmp_path / "clip.mp4"
+    (tmp_path / "clip.transcript.json").write_text(json.dumps({"segments": [{"start": 1, "text": text}]}))
+    rep = {"out": str(out), "pre_vision": {"cuts_per_min": 0, "static": 0, "dark": 0, "flags": []}}
+    args = (rep, "streamera", "source", 0, 20, dt.datetime.now(dt.timezone.utc), "Streamera won $507",
+            "line", None, None, True, True, False, False, {"titles": ["won"]}, ["hook"], None, True)
+    with pytest.raises(SystemExit, match="unsupported headline claims: 507"):
+        publish._finish(*args)
+    assert not drops and not (tmp_path / "judged.jsonl").exists()
+    publish._finish(*args, truth_override="The amount is visible on the receipt.")
+    row = json.loads((tmp_path / "judged.jsonl").read_text())
+    assert drops and row["verdict"] == "ship" and row["truth_override"] == "The amount is visible on the receipt."
+
+
+def test_judged_examples_count_unique_calls_and_save_frames(tmp_path, monkeypatch, capsys):
+    import time
+    from PIL import Image
+    from clipengine import judge
+
+    monkeypatch.setattr(judge, "DATA", str(tmp_path))
+    sheet = tmp_path / "sheet.jpg"
+    Image.new("RGB", (1280, 360), "navy").save(sheet)
+    row = {"id": "neutral-1", "start": 0, "stop": 25, "engine": 78, "best": 87, "sheet": str(sheet),
+           "judgment": {"engine": 78, "speech_s": 1, "duration_s": 25, "reaction": 0.9,
+                        "parts": {"chat": 0.9, "audio": 0.7, "crowd": 0.1}}}
+    result = judge.record(row, "drop", "menu")
+    assert len(result["frames"]) == 3
+    with Image.open(tmp_path / result["frames"][0]) as frame:
+        assert frame.height <= 240
+    for i in range(2, 4):
+        judge.record({**row, "id": f"neutral-{i}"}, "drop", "Menu")
+    judge.record(row, "drop", "menu")
+    assert judge.recurring_reasons(time.time()) == ["menu"]
+    assert judge.eval_judge()["low speech"] == {"count": 3, "correct": 0, "agreement": 0}
+    assert "reaction 0.9" in capsys.readouterr().out
+
+
+def test_creator_vocab_drives_prompt_and_reference_audit(tmp_path, monkeypatch):
+    import json
+    from clipengine import audio, judge, sentinel
+
+    config = tmp_path / "config"; config.mkdir()
+    monkeypatch.setattr(audio, "REPO", str(tmp_path))
+    (config / "creators.json").write_text(json.dumps({"creators": {"streamera": {"vocab": ["velocity"]}}}))
+    assert audio.vocab_prompt(login="StreamerA").startswith("velocity,")
+    words = tmp_path / "words.json"
+    words.write_text(json.dumps({"words": [{"w": "velocitty", "start": 1, "end": 2}]}))
+    rows = [{"id": "neutral-1", "login": "streamera", "start": 0, "stop": 3, "words": str(words)}]
+    monkeypatch.setattr(sentinel, "load_queue", lambda *a: rows)
+    refs = tmp_path / "reference.json"
+    refs.write_text(json.dumps({"neutral-1": "velocity"}))
+    result = judge.audit_words(reference=str(refs))
+    assert result["estimated_mishearings"] == 1
+    assert result["error_rate"] == 100
+
+
+def test_censor_audit_keeps_a_regression_list(tmp_path, monkeypatch):
+    import json
+    from clipengine import censor, judge
+
+    monkeypatch.setattr(judge, "DATA", str(tmp_path))
+    (tmp_path / "clip.transcript.json").write_text(json.dumps({"segments": [{"text": "ass and shit"}]}))
+    assert not censor.audit(str(tmp_path / "clip.mp4"), listen=False)["ok"]
+    words = {row["word"] for row in judge._rows(str(tmp_path / "censor_caught.jsonl"))}
+    assert words == {"ass", "shit"}
+    tracked = judge._rows(judge._path("censor_caught.jsonl"))
+    assert all(censor.censor_text(row["word"]) == "***" for row in tracked)
+
+
+def test_all_local_censor_audit_catches_still_get_masked():
+    from clipengine import censor, judge
+
+    caught = {r["word"] for r in judge._rows(judge._path("censor_caught.jsonl"))}
+    assert all(censor.censor_text(word) == "***" for word in caught | {"ass", "shit"})
+
+
+def test_post_verification_rejects_wrong_author_and_recovers_attention(tmp_path, monkeypatch):
+    import json
+    from clipengine import attention, handpost, verify
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.setattr(handpost, "REPO", str(tmp_path))
+    monkeypatch.setattr(handpost, "_sync", lambda *a: None)
+    monkeypatch.setattr(verify, "account", lambda platform: ("neutralchannel", ""))
+    observed = []
+
+    def oembed(url):
+        observed.append(parse_qs(urlsplit(url).query)["url"][0])
+        if "tiktok" in urlsplit(url).hostname:
+            return {"author_unique_id": "neutralchannel"}
+        return {"author_url": "https://www.youtube.com/@wrong", "author_name": "neutralchannel"}
+
+    monkeypatch.setattr(verify, "_json", oembed)
+    root = str(tmp_path / "runs")
+    with pytest.raises(SystemExit, match="author does not match"):
+        handpost.mark("one", "youtube", "https://youtu.be/cut")
+    assert not (tmp_path / "ledger.jsonl").exists()
+    assert attention.pending(root)[0]["kind"] == "overdue"
+    assert observed == ["https://www.youtube.com/watch?v=cut"]
+    with pytest.raises(SystemExit, match="confirm it's @neutralchannel"):
+        handpost.mark("one", "instagram", "https://instagram.com/reel/cut/")
+    assert not (tmp_path / "ledger.jsonl").exists()
+    handpost.mark("one", "instagram", "https://instagram.com/reel/cut/", confirmed=True)
+    handpost.mark("one", "tiktok", "https://www.tiktok.com/@neutralchannel/video/123")
+    assert [p["verified_by"] for p in handpost._ledger()] == ["operator-confirmed", "oembed"]
+    assert len(attention.pending(root)) == 1
+    with pytest.raises(ValueError, match="HTTPS"):
+        verify.post("youtube", "https://youtube.com@other.invalid/shorts/cut")
+    ledger = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert all(row.get("url") for row in ledger)
+
+
+def test_imported_post_blocks_overlapping_renamed_moment_across_sources(tmp_path, monkeypatch):
+    import datetime as dt
+    import json
+    from clipengine import handpost, moments, publish
+
+    monkeypatch.setattr(handpost, "REPO", str(tmp_path))
+    monkeypatch.setattr(handpost, "_sync", lambda *a: None)
+    monkeypatch.setattr(publish, "REPO", str(tmp_path))
+    monkeypatch.setattr(publish, "CLIPPED", str(tmp_path / "clipped.jsonl"))
+    import_file = tmp_path / "other.jsonl"
+    moment = 1_800_000_000.0
+    import_file.write_text(json.dumps({"slug": "original", "creator": "streamera", "moment_at": moments.iso(moment),
+                                       "links": {"youtube": "https://youtu.be/cut"}}))
+    assert moments.import_posts(str(import_file)) == 1
+    assert moments.import_posts(str(import_file)) == 0
+    assert not moments.match("streamera", moment + 61, moment + 90, handpost._ledger())
+    assert not moments.match("streamerb", moment + 1, moment + 6, handpost._ledger())
+    monkeypatch.setenv("CLIPENGINE_NO_AUDIT", "1")
+    monkeypatch.setattr(publish.GT, "decide", lambda *a, **k: {"youtube": {"action": "now", "at": None}})
+    monkeypatch.setattr(publish, "drop", lambda *a, **k: pytest.fail("a duplicate entered the outbox"))
+    (tmp_path / "clip.transcript.json").write_text('{"segments":[{"start":1,"text":"made it"}]}')
+    rep = {"out": str(tmp_path / "clip.mp4"),
+           "pre_vision": {"cuts_per_min": 0, "static": 0, "dark": 0, "flags": []}}
+    with pytest.raises(SystemExit, match="already posted as original"):
+        publish._finish(rep, "StreamerA", "different_vod", 24, 44, dt.datetime.fromtimestamp(moment + 25, dt.timezone.utc),
+                        "StreamerA MADE IT", "line", None, "different", True, True, False, False,
+                        {}, ["hook"], taste=True, clock_window=(moment + 10, moment + 30))
+
+
+def test_facecam_setup_writes_only_an_explicit_valid_decision(tmp_path, monkeypatch):
+    import json
+    from clipengine import facecam
+
+    target = tmp_path / "creators.json"
+    monkeypatch.setattr(facecam, "CREATORS", str(target))
+    monkeypatch.setattr(facecam, "available", lambda: True)
+    monkeypatch.setattr(facecam, "from_channel", lambda login: ({"box": None}, []))
+    assert not facecam.setup_channel("streamera")
+    assert not target.exists()
+    with pytest.raises(SystemExit, match="fit inside"):
+        facecam.setup_channel("streamera", approved="0.9,0.1,0.5,0.2")
+    assert facecam.setup_channel("streamera", approved="0.1,0.1,0.5,0.2")
+    assert json.loads(target.read_text())["creators"]["streamera"]["facecam"] == [0.1, 0.1, 0.5, 0.2]
+    assert facecam.setup_channel("streamera", no_camera=True)
+    assert json.loads(target.read_text())["creators"]["streamera"]["facecam"] is False
+
+
+def test_phone_review_is_self_contained_and_marks_the_draft_seen(tmp_path):
+    import json
+    from PIL import Image
+    from pathlib import Path
+    from clipengine import review, sentinel
+
+    rec = tmp_path / "stream"; rec.mkdir()
+    sheet = rec / "sheet.jpg"
+    Image.new("RGB", (60, 80), "navy").save(sheet)
+    token_file = rec / "words.json"
+    token_file.write_text(json.dumps({"words": [{"w": "<script>alert(1)</script>", "start": 11, "end": 12, "spk": "streamer"}]}))
+    row = {"id": "neutral-1", "rec": str(rec), "start": 10, "stop": 27, "payoff": 19,
+           "sheet": str(sheet), "words": str(token_file), "status": "new"}
+    (rec / "queue.jsonl").write_text(json.dumps(row))
+    page = Path(review.draft_page(row, "They ALMOST MADE IT")).read_text()
+    assert "<script>" not in page and "data:image/jpeg;base64," in page
+    assert "Payoff +9.0s" in page and "frames unassessed" in page and "streamer" in page
+    assert sentinel.load_queue(str(tmp_path))[0]["seen_at"]
+
+
+@pytest.mark.parametrize("layout", ["stack", "facecam", "single"])
+def test_public_layout_matches_the_reference(tmp_path, layout):
+    from tools import golden
+    frame = golden.render_frame(tmp_path, layout)
+    golden.compare_frame(frame, golden.OUTPUT / f"{layout}.png")
+
+
+def test_daily_brief_uses_observed_timings_holes_and_misses(tmp_path, monkeypatch):
+    import json
+    from clipengine import attention, moments, scouts, support
+
+    now = 1_800_000_000.0
+    iso = moments.iso
+    rec = tmp_path / "runs" / "sentinel-streamera"; rec.mkdir(parents=True)
+    (rec / "segments").mkdir(); (rec / "segments" / "segment.ts").write_bytes(b"sample")
+    (rec / "index.jsonl").write_text("\n".join(json.dumps(row) for row in [
+        {"t": now - 900, "d": 4, "f": "segment.ts"},
+        {"t": now - 500, "d": 24, "gap": "Twitch ad break"},
+        {"t": now - 400, "d": 6, "gap": "brief reconnect"}]))
+    (rec / "drafts").mkdir()
+    (rec / "drafts" / "draft-a.pre.json").write_text(json.dumps({"at": now - 240}))
+    draft = {"id": "draft-a", "login": "streamera", "engine": 84, "rec": str(rec), "start": now - 450, "stop": now - 425,
+             "at": iso(now - 440), "drafted_at": iso(now - 350), "seen_at": iso(now - 230), "judged_at": iso(now - 180),
+             "pre": str(rec / "drafts" / "draft-a.pre.mp4"), "status": "published", "slug": "winner"}
+    (rec / "queue.jsonl").write_text(json.dumps(draft))
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "creators.json").write_text(json.dumps({"creators": {"streamera": {}, "streamerb": {}}}))
+    (tmp_path / "config" / "sentinel_model.json").write_text(json.dumps(
+        {"eval": {"held_out_recall_top10": 0.65, "false_fires_per_hour": 3.0}}))
+    (tmp_path / "ledger.jsonl").write_text(json.dumps(
+        {"platform": "youtube", "status": "live", "slug": "winner", "at": iso(now - 160)}))
+    (tmp_path / "runs" / "autopilot.json").write_text(json.dumps(
+        {"deaths": [{"at": now - 1000, "dark_from": now - 2200, "cause": "restart failed"}]}))
+    attention.event("failure", "live-only start missed 5 s", key="missed:example", now=now - 500, root=str(rec.parent))
+    scouts.remember([{"slug": "sample-a", "login": "streamera", "title": "Watch that!", "t": now - 325, "views": 50, "duration": 24},
+                     {"slug": "sample-b", "login": "streamerb", "title": "Watch this!", "t": now - 600, "views": 80, "duration": 36}],
+                    now, str(rec.parent))
+    monkeypatch.setattr(support, "REPO", str(tmp_path))
+    out = support.report_text(1, now)
+    assert out.startswith("Posted 1 clip") and "biggest miss was a viewer clip from streamerb with 80 views" in out
+    assert "first 100% (target ≥50%)" in out and "live recall 50%" in out and "train 65% at 3 false/h" in out
+    assert "moment→draft 1.5m" in out and "render→live 1.3m" in out
+    assert "1 seen · 1 judged · 1 posted" in out
+    assert "24s (Twitch ad break)" in out and "brief reconnect" not in out
+    assert "oldest re-cuttable" in out and "late: live-only start" in out
+    assert "20m dark" in out and "causes: restart failed" in out
+    assert "category shapes: 2 fastest viewer clips" in out and "30s median" in out
+    assert "rights evidence: 2" in out and len(out.splitlines()) <= 12
+
+
+def test_unmeasured_old_posts_get_an_overdue_analytics_item(tmp_path, monkeypatch):
+    import json
+    from clipengine import attention, handpost, moments, ops
+
+    now = 1_800_000_000.0
+    monkeypatch.setattr(handpost, "REPO", str(tmp_path))
+    monkeypatch.setattr(handpost, "enabled", lambda: False)
+    ledger = [{"platform": "youtube", "slug": "cut", "status": "live", "at": moments.iso(now - 10 * 86400)}]
+    (tmp_path / "ledger.jsonl").write_text(json.dumps(ledger[0]))
+    items = ops._attention_items([], {}, {}, now)
+    assert items == [{"kind": "overdue", "key": "measure:cut:youtube", "text": "measure cut on youtube"}]
+    assert "clipengine to-measure" in attention.line(items)
+    assert handpost.show_measure(now)[0]["missing"]
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "performance.jsonl").write_text(json.dumps(
+        {"slug": "cut", "platform": "youtube", "views": 10, "checked_at": moments.iso(now - 10)}))
+    assert not ops._attention_items([], {}, {}, now)
+
+
+def test_house_queue_uses_best_angle_without_hiding_other_moments():
+    from clipengine import scouts
+
+    rows = [{"id": "a-1", "login": "streamera", "start": 900, "stop": 940, "payoff": 920, "best": 74},
+            {"id": "b-1", "login": "streamerb", "start": 925, "stop": 965, "payoff": 945, "best": 83},
+            {"id": "a-2", "login": "streamera", "start": 1100, "stop": 1140, "payoff": 1120, "best": 79}]
+    roster = {login: {"house": "studio"} for login in ("streamera", "streamerb")}
+    grouped = scouts.group_angles(rows, roster, [])
+    assert [r["id"] for r in grouped] == ["b-1", "a-2"]
+    assert grouped[0]["angles"] == ["b-1", "a-1"] and grouped[0]["angle_urgent"]
+
+
+def test_weekly_forecast_records_evidence_then_scores_future_reads(tmp_path):
+    from clipengine import learn
+
+    now = 1_800_000_000
+    dest = str(tmp_path / "predictions.jsonl")
+    changes = [{"login": "streamera", "previous": 1, "weight": 1.2, "reads": 5, "judged": 1, "failed": 0,
+                "median_quality": 1.4, "median_shares": 7, "median_watch_s": 15}]
+    added = learn.update_forecasts(dest, changes, [], now)
+    assert added[0]["expected"] == "above median" and added[0]["evidence"]["reads"] == 5
+    assert "15s" in learn.change_line(changes[0])
+    assert not learn.update_forecasts(dest, changes, [], now + 60)
+    outcomes = [{"login": "streamera", "posted_at": now + 60, "quality": 1.4},
+                {"login": "streamera", "posted_at": now - 60, "quality": 0.1}]
+    scored = learn.update_forecasts(dest, [], outcomes, now + 8 * 86400)
+    assert scored[0]["result"] == "right" and scored[0]["samples"] == 1
+    assert "1 right" in learn.forecast_summary(dest, now + 8 * 86400)
+
+
+def test_program_forecast_uses_rolling_views_and_names_owner_task(tmp_path):
+    import json
+    from clipengine import brief, moments
+
+    now = 1_800_000_000.0
+    iso = moments.iso
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "followers.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"platform": "tiktok", "at": iso(now - 7 * 86400), "followers": 9700},
+        {"platform": "tiktok", "at": iso(now - 60), "followers": 9950}]))
+    ledger = [{"platform": "tiktok", "slug": "cut", "at": iso(now - 5 * 86400)}]
+    perf = [{"platform": "tiktok", "slug": "cut", "checked_at": iso(now - 60), "views": 115000}]
+    line, tasks = brief.money(tmp_path, now, ledger, perf)
+    assert "9,950/10k followers + 115,000/100k views (30d)" in line
+    assert "tiktok ~2d" in line
+    assert tasks and tasks[0].startswith("Owner: TikTok Studio")

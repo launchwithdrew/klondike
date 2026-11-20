@@ -400,6 +400,14 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
     windows = posting_windows(by_hour, tz, gcfg.get("prime_hours", GT.DEFAULTS["prime_hours"]))
     summary = explain(previous, streamers, thresholds, windows, tst, ratio, evidence, clipped, creators, titles)
     report.insert(0, summary)
+    changes = forecast_rows(previous, streamers, ratio, evidence, clipped, creators, tst)
+    forecasts = []
+    for (slug, platform), row in snaps.items():
+        login = login_for(slug, clipped, creators)
+        posted = live_at.get((slug, platform))
+        median = cp_med.get("24h", {}).get(platform)
+        if login and posted is not None and median and median.get("views"):
+            forecasts.append({"login": login, "posted_at": posted, "quality": quality(row, median)[0]})
     return {"updated": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(), "target_age_h": TARGET_AGE_H,
             "summary": summary, "formats": formats, "windows": windows, "parts": judge_parts,
             "taste": {l: d for l, d in tst.items() if d["factor"] < 1.0},
@@ -409,7 +417,7 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
             "checkpoints": {c: {p: round(m, 1) for p, m in ms.items()} for c, ms in cp_medians.items()},
             "streamers": streamers, "streamer_posts": {l: len(v) for l, v in per_login.items()},
             "fit": fit, "thresholds": thresholds, "thresholds_changed_at": changed_at,
-            "headlines": headlines, "report": report}
+            "headlines": headlines, "report": report, "weight_changes": changes, "_forecast_samples": forecasts}
 
 
 def explain(previous: dict, streamers: dict, thresholds: dict, windows: dict, tst: dict, ratio: dict,
@@ -470,8 +478,103 @@ def run(write: bool = True) -> dict:
         print(f"  {login:<16} {f:.2f}× our median")
     for line in res["report"]:
         print("  " + line)
+    for row in res["weight_changes"]:
+        print("  " + change_line(row))
+    forecasts = res.pop("_forecast_samples")
     if write:
         os.makedirs(os.path.dirname(WEIGHTS), exist_ok=True)
+        path = os.path.join(os.path.dirname(WEIGHTS), "predictions.jsonl")
+        for row in update_forecasts(path, res["weight_changes"], forecasts, _ts(res["updated"])):
+            if row["kind"] == "forecast":
+                print(f"  next 7 days: {row['login']} {row['expected']} at 24h")
+            else:
+                print(f"  forecast scored: {row['login']} {row['result']} ({row['samples']} reads)")
         json.dump(res, open(WEIGHTS, "w"), indent=1)
         print(f"wrote {os.path.relpath(WEIGHTS, REPO)}")
     return res
+
+
+def forecast_rows(previous: dict, streamers: dict, ratios: dict, evidence: dict, clipped: dict,
+                  creators: dict, tastes: dict) -> list[dict]:
+    changes = []
+    old = previous.get("streamers") or {}
+    readings = {}
+    for (slug, platform), data in evidence.items():
+        login = login_for(slug, clipped, creators)
+        if login:
+            readings.setdefault(login, []).append((ratios[(slug, platform)][0], data))
+    for login in sorted(old.keys() | streamers.keys()):
+        before, after = old.get(login, 1.0), streamers.get(login, 1.0)
+        if before == after:
+            continue
+        samples = readings.get(login, [])
+        quality_values = [q for q, _ in samples]
+        shares = [r["shares"] for _, r in samples if r.get("shares") is not None]
+        watch = [r["watch_s"] for _, r in samples if r.get("watch_s") is not None]
+        taste = tastes.get(login) or {}
+        changes.append({"login": login, "previous": before, "weight": after, "reads": len(samples),
+                        "median_quality": round(st.median(quality_values), 2) if quality_values else None,
+                        "median_shares": st.median(shares) if shares else None,
+                        "median_watch_s": st.median(watch) if watch else None,
+                        "failed": taste.get("miss", 0), "judged": taste.get("seen", 0)})
+    return changes
+
+
+def change_line(row: dict) -> str:
+    evidence = [f"{row['reads']} reads"]
+    for field, label, suffix in (("median_quality", "quality", "×"), ("median_shares", "shares+saves", ""),
+                                 ("median_watch_s", "watch", "s")):
+        if row.get(field) is not None:
+            evidence.append(f"{label} {row[field]:g}{suffix}")
+    if row.get("judged"):
+        evidence.append(f"{row['failed']}/{row['judged']} failed judgment")
+    return f"{row['login']} {row['previous']:.3f}→{row['weight']:.3f}× ({', '.join(evidence)})"
+
+
+def update_forecasts(path: str, changes: list[dict], outcomes: list[dict], now: float) -> list[dict]:
+    """Forecast the next seven days of relative 24h quality and score the matured windows."""
+    from collections import defaultdict
+
+    import fcntl
+
+    with open(path, "a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        history = _rows(path)
+        forecasts = [r for r in history if r.get("kind") == "forecast"]
+        scored = {r["id"] for r in history if r.get("kind") == "result"}
+        by_login = defaultdict(list)
+        for sample in outcomes:
+            by_login[sample["login"]].append(sample)
+        appended = []
+        for r in forecasts:
+            if r["id"] in scored or now < r["until"] + 86400:
+                continue
+            measured = [s["quality"] for s in by_login[r["login"]] if r["from"] <= s["posted_at"] < r["until"]]
+            actual = st.median(measured) if measured else None
+            right = actual is not None and (actual >= 1 if r["expected"] == "above median" else actual < 1)
+            appended.append({"kind": "result", "id": r["id"], "login": r["login"], "at": now,
+                             "samples": len(measured), "quality": round(actual, 3) if actual is not None else None,
+                             "result": "right" if right else "wrong" if measured else "unscored"})
+        active = {r["login"] for r in forecasts if now < r["until"]}
+        for change in changes:
+            login = change["login"]
+            if login in active or abs(change["weight"] - change["previous"]) < 0.05:
+                continue
+            if not change["reads"] and not change["judged"]:
+                continue
+            expected = "above median" if change["weight"] >= 1 else "below median"
+            appended.append({"kind": "forecast", "id": f"{login}:{int(now)}", "login": login,
+                             "from": now, "until": now + 7 * 86400, "expected": expected, "evidence": change})
+        if appended:
+            stream.write("".join(json.dumps(r) + "\n" for r in appended))
+        return appended
+
+
+def forecast_summary(path: str, now: float) -> str | None:
+    from collections import Counter
+    rows = _rows(path)
+    if not rows:
+        return None
+    recent = Counter(r["result"] for r in rows if r.get("kind") == "result" and now - 7 * 86400 <= r["at"] <= now)
+    pending = sum(r.get("kind") == "forecast" and r["from"] <= now < r["until"] + 86400 for r in rows)
+    return f"predictions: {recent['right']} right · {recent['wrong']} wrong · {recent['unscored']} unscored · {pending} pending"

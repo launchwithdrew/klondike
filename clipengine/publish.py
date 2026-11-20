@@ -23,6 +23,7 @@ What it guarantees:
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -123,7 +124,7 @@ def check_title(title: str) -> list[str]:
 
 def drop(file: str, slug: str, title: str, description: str, moment_at: str, post: bool,
          push: bool = True, check_only: bool = False, platforms: list[str] | None = None,
-         schedule: dict | None = None, grade: dict | None = None) -> None:
+         schedule: dict | None = None, grade: dict | None = None, moment_window: dict | None = None) -> None:
     cmd = ["node", os.path.join(REPO, "tools", "drop.mjs"), "--file", file, "--slug", slug,
            "--title", title, "--description", description, "--moment-at", moment_at, "--brand-safe"]
     if platforms:
@@ -132,6 +133,8 @@ def drop(file: str, slug: str, title: str, description: str, moment_at: str, pos
         cmd += ["--schedule", ",".join(f"{p}={t}" for p, t in schedule.items())]
     if grade:
         cmd += ["--grade", json.dumps(grade, separators=(",", ":"))]
+    if moment_window:
+        cmd += ["--moment-window", json.dumps(moment_window, separators=(",", ":"))]
     if check_only:
         cmd.append("--check")
     elif not push:
@@ -174,13 +177,16 @@ def parse_taste(v: str | None) -> bool | None:
     raise ValueError(f"--taste takes yes or no, not {v!r}")
 
 
-def taste_no(login: str, ref: str, push: bool = True, title: str | None = None) -> None:
+def taste_no(login: str, ref: str, push: bool = True, title: str | None = None,
+             draft: dict | None = None) -> None:
     """--taste no: never post it. Recorded as a skip with reason "taste" (learn.taste pushes the streamer down)."""
     os.makedirs(os.path.dirname(TASTE), exist_ok=True)
     with open(TASTE, "a") as fh:
         fh.write(json.dumps({"login": (login or "").lower(), "ref": ref, "verdict": "no", "reason": "taste",
                              **({"title": title} if title else {}),
                              "at": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
+    from . import judge as JG
+    JG.record(draft or {"id": ref, "login": login}, "drop", "taste")
     _commit(TASTE, f"taste: skipped {ref}", push)
     raise SystemExit(f"NOT POSTED — taste: no. Skipped {ref} (reason: taste); learn counts it against {login or 'this streamer'}.")
 
@@ -188,14 +194,20 @@ def taste_no(login: str, ref: str, push: bool = True, title: str | None = None) 
 def publish_scan(scan_dir: str, pick: int, title: str, line: str, quote: str | None = None,
                  slug: str | None = None, frames_checked: bool = False, post: bool = False,
                  push: bool = True, check_only: bool = False, rubric: list[str] | None = None,
-                 question: str | None = None, taste: bool | None = None, **render_kw) -> dict:
+                 question: str | None = None, taste: bool | None = None, truth_override: str | None = None,
+                 draft: dict | None = None, **render_kw) -> dict:
     from . import pipeline as P
     from . import facecam as FC
     res = json.load(open(os.path.join(scan_dir, "scan.json")))
     vod = res["vod"]
-    if taste is False:
-        taste_no(vod.get("login", ""), f"{os.path.basename(os.path.normpath(scan_dir))}#{pick}", push, title)
     c = next(x for x in res["candidates"] if x["rank"] == pick)
+    sig = G.signals_from_candidate(c, vod)
+    if taste is False:
+        from . import judge as JG
+        ref = f"{vod['id']}#{c['peak_s']}"
+        sample = JG.score_snapshot(G.engine_score(sig), sig)
+        taste_no(vod.get("login", ""), ref, push, title,
+                 draft=draft or {"id": ref, "login": vod["login"], "thumbs": c.get("thumbs"), **sample})
     problems = check_title(title) + check_question(question)
     if problems:
         raise SystemExit("PUBLISH REFUSED: " + "; ".join(problems))
@@ -206,16 +218,34 @@ def publish_scan(scan_dir: str, pick: int, title: str, line: str, quote: str | N
     if hit:
         raise SystemExit(f"PUBLISH REFUSED: this moment was already published as '{hit['slug']}'")
     moment = dt.datetime.fromisoformat(vod["created_at"].replace("Z", "+00:00")) + dt.timedelta(seconds=c["peak_s"])
-    sig = G.signals_from_candidate(c, vod)
+    if not draft:
+        draft = {"id": f"{vod['id']}#{c['peak_s']}", "login": vod["login"], "thumbs": c.get("thumbs")}
+    origin = dt.datetime.fromisoformat(vod["created_at"].replace("Z", "+00:00")).timestamp()
     return _finish(rep, vod["login"], vod["id"], s, e, moment, title, line, quote, slug, frames_checked, post, push,
-                   check_only, sig, rubric, question, taste)
+                   check_only, sig, rubric, question, taste, truth_override=truth_override, draft=draft, clock_window=(origin + s, origin + e))
+
+
+def source_vision(rec_dir: str, start_ts: float, end_ts: float) -> dict:
+    """Frame checks + liveliness on the recording itself (the render's layout and card would skew them):
+    {"flags": [...], "liveliness": 0–1}, or {} when the recording can't be read."""
+    import tempfile
+    from . import live as L
+    from . import vision as VI
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.ts")
+            first = L.cut_source(rec_dir, start_ts, end_ts, src)
+            vis = VI.check(src, max(0.0, start_ts - first), end_ts - start_ts)
+        return {"flags": vis["flags"], "liveliness": vis["liveliness"]} if vis["frames"] else {}
+    except Exception:
+        return {}
 
 
 def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, line: str, quote: str | None = None,
                    slug: str | None = None, frames_checked: bool = False, post: bool = False,
                    push: bool = True, check_only: bool = False, rubric: list[str] | None = None,
                    chat_score: float | None = None, question: str | None = None, pre: dict | None = None,
-                   taste: bool | None = None, **kw) -> dict:
+                   taste: bool | None = None, truth_override: str | None = None, draft: dict | None = None, **kw) -> dict:
     """For a live recording (streams with no VOD): wall-clock window. A sentinel draft passes the chat
     strength its detector measured live (`chat_score`) — a recording keeps no chat of its own."""
     from . import live as L
@@ -223,7 +253,7 @@ def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, lin
     from . import facecam as FC
     login = json.load(open(os.path.join(rec_dir, "recording.json")))["login"]
     if taste is False:
-        taste_no(login, f"{login}@{int(start_ts)}", push, title)
+        taste_no(login, f"{login}@{int(start_ts)}", push, title, draft=draft)
     problems = check_title(title) + check_question(question)
     if problems:
         raise SystemExit("PUBLISH REFUSED: " + "; ".join(problems))
@@ -233,7 +263,7 @@ def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, lin
     os.makedirs(os.path.join(rec_dir, "renders"), exist_ok=True)
     out = os.path.join(rec_dir, "renders", f"{login}_{int(start_ts)}.mp4")
     if pre:                                     # pre-rendered draft: only the headline card is burned in
-        info = from_prerender(pre, out, start_ts, end_ts, title, quote)
+        info = from_prerender(pre, out, start_ts, end_ts, title, quote, payoff_ts=kw.get("payoff_ts"))
     else:
         with FC.creator(login):                 # the facecam layout looks up this streamer's webcam
             info = L.render_window(rec_dir, start_ts, end_ts, out, title, quote, watermark=V.WATERMARK, **kw)
@@ -248,13 +278,19 @@ def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, lin
                  for seg in tr.get("segments", []) for w in seg.get("words", []) if w.get("start", 0) < end_ts - start_ts]
     sig = G.signals_from_live(rec_dir, login, start_ts, end_ts, words)
     sig["words_all"] = words
+    sv = source_vision(rec_dir, start_ts, end_ts)
+    sig["flags"] = G.merge_vision_flags(list(sig.get("flags") or []), sv.get("flags") or [])
+    sig["liveliness"] = sv.get("liveliness")
     if chat_score is not None:
         sig["chat_score"] = chat_score
+    if draft:
+        sig["titles"] = list(dict.fromkeys([*(sig.get("titles") or []), *(draft.get("titles") or [])]))
     return _finish(rep, login, login, start_ts, end_ts, moment, title, line, quote, slug, frames_checked, post, push,
-                   check_only, sig, rubric, question, taste)
+                   check_only, sig, rubric, question, taste, truth_override=truth_override, draft=draft, clock_window=(start_ts, end_ts))
 
 
-def from_prerender(pre: dict, out: str, start_ts: float, end_ts: float, title: str, quote: str | None) -> dict:
+def from_prerender(pre: dict, out: str, start_ts: float, end_ts: float, title: str, quote: str | None,
+                   payoff_ts: float | None = None) -> dict:
     """Finish a pre-rendered draft: burn the card (and a trim) into it; its transcript follows the trim."""
     import sys as _sys
     from . import render as V
@@ -262,8 +298,9 @@ def from_prerender(pre: dict, out: str, start_ts: float, end_ts: float, title: s
     dur = end_ts - start_ts
     print(f"[render] pre-rendered draft: burning the headline card{f' (trim {trim:.1f} s)' if trim else ''}…",
           file=_sys.stderr, flush=True)
-    V.burn_card(pre["mp4"], out, title, quote, pre.get("slot") or {}, trim_start=trim, dur=dur,
-                captions=pre.get("captions"))
+    burned = V.burn_card(pre["mp4"], out, title, quote, pre.get("slot") or {}, trim_start=trim, dur=dur,
+                         captions=pre.get("captions"),
+                         payoff_s=(payoff_ts - start_ts) if payoff_ts is not None else None)
     tr = json.load(open(pre["mp4"].rsplit(".mp4", 1)[0] + ".transcript.json"))
     shift = lambda a, b: (round(a - trim, 2), round(b - trim, 2))
     segs = []
@@ -280,12 +317,14 @@ def from_prerender(pre: dict, out: str, start_ts: float, end_ts: float, title: s
               open(out.rsplit(".mp4", 1)[0] + ".transcript.json", "w"), indent=2)
     return {"out": out, "cards": len(segs), "bleeps": bleeps, "watermark": pre.get("watermark", True),
             "layout": pre.get("layout"), "facecam": pre.get("facecam"), "title": title, "quote": quote,
-            "prerendered": True, "pre_audit": pre.get("audit"), "pre_vision": pre.get("vision")}
+            "prerendered": True, "pre_audit": pre.get("audit"), "pre_vision": pre.get("vision"),
+            "audit": burned.get("audit")}
 
 
 def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_checked, post, push, check_only,
             sig: dict | None = None, rubric: list[str] | None = None, question: str | None = None,
-            taste: bool | None = None):
+            taste: bool | None = None, *, truth_override: str | None = None, draft: dict | None = None,
+            clock_window: tuple[float, float] | None = None):
     # transcript-level screen on what is actually in the cut
     tr = json.load(open(rep["out"].rsplit(".mp4", 1)[0] + ".transcript.json"))
     # what is in OUR cut (card times are clip seconds): a --start trim drops the words before it
@@ -295,7 +334,8 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
               "layout": rep.get("layout"), **({"facecam_note": rep["facecam"]["note"]}
                                                 if (rep.get("facecam") or {}).get("note") else {}),
               "caption": caption(line, login, question),
-              "length_s": round(e - s, 1), "captions_preview": UT.quote(said, 400)}
+              "length_s": round(e - s, 1), "captions_preview": UT.quote(said, 400),
+              **({"render_audit": rep["audit"]["line"]} if isinstance(rep.get("audit"), dict) else {})}
     # judge like an editor: the censor checked on the render itself, the headline checked against the moment
     from . import censor as CN
     if rep.get("prerendered") and (rep.get("pre_audit") or {}).get("ok"):
@@ -309,23 +349,34 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
         if not aud["ok"]:
             raise SystemExit("PUBLISH REFUSED: the render still has an uncensored word "
                              f"({', '.join(aud['captions'] + [w['w'] for w in aud['audio']])}) — re-run with --bleep WORD")
-    spoken = " ".join(w.get("w", "") for w in (sig or {}).get("words_all", [])) or said
+    raw_words = (sig or {}).get("words_all") or []
+    spoken = " ".join(w.get("w", "").strip() for w in raw_words)
+    spoken = ". ".join(part for part in (spoken, said) if part)
     missing = SF.headline_support(title, spoken, (sig or {}).get("titles"),
                                   names=[login, creators().get(login.lower(), {}).get("name", "")])
     if missing:
         report["warnings"] = [f"headline words not in the transcript or viewer titles: {', '.join(missing[:5])} — "
                               "make sure the cut SHOWS it (rules/headlines.md)"]
+    if not sf["flagged"] and (draft or {}).get("unsafe"):
+        sf = {**sf, "flagged": True, "why": draft["unsafe"]}
+        report["safety"] = sf
     if sf["flagged"]:
         report["status"] = "REFUSED — sexual content: " + sf["why"]
         print(json.dumps(report, indent=2))
         raise SystemExit("PUBLISH REFUSED: " + report["status"])
+    if frames_checked and missing and not (truth_override or "").strip():
+        raise SystemExit("PUBLISH REFUSED: unsupported headline claims: " + ", ".join(missing) +
+                         " — edit the headline or pass --truth-override with what you verified in the cut")
     if not wm_ok(rep):
         raise SystemExit("PUBLISH REFUSED: no logo — copy assets/watermark.png into the repo (setup/setup.sh checks this)")
     # vision: cutscene / menu / loading screen, from the frames themselves
     from . import vision as VI
     vis = rep.get("pre_vision") or VI.check(rep["out"])      # a pre-render was checked when it was made
     report["vision"] = {k: vis[k] for k in ("cuts_per_min", "static", "dark", "flags")}
-    sig = {**(sig or {}), "flags": list((sig or {}).get("flags") or []) + vis["flags"]}
+    more = vis["flags"]
+    if (sig or {}).get("liveliness") is not None:      # the source frames were checked: the render (layout, card,
+        more = [f for f in more if "cutscene" in f.lower()]   # logo) adds only what it can see better
+    sig = {**(sig or {}), "flags": G.merge_vision_flags(list((sig or {}).get("flags") or []), more)}
     # banger score: engine signals now, operator rubric once the frames are checked
     eng = G.engine_score({**sig, "unsafe": sf["why"] if sf["flagged"] else ""})
     rub = G.rubric_score(rubric)
@@ -355,25 +406,49 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
                           dt.datetime.fromtimestamp(d["at"], dt.timezone.utc).isoformat()} for p, d in decision.items()}
     platforms = [p for p, d in decision.items() if d["action"] in ("now", "scheduled")]
     schedule = {p: report["gate"][p]["at"] for p, d in decision.items() if d["action"] == "scheduled"}
+    from . import judge as JG
+    sample = JG.score_snapshot(eng, sig)
+    example = {"id": f"{source}@{s:g}", "login": login, "start": s, "stop": e, **(draft or {})}
+    if not example.get("judgment"):
+        example = {**sample, **example, "judgment": sample}
+    accepted_override = truth_override.strip() if missing and truth_override else None
     if not platforms:
+        if post and not check_only:
+            JG.record(example, "ship", "operator approved; distribution gate held it",
+                      frames=rep.get("frames"), override=accepted_override)
         report["status"] = f"NOT POSTED — banger score {final['score']} ({final['tier']}): {GT.summary(decision)}"
         print(json.dumps(report, indent=2))
         return report
     slug = slug or _slugify(login, title)
     description = caption(line, login, question)
-    drop(rep["out"], slug, title, description, moment.isoformat(), post, push, check_only,
-         platforms=platforms, schedule=schedule,
-         grade={"score": final["score"], "tier": final["tier"], "engine": eng["score"], "rubric": rubric,
-                "parts": eng["parts"]})
-    if not check_only:
-        record_clipped({"slug": slug, "source": source, "login": login, "start_s": s, "end_s": e,
-                        "moment_at": moment.isoformat(), "title": title, "grade": final["score"],
-                        "engine": eng["score"], "rubric": rubric, "taste": "yes", "platforms": platforms,
-                        "explore": [p for p, d in decision.items() if d.get("explore")],
-                        "layout": rep.get("layout") or "stack",
-                        "caption_style": "line+question" if (question or "").strip() else "line",
-                        "parts": eng.get("parts"),
-                        "at": dt.datetime.now(dt.timezone.utc).isoformat()}, push)
+    from . import handpost
+    from . import moments
+
+    bounds = clock_window or (moment.timestamp() - (e - s) / 2, moment.timestamp() + (e - s) / 2)
+    moment_window = moments.metadata(login, *bounds)
+    lock_path = os.path.join(REPO, "runs", "publish.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        records = load_clipped() + [row for row in handpost._ledger() if row.get("status") == "live"]
+        duplicate = moments.match(login, *bounds, records)
+        if duplicate:
+            raise SystemExit(f"PUBLISH REFUSED: this moment was already posted as {duplicate['slug']}")
+        drop(rep["out"], slug, title, description, moment.isoformat(), post, push, check_only,
+             platforms=platforms, schedule=schedule,
+             grade={"score": final["score"], "tier": final["tier"], "engine": eng["score"], "rubric": rubric,
+                    "parts": eng["parts"]}, moment_window=moment_window)
+        if not check_only:
+            JG.record(example, "ship", "approved for posting", frames=rep.get("frames"),
+                      override=accepted_override, slug=slug)
+            record_clipped({"slug": slug, "source": source, "login": login, "start_s": s, "end_s": e,
+                            "moment_at": moment.isoformat(), **moment_window, "title": title, "grade": final["score"],
+                            "engine": eng["score"], "rubric": rubric, "taste": "yes", "platforms": platforms,
+                            "explore": [p for p, d in decision.items() if d.get("explore")],
+                            "layout": rep.get("layout") or "stack",
+                            "caption_style": "line+question" if (question or "").strip() else "line",
+                            "parts": eng.get("parts"),
+                            "at": dt.datetime.now(dt.timezone.utc).isoformat()}, push)
     report.update({"status": ("CHECKED (not dropped)" if check_only else ("DROPPED + POSTED" if post else "DROPPED"))
                    + f" — banger {final['score']} ({final['tier']}): {GT.summary(decision)}",
                    "slug": slug, "description": description})

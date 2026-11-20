@@ -84,7 +84,7 @@ async function processItem(ctx, dir) {
         const r = await POSTERS[platform](page, item, { dry: DRY });
         if (r.dry) { results[platform] = 'dry-ok'; break; }
         const latency = item.moment_at ? Math.round((Date.now() - Date.parse(item.moment_at)) / 60000) : null;
-        appendLedger({ platform, slug: item.slug, sha256: item.sha256, title: item.title, url: r.url, status: 'live', found_existing: !!r.existing, post_seconds: Math.round((Date.now() - t0) / 1000), moment_to_live_min: latency });
+        appendLedger({ platform, slug: item.slug, sha256: item.sha256, title: item.title, url: r.url, status: 'live', found_existing: !!r.existing, post_seconds: Math.round((Date.now() - t0) / 1000), moment_to_live_min: latency, login: item.login, moment_at: item.moment_at, moment_start_at: item.moment_start_at, moment_end_at: item.moment_end_at });
         log(item.slug, platform, 'LIVE', r.url, latency != null ? `(${latency} min after the moment)` : '');
         results[platform] = 'live';
         break;

@@ -367,6 +367,7 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
     cur, last_end, fired = None, 0.0, 0
     status_path = os.path.join(out, "sentinel.json")
     print(f"[sentinel] {login}: listening (trigger p ≥ {m['trigger']}) -> {out}", flush=True)
+    threading.Thread(target=_facecam_suggest, args=(login, out, time.time()), daemon=True).start()
     t_next = time.time() + STEP_S
     last_beat = 0.0
     while True:
@@ -447,6 +448,31 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
                        "chat_per_min": round(sum(hist.get("msgs", [])[-12:]) * (60 / (12 * WINDOW_S)), 1),
                        "recorded_min": round(len(L.load_index(out)) * 2 / 60, 1) if os.path.exists(os.path.join(out, "index.jsonl")) else 0,
                        "moments": fired, "p": round(p, 3), "rec": _rec_health(out)}, open(status_path, "w"))
+
+
+def _facecam_suggest(login: str, out: str, started: float) -> None:
+    """A creator with no "facecam" setting: once ~3 min are recorded, suggest a checked webcam box on the
+    attention line (once per creator per day; never writes config)."""
+    from . import attention as AT
+    from . import facecam as FC
+    from . import live as L
+    try:
+        if not FC.available() or not FC.unchecked(login):
+            return
+        deadline = started + 3600
+        while time.time() < deadline:
+            idx = L.load_index(out) if os.path.exists(os.path.join(out, "index.jsonl")) else []
+            if idx and sum(r["d"] for r in idx if r["t"] + r["d"] >= started - 60) >= FC.SUGGEST_AFTER_S:
+                break
+            time.sleep(20)
+        else:
+            return
+        sug = FC.suggest(login, out)
+        if sug:
+            AT.event("setup", sug["text"], key=f"facecam:{login}:{time.strftime('%Y-%m-%d', time.gmtime())}")
+            print(f"[sentinel] {login}: {sug['text']}", flush=True)
+    except Exception as exc:
+        print(f"[sentinel] {login}: webcam suggestion skipped ({str(exc)[:80]})", flush=True)
 
 
 def _rec_health(out: str) -> dict | None:
@@ -736,7 +762,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     src = os.path.join(ddir, mid + ".ts")
     first = L.cut_source(out, a, b, src)
     x = A.decode_pcm(src, 0, None)
-    words = A.real_words(A.transcribe(x, model_name, offset=first))
+    words = A.real_words(A.transcribe(x, model_name, offset=first, prompt=A.vocab_prompt(login=login)))
     words = [w for w in words if a <= w["start"] <= b]
     # who is talking: the session's voice profile + what the screen shows (subtitles, cutscene editing)
     tl = VI.timeline(src)
@@ -778,14 +804,15 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     human = [w for w in in_win if w.get("spk", "streamer") != "game"]
     said = " ".join(w["w"].strip() for w in human)
     chat_lines = [c["text"] for c in moment.get("chat", [])]
-    sf = SF.screen(said, chat_lines=chat_lines)
     vis = VI.check(src, s - first, e - s)
     sig = G.signals_from_live(out, login, s, e, in_win)
+    sf = SF.screen(said, titles=sig.get("titles"), chat_lines=chat_lines)
     sig["chat_score"] = chat_score_from_p(moment["p"])
     if moment.get("crowd_new"):                     # viewers already clipping it: strong early crowd signal
         sig["crowd_vpm"] = (sig.get("crowd_vpm") or 0) + 5 * moment["crowd_new"]
     sig["reaction"], sig["reaction_why"] = rx["score"], rx["why"]
-    misheard = A.misheard_names(in_win)
+    sig["liveliness"] = vis.get("liveliness")
+    misheard = A.misheard_names(in_win, login=login)
     sig["flags"] = (sig.get("flags") or []) + vis["flags"] + \
         ([f"recording from {game}, not {target_game()}"] if bad_game else []) + \
         ([f"names? {', '.join(f'{h}→{r}' for h, r in misheard)}"] if misheard else []) + \
@@ -804,11 +831,15 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     reason = ("wrong game: " + bad_game if bad_game else "unsafe: " + sig["unsafe"] if sig["unsafe"] else
               f"best {best} under every platform's bar ({floor}): " + "; ".join(eng["why"][:2])
               if best < floor else "")
+    from . import judge as JG
     spk = SPK.summary(in_win, prof)
     entry = {"id": mid, "login": login, "rec": out, "start": round(s, 2), "stop": round(e, 2),
              "payoff": round(payoff, 2), "payoff_how": how, "src": [round(a, 1), round(b, 1)],
-             "at": dt.datetime.fromtimestamp(moment["fire"], dt.timezone.utc).isoformat(), "p": moment["p"],
+             "at": dt.datetime.fromtimestamp(moment["fire"], dt.timezone.utc).isoformat(),
+             "drafted_at": dt.datetime.now(dt.timezone.utc).isoformat(), "p": moment["p"],
              "engine": eng["score"], "best": best, "parts": G.parts_line(eng, sig), "why": eng["why"],
+             "liveliness": vis.get("liveliness"), "frames_assessed": bool(vis.get("frames")),
+             "judgment": JG.score_snapshot(eng, sig), "titles": sig.get("titles") or [],
              "flags": sig["flags"], "unsafe": sig["unsafe"], "chat_unsafe": sf.get("chat_hits", []),
              "chat": " ".join(f"{w}×{n}" for w, n in top), "said": said[:140], "quote_hint": quote[:60],
              "speakers": {k: spk[k] for k in ("streamer_s", "other_s", "game_s", "game_share", "backend")},
@@ -868,17 +899,47 @@ def load_queue(root: str = os.path.join(REPO, "runs")) -> list[dict]:
 
 
 def note(entry: dict, **extra) -> None:
-    """Add facts to a queued draft without changing its status (e.g. its pre-render)."""
-    with open(os.path.join(entry["rec"], "queue.jsonl"), "a") as fh:
-        fh.write(json.dumps({"id": entry["id"], **extra}) + "\n")
+    """Append a queue update, even if an older writer omitted the final newline."""
+    import fcntl
+
+    with open(os.path.join(entry["rec"], "queue.jsonl"), "a+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0, os.SEEK_END)
+        if stream.tell():
+            stream.seek(-1, os.SEEK_END)
+            if stream.read(1) != b"\n":
+                stream.write(b"\n")
+        stream.write((json.dumps({"id": entry["id"], **extra}) + "\n").encode())
+
+
+def mark_seen(entry: dict, now: float | None = None) -> str | None:
+    seen = entry.get("seen_at")
+    if not seen and entry.get("rec") and os.path.isdir(entry["rec"]):
+        seen = dt.datetime.fromtimestamp(time.time() if now is None else now, dt.timezone.utc).isoformat()
+        note(entry, seen_at=seen)
+        entry["seen_at"] = seen
+    return seen
 
 
 def set_status(entry: dict, status: str, **extra) -> None:
-    with open(os.path.join(entry["rec"], "queue.jsonl"), "a") as fh:
-        fh.write(json.dumps({"id": entry["id"], "status": status, **extra}) + "\n")
+    if status in ("published", "skipped"):
+        extra.setdefault("judged_at", dt.datetime.now(dt.timezone.utc).isoformat())
+    note(entry, status=status, **extra)
 
 
-def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_age_h: float = 6.0) -> list[dict]:
+URGENT_BEST = 75.0          # a draft that can clear TikTok/Instagram's bar…
+
+
+def is_urgent(r: dict) -> bool:
+    """…or one viewers are already clipping: a race to be first — it goes to the top and pings the phone."""
+    if r.get("unsafe") or r.get("status") not in (None, "new"):
+        return False
+    m = re.search(r"\bcr ([0-9.]+)", str(r.get("parts") or ""))
+    crowd = float(m.group(1)) if m else float((r.get("features") or {}).get("crowd_new") or 0)
+    return float(r.get("best") or 0) >= URGENT_BEST or crowd > 0 or "crowd" in str(r.get("via") or "")
+
+
+def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_age_h: float = 6.0, seen: bool = True) -> list[dict]:
     """One line per draft worth a look: new, safe, fresh, and able to clear some platform's bar."""
     from . import gate as GT
     from . import untrusted as UT
@@ -890,20 +951,46 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
         if not all_ and (r.get("status") != "new" or r.get("unsafe") or r.get("best", 0) < floor or age_h > max_age_h):
             continue
         rows.append({**r, "age_min": round(age_h * 60)})
-    rows.sort(key=lambda r: -r.get("best", 0))
+    if not all_ and len(rows) > 1:
+        from . import events, publish, scouts
+        rows = scouts.group_angles(rows, publish.creators(), events.load())
+    rows.sort(key=lambda r: (not (is_urgent(r) or r.get("angle_urgent")), -r.get("best", 0)))
     for r in rows:
+        if seen and r.get("status") == "new":
+            mark_seen(r, now)
         mark = f" ⛔{UT.quote(r['unsafe'], 30)}" if r.get("unsafe") else \
             f" ⚠chat: {UT.quote(', '.join(r['chat_unsafe'][:2]), 20)}" if r.get("chat_unsafe") else ""
+        if is_urgent(r) or r.get("angle_urgent"):
+            mark += " 🔥URGENT"
         if r.get("status") not in (None, "new"):
-            mark += f" [{r['status']}{': ' + UT.quote(r['reason'], 50) if r.get('reason') else ''}]"
-        print(f"{r['id']:<22} best {r.get('best', 0):>4.0f}  {r['age_min']:>3}m ago  chat: {UT.quote(r.get('chat', ''), 30):<32} "
-              f"said: {UT.quote(r.get('said', ''), 60)}{mark}")
+            reason = r.get("reason") or ("no reason saved" if r.get("status") in ("dropped", "skipped") else "")
+            mark += f" [{r['status']}{': ' + UT.quote(reason, 50) if reason else ''}]"
+        confidence = []
+        if not r.get("frames_assessed", r.get("liveliness") is not None):
+            confidence.append("frames unassessed")
+        speakers = r.get("speakers") or {}
+        speech = (r.get("judgment") or {}).get("speech_s", speakers.get("streamer_s"))
+        if "thin speech" in (r.get("flags") or []) or (speech is not None and speech < 0.2 * (r["stop"] - r["start"])):
+            confidence.append("thin speech")
+        if speakers.get("backend") in {"stats", "hints"}:
+            confidence.append("speaker tags uncertain")
+        if confidence:
+            mark += " · " + " · ".join(confidence)
+        if r.get("angles"):
+            mark += f" · same moment, {len(r['angles'])} angles"
+        if r.get("seen_at"):
+            mark += f" · seen {r['seen_at'][11:16]} UTC"
+        summary = (f"{r['id']:<22} best {r.get('best', 0):>4.0f}  {r['age_min']:>3}m ago  "
+                   f"chat: {UT.quote(r.get('chat', ''), 30):<32} said: ")
+        excerpt = UT.quote(r.get("said", ""), max(0, min(60, 218 - len(summary) - len(mark))))
+        print(summary + excerpt + mark)
         work = r.get("parts") or ""
         if r.get("payoff") is not None:
             work = f"{r['stop'] - r['start']:.0f}s payoff +{r['payoff'] - r['start']:.0f}s · " + work
         flags = ", ".join(r.get("flags") or [])
         line2 = (f"{'':<22} {work}{' | ' + flags if flags else ''}")[:140]
-        print(f"{line2}  sheet {os.path.relpath(r['sheet'], REPO) if r.get('sheet') else '-'}")
+        alternate = " · angles: " + ", ".join(r["angles"][1:]) if r.get("angles") else ""
+        print(f"{line2}  sheet {os.path.relpath(r['sheet'], REPO) if r.get('sheet') else '-'}{alternate}")
     return rows
 
 

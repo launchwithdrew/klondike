@@ -58,6 +58,11 @@ for (const pair of (opt('schedule', '') || '').split(',').map(s => s.trim()).fil
 }
 const post = { slug, title, description, platforms, cover_s: Number(opt('cover', '1.2')), moment_at: opt('moment-at', null), brand_safe: true, dropped_at: new Date().toISOString() };
 if (Object.keys(schedule).length) post.schedule = schedule;
+const momentWindow = opt('moment-window', null);
+if (momentWindow) {
+  const { login, moment_start_at, moment_end_at } = JSON.parse(momentWindow);
+  Object.assign(post, { login, moment_start_at, moment_end_at });
+}
 const grade = opt('grade', null);                 // banger score JSON from publish, kept with the post for learning
 if (grade) { try { post.grade = JSON.parse(grade); } catch { die('--grade must be JSON'); } }
 fs.writeFileSync(path.join(dir, 'post.json'), JSON.stringify(post, null, 2) + '\n'); // written last
