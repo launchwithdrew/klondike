@@ -28,9 +28,15 @@ def _floor() -> float:
 
 
 def brand_key() -> str:
-    """A pre-render made under another look (brand pack changed since) is stale."""
+    """A pre-render made under another look is stale: the brand pack changed, or the BYTES of a font, the logo or
+    a card style's code did (finish.py)."""
     from . import brand as B
-    return hashlib.sha1(json.dumps(B.load(fresh=True), sort_keys=True, default=str).encode()).hexdigest()[:12]
+    from . import finish as FN
+    try:
+        fk = FN.fingerprint()["key"]
+    except Exception:
+        fk = ""
+    return hashlib.sha1((json.dumps(B.load(fresh=True), sort_keys=True, default=str) + fk).encode()).hexdigest()[:12]
 
 
 def paths(entry: dict) -> tuple[str, str]:

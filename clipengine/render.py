@@ -229,8 +229,13 @@ def facecam_geometry(box: list[float], src_w: int, src_h: int, max_frac: float =
 def render(*a, **k) -> dict:
     """The final encode is heavy work: it waits its turn for a heavy-job slot (admission.py)."""
     from .admission import slot
+    from . import finish as FN
     with slot("render"):
-        return _render(*a, **k)
+        info = _render(*a, **k)
+    out = a[5] if len(a) > 5 else k.get("out")
+    if out:
+        FN.write_receipt(out, "render")                 # which finish this clip has (finish.py)
+    return info
 
 
 def _render(source: str, source_t0: float, start_s: float, end_s: float,
@@ -461,8 +466,13 @@ def card_position(bp: dict, slot: dict, card_h: int, card_mid: int) -> int:
 
 def burn_card(*a, **k):
     from .admission import slot
+    from . import finish as FN
     with slot("finish"):
-        return _burn_card(*a, **k)
+        info = _burn_card(*a, **k)
+    out = a[1] if len(a) > 1 else k.get("out")
+    if out:
+        FN.write_receipt(out, "card")
+    return info
 
 
 def _burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: dict, trim_start: float = 0.0,

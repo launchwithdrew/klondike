@@ -47,3 +47,11 @@ Your agent can design one with you: a Python function in `clipengine/house/` (yo
 stays on your computer and is kept across updates), listed as `CARD_STYLES = {"mystyle": fn}` in
 `clipengine/house/__init__.py`, then `"card": {"style": "mystyle"}` in `brand/brand.json`. See
 `clipengine/card.py` (`styles()`) for what the function receives and returns.
+
+## Freeze an approved look
+Once the look is right, run `clipengine finish approve --name V1`. It records the look settings, every font and
+logo by content hash with a copy of each, and a reference frame, all in `brand/finish/`. After that:
+- a clip rendered with a different look isn't dropped, and the refusal says what changed;
+- `finish restore` puts the approved version back byte for byte;
+- `finish check --still` re-renders the reference frame and compares it, which catches an update that changes
+  the look.

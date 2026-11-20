@@ -4506,3 +4506,99 @@ def test_a_tiktok_post_records_with_confirmation_when_tiktok_wont_answer_this_ho
     monkeypatch.setattr(verify, "_json", lambda url: {"author_unique_id": "impostor"})
     with pytest.raises(ValueError, match="author does not match"):
         verify.post("tiktok", url, confirmed=True)
+
+
+# ---- the approved finish (spec §4): approval record, receipts, drop gate, byte-level cache ---------------
+
+def _finish_pack(tmp_path, monkeypatch, **over):
+    import copy
+    from PIL import Image
+    from clipengine import brand as B
+    d = tmp_path / "brand"; (d / "kit").mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (64, 32), (229, 25, 55, 255)).save(d / "kit" / "logo.png")
+    pack = copy.deepcopy(B.DEFAULTS)
+    pack["logo"]["file"] = str(d / "kit" / "logo.png")
+    pack.update(over)
+    (d / "brand.json").write_text(json.dumps(pack))
+    monkeypatch.setenv("CLIPENGINE_BRAND", str(d / "brand.json"))
+    return d
+
+
+def test_an_approved_finish_notices_changed_settings_and_changed_logo_bytes_and_restores_them(tmp_path, monkeypatch):
+    from PIL import Image
+    from clipengine import finish as FN, prerender as PR
+    d = _finish_pack(tmp_path, monkeypatch)
+    assert FN.check()["state"] == "none"
+    key0 = PR.brand_key()
+    r = FN.approve("V3", "the tester's look", still=False)
+    assert r["version"] == 1 and FN.check()["state"] == "ok" and FN.folder() == str(d / "finish")
+    assert set(r["fingerprint"]["assets"]) >= {"card.font", "quote.font", "captions.font_file", "logo.file"}
+    Image.new("RGBA", (64, 32), (0, 0, 255, 255)).save(d / "kit" / "logo.png")      # same name, other bytes
+    c = FN.check()
+    assert c["state"] == "drift" and c["changes"] == [f"logo.file bytes changed ({d / 'kit' / 'logo.png'})"]
+    assert PR.brand_key() != key0                                                    # the pre-render cache sees bytes
+    pack = json.loads((d / "brand.json").read_text()); pack["card"]["fill"] = "#00FF00"
+    (d / "brand.json").write_text(json.dumps(pack))
+    c = FN.check()
+    assert "card.fill '#111111'→'#00FF00'" in c["changes"] and any("logo.file" in x for x in c["changes"])
+    done = FN.restore()
+    assert any(x.startswith("logo.file: restored") for x in done) and any("card" in x for x in done if "brand pack" in x)
+    assert FN.check()["state"] == "ok" and (d / "brand.json.before-restore").exists()
+    r2 = FN.approve("V4", still=False)
+    assert r2["version"] == 2 and [h["version"] for h in FN.history()] == [1, 2]
+    FN.restore(1)
+    assert FN.approved()["version"] == 1                                              # an older version back
+    os.remove(d / "kit" / "logo.png")
+    assert any("logo.file file missing" in x for x in FN.check()["changes"])
+    with pytest.raises(SystemExit, match="missing"):
+        FN.approve("broken", still=False)
+
+
+def test_every_render_has_a_finish_receipt_and_a_drifted_clip_never_drops(tmp_path, monkeypatch):
+    from PIL import Image
+    from clipengine import finish as FN, render as V, publish as PB
+    d = _finish_pack(tmp_path, monkeypatch)
+    monkeypatch.setattr(V, "_render", lambda *a, **k: {"out": a[5]})
+    clip = str(tmp_path / "a.mp4")
+    V.render("src.ts", 0, 0, 3, [], clip)
+    rc = FN.receipt(clip)
+    assert rc["stage"] == "render" and rc["approved"] is None and rc["matches_approved"] is None
+    FN.approve("V3", still=False)
+    V.render("src.ts", 0, 0, 3, [], clip)
+    assert FN.receipt(clip)["approved"] == "v1 “V3”" and FN.receipt(clip)["matches_approved"] is True
+    cmds = []
+    monkeypatch.setattr(PB.subprocess, "run", lambda cmd, **k: cmds.append(cmd))
+    PB.drop(clip, "slug-1", "t", "d", "2026-11-20T00:00:00Z", post=False)
+    fin = json.loads(cmds[-1][cmds[-1].index("--finish") + 1])
+    assert fin["approved"] == "v1 “V3”" and fin["matches_approved"] is True        # the drop carries it
+    Image.new("RGBA", (64, 32), (0, 0, 255, 255)).save(d / "kit" / "logo.png")
+    clip2 = str(tmp_path / "b.mp4")
+    V.render("src.ts", 0, 0, 3, [], clip2)                                        # rendered with the changed logo
+    n = len(cmds)
+    with pytest.raises(SystemExit, match="NOT DROPPED.*approved v1 “V3”.*logo.file bytes changed"):
+        PB.drop(clip2, "slug-2", "t", "d", "2026-11-20T00:00:00Z", post=False)
+    assert len(cmds) == n                                                          # drop.mjs never ran
+    PB.drop(clip, "slug-1", "t", "d", "2026-11-20T00:00:00Z", post=False)         # a clip made before still drops
+
+
+def test_the_reference_frame_catches_a_look_change_the_settings_alone_would_not(tmp_path, monkeypatch):
+    import shutil as _sh
+    if not _sh.which("ffmpeg"):
+        pytest.skip("ffmpeg")
+    from clipengine import finish as FN, card as CD
+    d = _finish_pack(tmp_path, monkeypatch)
+    r = FN.approve("V3")
+    assert r["still"] == "v1.png" and (d / "finish" / "v1.png").exists()
+    st = FN.check_still(force=True)
+    assert st["same"], st                                                          # same engine, same look
+    real = CD.make_card
+    def louder(title, quote, out_png, *a, **k):                                     # an "engine update" that
+        from PIL import Image                                                      # changes how cards draw
+        res = real(title, quote, out_png, *a, **k)
+        with Image.open(out_png) as im:
+            Image.new("RGBA", im.size, (0, 200, 255, 255)).save(out_png)
+        return res
+    monkeypatch.setattr(CD, "make_card", louder)
+    assert FN.check()["state"] == "ok"                                             # settings + files unchanged...
+    st = FN.check_still(force=True)
+    assert not st["same"] and "looks different" in st["why"]                       # ...but the frame shows it

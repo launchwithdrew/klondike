@@ -125,6 +125,8 @@ def check_title(title: str) -> list[str]:
 def drop(file: str, slug: str, title: str, description: str, moment_at: str, post: bool,
          push: bool = True, check_only: bool = False, platforms: list[str] | None = None,
          schedule: dict | None = None, grade: dict | None = None, moment_window: dict | None = None) -> None:
+    from . import finish as FN
+    receipt = FN.gate(file)                      # a clip with a look other than the approved finish never drops
     cmd = ["node", os.path.join(REPO, "tools", "drop.mjs"), "--file", file, "--slug", slug,
            "--title", title, "--description", description, "--moment-at", moment_at, "--brand-safe"]
     if platforms:
@@ -135,6 +137,9 @@ def drop(file: str, slug: str, title: str, description: str, moment_at: str, pos
         cmd += ["--grade", json.dumps(grade, separators=(",", ":"))]
     if moment_window:
         cmd += ["--moment-window", json.dumps(moment_window, separators=(",", ":"))]
+    if receipt:
+        cmd += ["--finish", json.dumps({k: receipt[k] for k in ("key", "approved", "matches_approved", "engine",
+                                                                  "stage") if k in receipt}, separators=(",", ":"))]
     if check_only:
         cmd.append("--check")
     elif not push:

@@ -145,6 +145,13 @@ def main(argv: list[str] | None = None) -> int:
     tr_ = sub.add_parser("triage", help="route every new draft (preview / review / repair / archive) — cycle runs this")
     tr_.add_argument("--keep", metavar="ID", help="keep an old draft as evergreen (needs --why)")
     tr_.add_argument("--why", help="the editorial reason it is still worth posting")
+    fn_ = sub.add_parser("finish", help="the approved finish (look): approve / check / restore / history")
+    fn_.add_argument("action", choices=["approve", "check", "restore", "history"])
+    fn_.add_argument("--name", help="approve: a name for this version (e.g. V3)")
+    fn_.add_argument("--note", help="approve: why")
+    fn_.add_argument("--no-still", action="store_true", help="approve: skip the reference frame")
+    fn_.add_argument("--still", action="store_true", help="check: re-render the reference frame and compare it now")
+    fn_.add_argument("--version", type=int, help="restore: this version (default: the approved one)")
     sub.add_parser("jobs", help="heavy jobs (transcription, encodes): who runs, who waits and why, 24 h timings")
     sv_ = sub.add_parser("supervisor", help="the native service that keeps the autopilot alive (install/status/stop/resume/uninstall)")
     sv_.add_argument("action", choices=["install", "status", "stop", "resume", "uninstall", "boot", "keep"])
@@ -338,6 +345,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{a.keep}: kept as evergreen — {a.why.strip()}")
         else:
             print(TR.apply() or "triage: nothing new")
+        return 0
+    if a.cmd == "finish":
+        from . import finish as FN
+        if a.action == "approve":
+            r = FN.approve(a.name, a.note, still=not a.no_still)
+            print(f"finish: approved {FN.label(r)} — {len(r['fingerprint']['assets'])} files kept, key {r['fingerprint']['key']}"
+                  + (f", reference frame {os.path.join(FN.folder(), r['still'])}" if r.get("still") else
+                     f" (no reference frame: {r.get('still_error', 'skipped')})"))
+        elif a.action == "restore":
+            print("\n".join(FN.restore(a.version)) or "finish: already the approved version — nothing to restore")
+        elif a.action == "history":
+            ap = FN.approved() or {}
+            for h in FN.history():
+                print(f"{'*' if h['version'] == ap.get('version') else ' '} {FN.label(h):<14} {h['at'][:16]}  "
+                      f"engine {h.get('engine')}  key {h['fingerprint']['key']}" + (f"  — {h['note']}" if h.get("note") else ""))
+        else:
+            print("\n".join(FN.lines()))
+            c = FN.check()
+            for ch in c["changes"]:
+                print(f"  changed: {ch}")
+            if a.still or c["state"] != "none":
+                st = FN.check_still(force=a.still)
+                if st:
+                    print("  reference frame on this engine: " + ("same as approved" if st.get("same") else
+                                                                 "DIFFERENT — " + st.get("why", "")))
         return 0
     if a.cmd == "jobs":
         from . import admission as ADM

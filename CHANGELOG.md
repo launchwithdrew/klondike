@@ -99,3 +99,24 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.8
+
+- Approved finish. `clipengine finish approve --name V3` freezes your channel's look as a numbered version, kept in `brand/finish/`. It records:
+  - the look settings (layout, card, quote, captions, logo);
+  - every font and logo file, by content hash, with a copy of each;
+  - a reference frame rendered through the real pipeline.
+- Every render now writes a receipt beside the clip (`<clip>.finish.json`), and the drop's `post.json` carries it. Each post records which approved version it has.
+- With an approved finish, a clip rendered with a different look is not dropped. The refusal names the change, for example "logo.file bytes changed" or "card.fill '#111111'→'#00FF00'".
+  - `finish restore [--version N]` puts the approved settings and files back byte for byte.
+  - `finish approve` makes the new look the approved one.
+- `finish check --still` re-renders the reference frame and compares pixels. This catches an engine update that changes how your look is drawn even when no setting changed. `doctor` and `cycle` run it once per engine version and say so.
+- Pre-renders are invalidated when the bytes of a font or the logo change, not only when settings change.
+- Without an approved finish nothing is enforced. Receipts are still written.
+
+Export diff
+- Added (1): `clipengine/finish.py`
+- Changed (10): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/ops.py`, `clipengine/prerender.py`, `clipengine/publish.py`, `clipengine/render.py`, `docs/customizing.md`, `tests/test_engine.py`, `tools/drop.mjs`
+- Removed (0)
+
+Leak scan: clean.

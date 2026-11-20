@@ -886,6 +886,21 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             lines.append(tline)
     except Exception as exc:
         AT.event("failure", f"triage failed ({str(exc)[:80]})", key=f"triage:{int(time.time()) // 3600}")
+    try:                                                     # the approved finish: a changed look is said once
+        from . import finish as FN
+        fc = FN.check()
+        if fc["state"] == "drift":
+            AT.event("failure", f"finish changed since the approved {FN.label(FN.approved())}: "
+                     + "; ".join(fc["changes"][:2]) + " — clips with it won't drop; `clipengine finish check`",
+                     key=f"finish-drift:{fc['key']}")
+        elif fc["state"] == "ok":
+            st = FN.check_still()                           # once per engine version (remembered)
+            if st and not st.get("same"):
+                AT.event("failure", f"this engine draws the approved {FN.label(FN.approved())} differently: "
+                         f"{st.get('why', '')} — look at `clipengine finish check --still` before posting",
+                         key=f"finish-still:{st.get('engine')}:{fc['key']}")
+    except Exception:
+        pass
     line = maybe_prerender(cfg)
     if line:
         lines.append(line)
@@ -1008,6 +1023,16 @@ def doctor(accounts: bool = False) -> bool:
     else:
         print("  \u00b7 off-host heartbeat: off \u2014 a dead or sleeping host can't alert you (optional: "
               "config/ops.json \"heartbeat_url\")")
+    try:
+        from . import finish as _FN
+        _fl = _FN.lines()[0]
+        _ok = _FN.check()["state"]
+        _st = _FN.check_still() if _ok != "none" else None
+        _mark = "\u00b7" if _ok == "none" else ("\u2713" if _ok == "ok" and (not _st or _st.get("same")) else "\u2717")
+        print(f"  {_mark} {_fl}" + ("" if not _st else " · reference frame " + ("same on this engine" if _st.get("same")
+                                                                              else "DIFFERENT: " + _st.get("why", ""))))
+    except Exception as exc:
+        print(f"  \u00b7 finish: not checked ({str(exc)[:80]})")
     cdp = config().get("browser_cdp_url")
     from . import handpost as _HP
     if _HP.enabled():

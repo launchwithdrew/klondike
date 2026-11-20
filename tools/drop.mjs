@@ -6,7 +6,7 @@
 //     --description "One true sentence about the clip. #game #streamer" \
 //     --moment-at 2026-11-18T12:41:00-05:00 --brand-safe
 //
-// Options: --platforms youtube,instagram,tiktok (default all) · --schedule tiktok=ISO,... · --grade JSON · --cover 1.2 · --no-push (stage only) · --check (validate only)
+// Options: --platforms youtube,instagram,tiktok (default all) · --schedule tiktok=ISO,... · --grade JSON · --finish JSON · --cover 1.2 · --no-push (stage only) · --check (validate only)
 // It refuses: bad slug, slug or title already live (ledger), missing brand-safe flag, non-vertical or >3 min video.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,6 +65,8 @@ if (momentWindow) {
 }
 const grade = opt('grade', null);                 // banger score JSON from publish, kept with the post for learning
 if (grade) { try { post.grade = JSON.parse(grade); } catch { die('--grade must be JSON'); } }
+const finish = opt('finish', null);                // the finish receipt: which approved look this clip has
+if (finish) { try { post.finish = JSON.parse(finish); } catch { die('--finish must be JSON'); } }
 fs.writeFileSync(path.join(dir, 'post.json'), JSON.stringify(post, null, 2) + '\n'); // written last
 console.log(`staged outbox/${slug}`);
 
