@@ -192,7 +192,8 @@ def notify(cfg: dict, root: str | None = None, now: float | None = None) -> str 
         except Exception as exc:
             errs.append(f"notify_url failed ({str(exc)[:60]})")
     st = _load(root)
-    st["notified_keys"] = (list(told) + [i["key"] for i in new])[-500:]
+    if not errs:                                           # failed (offline?): keep them for the next try
+        st["notified_keys"] = (list(told) + [i["key"] for i in new])[-500:]
     st["notify_at"] = now
     _save(st, root)
     return "notify: " + ("; ".join(errs) if errs else f"sent ({len(new)} new)")

@@ -98,9 +98,9 @@ def _alive(pid: int | None) -> bool:
         return False
 
 
-def _detach(cmd: list[str], log: str, cwd: str = REPO) -> int:
+def _detach(cmd: list[str], log: str, cwd: str = REPO, env: dict | None = None) -> int:
     os.makedirs(os.path.dirname(log), exist_ok=True)
-    env = {**os.environ, "HF_HUB_DISABLE_XET": "1", "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "HF_HUB_DISABLE_XET": "1", "PYTHONUNBUFFERED": "1", **(env or {})}
     with open(log, "a") as fh:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                              env=env, start_new_session=True)
@@ -152,6 +152,25 @@ def start_recorder(channel: str, d: str, buf: float) -> bool:
                    "--buffer", f"{buf}h", "--supervised"], d + ".rec.log")
     open(os.path.join(d, "recorder.pid"), "w").write(str(pid))
     return True
+
+
+RECORDER_STALL_S = 360          # an alive recorder with no new media this long (longer than an ad break) is stuck
+
+
+def recorder_stalled(d: str, now: float | None = None) -> float | None:
+    """Seconds since the recorder's last segment when it is alive but stuck (the process lives, no media
+    arrives), else None. Only the stuck recorder is restarted — healthy sources and the sentinel keep going."""
+    from . import autopilot as AP
+    now = time.time() if now is None else now
+    if not _alive(recorder_pid(d)) or not os.path.exists(os.path.join(d, "index.jsonl")):
+        return None
+    try:
+        started = os.path.getmtime(os.path.join(d, "recorder.pid"))
+    except OSError:
+        started = now
+    age = AP.recorder_stats(d, now - 6 * 3600, now).get("last_segment_age_s")
+    age = (now - started) if age is None else min(age, now - started)
+    return age if age > RECORDER_STALL_S else None
 
 
 def stop_recorder(d: str) -> None:
@@ -715,6 +734,14 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             start_recorder(s["source"] or s["login"], s["dir"], AP.buffer_hours(cfg, _free_gb(), AP.explicit_buffer()))
             notes.append(f"{s['login']}'s recorder restarted")
             AT.event("failure", f"{s['login']}'s recorder had stopped — restarted", key=f"recdied:{s['login']}:{int(now) // 600}")
+        else:
+            stuck = recorder_stalled(s["dir"], now)
+            if stuck:
+                stop_recorder(s["dir"])
+                start_recorder(s["source"] or s["login"], s["dir"], AP.buffer_hours(cfg, _free_gb(), AP.explicit_buffer()))
+                notes.append(f"{s['login']}'s recorder was stuck ({stuck / 60:.0f} min without media) — restarted")
+                AT.event("failure", f"{s['login']}'s recorder was alive but stuck ({stuck / 60:.0f} min without media) "
+                         "— restarted it alone", key=f"recstuck:{s['login']}:{int(now) // 600}")
     if radar:
         try:
             from . import radar as R
@@ -949,6 +976,21 @@ def doctor(accounts: bool = False) -> bool:
     else:
         print("  \u00b7 recording logged out: ad breaks become gaps (optional: set TWITCH_AUTH_TOKEN in the environment "
               "\u2014 docs/troubleshooting.md)")
+    from . import supervise as _SV
+    _kind = _SV.manager()
+    if _SV.installed(_kind):
+        print(f"  \u2713 supervisor: {_kind} service restarts the autopilot after any exit that wasn't a stop")
+    elif _kind != "none":
+        print(f"  \u00b7 supervisor: not installed \u2014 `clipengine supervisor install` so the autopilot survives "
+              "crashes, the agent session ending and reboots")
+    else:
+        print("  \u00b7 supervisor: DEGRADED here (no launchd / user systemd) \u2014 the autopilot runs detached; "
+              "a death is noticed late")
+    if config().get("heartbeat_url"):
+        print("  \u2713 off-host heartbeat: pinged every minute (your monitor alerts when pings stop)")
+    else:
+        print("  \u00b7 off-host heartbeat: off \u2014 a dead or sleeping host can't alert you (optional: "
+              "config/ops.json \"heartbeat_url\")")
     cdp = config().get("browser_cdp_url")
     from . import handpost as _HP
     if _HP.enabled():

@@ -39,6 +39,11 @@ def match(text: str, catalog: dict | None = None) -> list[dict]:
 
 
 def diagnose(text: str | None = None) -> list[dict]:
+    if text is None:
+        from . import supervise as SV
+        for line in SV.status_lines():
+            if line.startswith(("leader: NONE", "OPEN incident", "last 7 days")) or "LATE" in line:
+                print(line)
     hits = match(recent_log_text() if text is None else text)
     if not hits:
         print("diagnose: no known problem in recent logs (run `clipengine doctor` to check the machine)")

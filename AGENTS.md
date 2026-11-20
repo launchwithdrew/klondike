@@ -46,15 +46,15 @@ the **queue** — the only part that needs you.
 
 ## Let it run by itself
 ```bash
-.venv/bin/python -m clipengine autopilot start            # cycle every 5 min in the background (no tokens)
+.venv/bin/python -m clipengine supervisor install        # cycle every 5 min; restarted after crashes and reboots
 .venv/bin/python -m clipengine attention                  # ONE line of what needs you, or nothing
 ```
-`--sessions` runs only in the streamers' usual hours (`clipengine schedule`); `autopilot status` / `stop`.
+No service manager on the host? `autopilot start` (degraded). `supervisor status`: every outage with its cause. `--sessions`: only the streamers' usual hours; `autopilot stop` stays stopped.
 `attention`: urgent drafts, overdue posts, clips due, failures, new drafts, the daily report (`--seen` marks it
 read). To get it on the user's phone, add to `config/ops.json`:
 `"notify_cmd": "curl -s -d \"$CLIPENGINE_ATTENTION\" ntfy.sh/<a-long-random-topic>"` (they subscribe to that
-topic in the ntfy app), or `"notify_url"` for a webhook that takes `{"text": ...}`. If nothing ran for a while,
-the next cycle scans the saved streams of that time and queues their best moments, so nothing is lost.
+topic in the ntfy app), or `"notify_url"` for a webhook that takes `{"text": ...}`. A gap is caught up from the
+saved streams.
 **Other sources:** `kick:<slug>` runs on audio + viewers' clips (Kick refuses chat to outside clients;
 `kick-check` says `READY (audio mode)`); `yt:@handle` uses live chat when YouTube serves it, else audio.
 Streamers with subscriber-only saved streams are noticed by themselves and get a full sentinel when live.

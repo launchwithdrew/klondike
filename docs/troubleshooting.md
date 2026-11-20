@@ -5,6 +5,7 @@ machine). Most problems are one of these:
 
 | Symptom | Fix |
 |---|---|
+| Autopilot stops, nothing ran overnight, machine overloaded | `docs/reliability.md` |
 | A sentinel shows DOWN | `clipengine cycle` restarts it; if it keeps dying, `diagnose` |
 | "not signed in" / "wrong channel" / "logged in as @…" | The user signs in again: `cd engine && node post.mjs --login`, then `--check` |
 | Posts stuck in `outbox/` | The poster isn't running: `cycle` starts it; or `cd engine && node post.mjs --once` |
@@ -20,7 +21,7 @@ machine). Most problems are one of these:
 | kick-check: `READY (audio mode)` / `chat ✓ refused by Kick (pusher 4001)` | Normal: Kick refuses its chat to outside clients. Kick sentinels judge on audio and on viewers' clips; nothing to fix |
 | catch-up: `broadcast …: video unreadable here` | Kick's saved-broadcast video (stream.kick.com) is blocked from this machine. The moment isn't drafted; run Kick sources from a machine that reaches stream.kick.com |
 | kick-check: `record ✗ … official API gives no playback URL` | Live status came from Kick's official API, but kick.com's channel API (the only source of the playback URL) refused this machine. Run Kick sentinels from a machine kick.com allows |
-| "engine Chrome did not start" | The error now shows what Chrome said. Running as root (Docker, cloud VM) is handled; no screen → it runs headless. "certificate" errors: give Chrome the machine's CA certificates. A proxy that needs a username/password: Chrome can't use one directly — run a small local forwarding proxy and point Chrome at it |
+| "engine Chrome did not start" | The error shows what Chrome said. Root (Docker, cloud VM) and no screen (headless) are handled. "certificate" errors: give Chrome the machine's CA certificates. A proxy with a username/password: run a local forwarding proxy and point Chrome at it |
 | Signing in on a computer with no screen (an agent's VM) | `post.mjs --login` can't show a window there. Sign in inside a browser you *can* see (e.g. your agent's own), start it with `--remote-debugging-port=9222`, and add `"browser_cdp_url": "http://127.0.0.1:9222"` to `config/ops.json` — the poster, stats and doctor then use that signed-in browser; check with `node post.mjs --check` |
 | The signed-in browser is somewhere the engine can't reach (a cloud browser) | `"post_with": "agent"` in `config/ops.json`: the agent uploads each clip with its own browser from `clipengine to-post`, then runs `clipengine posted …` |
 | "render came out N s short" | The recording has a hole in that window (the recorder lost the stream for a moment). Choose a moment inside the recording or trim with `--end` — the engine won't post a clip that lost its ending |

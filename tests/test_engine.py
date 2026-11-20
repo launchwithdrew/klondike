@@ -8,6 +8,8 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+import tempfile  # noqa: E402
+os.environ.setdefault("CLIPENGINE_ADMISSION_ROOT", tempfile.mkdtemp(prefix="klondike-heavy-"))
 
 from clipengine import censor as C  # noqa: E402
 from clipengine import headers as H  # noqa: E402
@@ -2792,7 +2794,7 @@ def test_a_dead_autopilot_is_revived_by_a_sentinel_once(tmp_path, monkeypatch):
     assert AP.revive_if_dead("streamera") is None                         # never started: nothing to do
     (tmp_path / "autopilot.pid").write_text("999999")                     # started, then died
     started = []
-    monkeypatch.setattr(AP, "autopilot_start", lambda every, sessions: started.append((every, sessions)) or "started")
+    monkeypatch.setattr(AP, "autopilot_start", lambda every, sessions, by="manual": started.append((every, sessions)) or "started")
     assert AP.autopilot_died()
     assert AP.revive_if_dead("streamera", now=1_800_000_000) == "started" and started == [(5, True)]
     assert "restarted by the streamera sentinel" in AT.line()
@@ -3636,6 +3638,8 @@ def test_post_verification_rejects_wrong_author_and_recovers_attention(tmp_path,
 
     monkeypatch.setattr(verify, "_json", oembed)
     root = str(tmp_path / "runs")
+    drop = tmp_path / "outbox" / "one"; drop.mkdir(parents=True)
+    (drop / "post.json").write_text(json.dumps({"slug": "one", "platforms": ["youtube", "instagram", "tiktok"]}))
     with pytest.raises(SystemExit, match="author does not match"):
         handpost.mark("one", "youtube", "https://youtu.be/cut")
     assert not (tmp_path / "ledger.jsonl").exists()
@@ -3836,3 +3840,321 @@ def test_program_forecast_uses_rolling_views_and_names_owner_task(tmp_path):
     assert "9,950/10k followers + 115,000/100k views (30d)" in line
     assert "tiktok ~2d" in line
     assert tasks and tasks[0].startswith("Owner: TikTok Studio")
+
+
+def test_posted_records_only_what_the_gate_approved_unless_overridden(tmp_path, monkeypatch):
+    import json as _json
+    from clipengine import handpost as HP, moments, verify
+    monkeypatch.setattr(verify, "post", lambda *a: "oembed")
+    monkeypatch.setattr(HP, "REPO", str(tmp_path))
+    monkeypatch.setattr(HP, "_sync", lambda *a: None)
+    d = tmp_path / "outbox" / "jx"; d.mkdir(parents=True)
+    (d / "post.json").write_text(_json.dumps({"slug": "jx", "login": "jx", "platforms": ["youtube"],
+                                              "moment_at": "2026-11-19T21:42:37+00:00"}))
+    with pytest.raises(SystemExit, match="approved jx for youtube only"):
+        HP.mark("jx", "instagram", "https://instagram.com/reel/a/")      # platform the drop didn't list
+    with pytest.raises(SystemExit, match="has no drop"):
+        HP.mark("solo", "youtube", "https://youtube.com/shorts/b")      # no drop at all
+    with pytest.raises(SystemExit, match="needs --login CREATOR and --moment-at"):
+        HP.mark("solo", "youtube", "https://youtube.com/shorts/b", override="owner's call")
+    with pytest.raises(SystemExit, match="needs --login"):
+        HP.mark("solo", "youtube", "https://youtube.com/shorts/b", override="owner's call", login="ag",
+                moment_at="2026-11-19 21:00")                           # no time zone: refused
+    assert not (tmp_path / "ledger.jsonl").exists()
+    HP.mark("jx", "youtube", "https://youtube.com/shorts/c")
+    assert "override: outside the gate" in HP.mark("jx", "instagram", "https://instagram.com/reel/a/", override="owner's call")
+    msg = HP.mark("solo", "youtube", "https://youtube.com/shorts/b", override="owner's call (gate 0.0)",
+                  login="AG", moment_at="2026-11-19T21:00:00Z")
+    assert "recorded as an override" in msg
+    rows = {(r["slug"], r["platform"]): r for r in HP._ledger()}
+    assert "override" not in rows[("jx", "youtube")] and rows[("jx", "instagram")]["override"] == "owner's call"
+    solo = rows[("solo", "youtube")]
+    assert solo["override"] == "owner's call (gate 0.0)" and solo["login"] == "ag"
+    t = moments.timestamp("2026-11-19T21:00:00Z")
+    assert moments.match("ag", t + 10, t + 20, list(rows.values()))["slug"] == "solo"   # the repeat guard knows it
+    assert moments.match("ag", t + 120, t + 130, list(rows.values())) is None
+
+
+def test_learn_leaves_override_posts_out_of_the_weights():
+    from clipengine import learn as L
+    at = "2026-11-19T20:00:00+00:00"
+    ledger = [{"slug": "a", "platform": "youtube", "status": "live", "at": at},
+              {"slug": "b", "platform": "youtube", "status": "live", "at": at},
+              {"slug": "x", "platform": "youtube", "status": "live", "at": at, "override": "owner's call"}]
+    perf = [{"slug": s, "platform": "youtube", "views": v, "age_h": 24} for s, v in (("a", 100), ("b", 120), ("x", 90000))]
+    clipped = [{"slug": "a", "login": "one"}, {"slug": "b", "login": "two"}, {"slug": "x", "login": "three"}]
+    w = L.learn(perf, ledger, clipped, {})
+    assert "three" not in w.get("streamers", {}) and {"one", "two"} <= set(w.get("streamers", {}))
+
+
+# ---- supervisor drills (spec §1): lease, heartbeat, incidents, service files ----------------------------
+
+import time  # noqa: E402
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _hold_lease(root, extra=""):
+    """A real separate process that takes the leader lease and sleeps (then gets killed)."""
+    import subprocess as _sp
+    code = (f"import sys,time; sys.path.insert(0, {REPO!r}); from clipengine import supervise as SV; "
+            f"L=SV.Lease({str(root)!r}); assert L.acquire(); L.update(heartbeat_at=time.time()); {extra}"
+            "print('held', flush=True); time.sleep(60)")
+    p = _sp.Popen([sys.executable, "-c", code], stdout=_sp.PIPE, text=True)
+    assert p.stdout.readline().strip() == "held"
+    return p
+
+
+def test_one_leader_and_a_killed_leader_frees_the_lease(tmp_path):
+    from clipengine import supervise as SV
+    p = _hold_lease(tmp_path)
+    try:
+        assert SV.holder(str(tmp_path))["pid"] == p.pid
+        second = SV.Lease(str(tmp_path))
+        assert not second.acquire()                         # a revival racing the leader steps aside
+    finally:
+        p.kill(); p.wait()                                  # SIGKILL: no exit record, like the OOM killer
+    assert SV.holder(str(tmp_path)) is None                 # the kernel dropped the lock with the process
+    lease = SV.Lease(str(tmp_path))
+    assert lease.acquire() and lease.generation == 2
+    inc = SV.reconcile("service", root=str(tmp_path))
+    assert inc["cause"] == "unknown" and inc["status"] == "recovered" and inc["recovered_by"] == "service"
+    assert "historical cause unknown" in inc["evidence"]
+    assert SV.reconcile("service", root=str(tmp_path))["status"] == "recovered"   # idempotent
+    assert len(SV.incidents(str(tmp_path))) == 1
+    lease.release()
+
+
+def test_simultaneous_starts_converge_on_one_leader(tmp_path):
+    import subprocess as _sp
+    code = (f"import sys,time; sys.path.insert(0, {REPO!r}); from clipengine import supervise as SV; "
+            f"L=SV.Lease({str(tmp_path)!r}); ok=L.acquire(); print('LEAD' if ok else 'STEP', flush=True); "
+            "time.sleep(1.5 if ok else 0)")
+    ps = [_sp.Popen([sys.executable, "-c", code], stdout=_sp.PIPE, text=True) for _ in range(4)]
+    outs = [p.communicate(timeout=30)[0].strip() for p in ps]
+    assert outs.count("LEAD") == 1 and outs.count("STEP") == 3
+
+
+def test_operator_stop_and_self_update_are_not_incidents(tmp_path):
+    from clipengine import supervise as SV
+    lease = SV.Lease(str(tmp_path)); assert lease.acquire()
+    SV.record_exit(lease.generation, "update", 0, str(tmp_path)); lease.release()
+    lease = SV.Lease(str(tmp_path)); assert lease.acquire()
+    assert SV.reconcile("service", root=str(tmp_path)) is None
+    SV.mark_stopped("operator", str(tmp_path)); lease.release()
+    assert SV.reconcile(None, root=str(tmp_path), now=time.time() + 3600) is None
+    assert SV.incidents(str(tmp_path)) == []
+
+
+def test_classify_signal_crash_stall_and_reboot():
+    from clipengine import supervise as SV
+    prev = {"generation": 4, "heartbeat_at": 1000.0, "boot_id": "aaa"}
+    assert SV.classify(prev, {"generation": 4, "reason": "signal:SIGTERM (not an operator stop)"}, 2000, None, "aaa")[0] == "signal"
+    assert SV.classify(prev, {"generation": 4, "reason": "crash: ValueError: x"}, 2000, None, "aaa")[0] == "crash"
+    assert SV.classify(prev, {"generation": 4, "reason": "stalled: no cycle progress for 41 min"}, 2000, None, "aaa")[0] == "stalled"
+    assert SV.classify(prev, {"generation": 3, "reason": "stop"}, 2000, None, "bbb")[0] == "reboot"   # old exit, new boot
+    assert SV.classify(prev, {}, 2000, 1500.0, "")[0] == "reboot"                                  # booted after last beat
+    assert SV.classify(prev, {}, 2000, 900.0, "aaa")[0] == "unknown"
+
+
+def test_eleven_and_a_half_hours_dark_is_one_incident_one_alert_one_recovery(tmp_path):
+    from clipengine import attention as AT, supervise as SV
+    root = str(tmp_path)
+    p = _hold_lease(tmp_path)
+    p.kill(); p.wait()
+    lease_file = tmp_path / "autopilot.lease.json"
+    st = json.loads(lease_file.read_text()); t0 = 1_800_000_000.0
+    st.update(heartbeat_at=t0, started_at=t0 - 600); lease_file.write_text(json.dumps(st))
+    assert SV.reconcile(None, root=root, now=t0 + 60) is None              # 1 missed beat: not yet
+    for minutes in (5, 60, 300, 690):                                       # status checks through the night
+        SV.reconcile(None, root=root, now=t0 + minutes * 60)
+    items = [i for i in AT.pending(root) if i["key"].startswith("incident:")]
+    assert len(items) == 1 and "autopilot is down 5 min" in items[0]["text"]
+    lease = SV.Lease(root); assert lease.acquire()
+    inc = SV.reconcile("service", root=root, now=t0 + 690 * 60)
+    assert inc["status"] == "recovered" and inc["dark_min"] == 690.0
+    keys = [i["key"] for i in AT.pending(root)]
+    assert not any(k.startswith("incident:") for k in keys)                 # the open alert cleared once
+    assert sum(k.startswith("incident-recovered:") for k in keys) == 1
+    assert len(SV.incidents(root)) == 1
+    lease.release()
+
+
+def test_heartbeat_notices_sleep_stalls_and_survives_a_dead_ping(tmp_path):
+    from clipengine import supervise as SV
+    lease = SV.Lease(str(tmp_path)); assert lease.acquire()
+    wall, mono = [1000.0], [50.0]
+    stalls = []
+    hb = SV.Heartbeat(lease, stall_s=600, ping_url="http://127.0.0.1:9/never", on_stall=stalls.append,
+                      clock=lambda: wall[0], mono=lambda: mono[0])
+    hb.set_phase("cycle")
+    wall[0] += 30; mono[0] += 30; hb.beat()
+    assert SV.incidents(str(tmp_path)) == [] and not stalls and hb.ping_error  # offline ping: noted, no crash
+    wall[0] += 3600; mono[0] += 30; hb.beat()                                  # the host slept ~59 min
+    inc = SV.incidents(str(tmp_path))
+    assert inc and inc[0]["cause"] == "suspension" and inc[0]["dark_min"] > 55
+    assert stalls and stalls[0] > 600                                          # the cycle phase stalled too
+    assert json.loads((tmp_path / "autopilot.lease.json").read_text())["heartbeat_at"] == wall[0]
+    lease.release()
+
+
+def test_crash_loop_escalates_and_backs_off(tmp_path):
+    from clipengine import attention as AT, supervise as SV
+    root, now = str(tmp_path), 1_800_000_000.0
+    for g in range(1, 4):
+        SV._append_incident({"id": f"x{g}", "cause": "crash", "dark_from": now - 600 + g, "status": "recovered"}, root)
+    assert SV.crash_loop_delay(root, now) == 30.0
+    lease = SV.Lease(root); assert lease.acquire()
+    SV.reconcile("service", root=root, now=now, prev={"generation": 9, "heartbeat_at": now - 100, "boot_id": "b"})
+    assert any("CRASH LOOP" in i["text"] for i in AT.pending(root))
+    assert SV.crash_loop_delay(root, now) == 60.0
+    lease.release()
+
+
+def test_autopilot_sigterm_without_a_stop_exits_for_restart_and_stop_survives(tmp_path):
+    import subprocess as _sp, signal as _sig
+    root = tmp_path / "runs"; root.mkdir()
+    code = (f"import sys; sys.path.insert(0, {REPO!r}); from clipengine import autopilot as AP; "
+            f"AP.APSTATE={str(root / 'autopilot.json')!r}; AP.RUNS={str(root)!r}; "
+            "AP.autopilot_run(5, cycle_cmd=[sys.executable, '-c', 'print(1)'])")
+    env = {**os.environ, "CLIPENGINE_STARTED_BY": "service"}
+    p = _sp.Popen([sys.executable, "-c", code], env=env)
+    for _ in range(100):
+        if (root / "autopilot.lease.json").exists() and json.loads((root / "autopilot.lease.json").read_text()).get("phase") == "sleep":
+            break
+        time.sleep(0.1)
+    p.send_signal(_sig.SIGTERM)
+    assert p.wait(timeout=30) == 75                                            # the service manager restarts it
+    assert json.loads((root / "autopilot.exit.json").read_text())["reason"].startswith("signal:SIGTERM")
+    (root / "autopilot.stopped").write_text(json.dumps({"at": time.time(), "by": "operator"}))
+    p = _sp.Popen([sys.executable, "-c", code], env=env)
+    assert p.wait(timeout=30) == 0                                             # stopped on purpose: stays down
+
+
+def test_a_hung_cycle_holding_its_pipe_cannot_hang_the_loop(tmp_path):
+    from clipengine import autopilot as AP
+    cmd = [sys.executable, "-c", "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+           "print('started', flush=True); time.sleep(60)"]
+    t = time.time()
+    out, rc = AP.run_cycle(cmd, 1.5, str(tmp_path / "out"))
+    assert rc == -1 and time.time() - t < 20 and "started" in out and "stopped it" in out
+
+
+def test_failed_notifications_stay_queued_until_delivered(tmp_path):
+    from clipengine import attention as AT
+    root = str(tmp_path)
+    AT.event("failure", "autopilot is down", key="incident:x", root=root)
+    assert AT.notify({"notify_cmd": "exit 7"}, root=root, now=1000.0) == "notify: notify_cmd exited 7"
+    assert AT.notify({"notify_cmd": "true"}, root=root, now=1100.0) == "notify: sent (1 new)"
+    assert AT.notify({"notify_cmd": "true"}, root=root, now=1200.0) is None
+
+
+def test_service_files_restart_on_failure_but_not_after_a_stop():
+    from clipengine import supervise as SV
+    plist = SV.render_service("launchd", 5, True)
+    assert "<key>SuccessfulExit</key><false/>" in plist and "--sessions" in plist and "RunAtLoad" in plist
+    assert "CLIPENGINE_STARTED_BY</key><string>service" in plist
+    unit = SV.render_service("systemd", 5, False)
+    assert "Restart=on-failure" in unit and "RestartSec=30" in unit and "CLIPENGINE_STARTED_BY=service" in unit
+
+
+def test_a_live_recorder_with_no_new_media_is_stuck_but_an_ad_break_is_not(tmp_path, monkeypatch):
+    from clipengine import ops as O
+    d = tmp_path / "sentinel-x"; (d / "segments").mkdir(parents=True)
+    (d / "recorder.pid").write_text(str(os.getpid()))                   # alive
+    now = time.time()
+    os.utime(d / "recorder.pid", (now - 3600, now - 3600))
+    (d / "index.jsonl").write_text(json.dumps({"f": "a.ts", "t": now - 200, "d": 2}) + "\n")
+    assert O.recorder_stalled(str(d), now) is None                      # 3 min quiet: could be an ad break
+    (d / "index.jsonl").write_text(json.dumps({"f": "a.ts", "t": now - 900, "d": 2}) + "\n")
+    assert O.recorder_stalled(str(d), now) > 600                        # 15 min, process alive: stuck
+    (d / "recorder.pid").write_text("999999")
+    assert O.recorder_stalled(str(d), now) is None                      # dead is the other branch's job
+
+
+# ---- admission (spec §2): one heavy job at a time on lite, capture first -------------------------------
+
+def test_admission_limits_heavy_jobs_and_a_killed_holder_frees_its_slot(tmp_path):
+    import subprocess as _sp
+    from clipengine import admission as ADM
+    code = (f"import sys,time; sys.path.insert(0, {REPO!r}); from clipengine import admission as A; "
+            f"cm=A.slot('render', kind='catchup', root={str(tmp_path)!r}, slots=1, min_free_gb=0, poll_s=0.05); "
+            "cm.__enter__(); print('in', flush=True); time.sleep(60)")
+    p = _sp.Popen([sys.executable, "-c", code], stdout=_sp.PIPE, text=True)
+    assert p.stdout.readline().strip() == "in"
+    assert [r["kind"] for r in ADM.running(str(tmp_path))] == ["catchup"]
+    got = []
+    import threading as _th
+    def second():
+        with ADM.slot("transcribe", kind="live", root=str(tmp_path), slots=1, min_free_gb=0, poll_s=0.05):
+            got.append(time.time())
+    t = _th.Thread(target=second); t.start()
+    time.sleep(0.5)
+    assert not got                                               # one heavy job at a time
+    w = ADM.waiters(str(tmp_path))
+    assert w and w[0]["kind"] == "live" and "busy" in w[0]["reason"]
+    p.kill(); p.wait()                                           # killed mid-encode: the kernel frees the slot
+    t.join(timeout=10)
+    assert got and ADM.waiters(str(tmp_path)) == []
+    st = ADM.stats(str(tmp_path))
+    assert st["transcribe"]["n"] == 1 and st["transcribe"]["wait_p50"] >= 0.4
+
+
+def test_admission_serves_the_live_moment_before_catchup_and_respects_memory(tmp_path):
+    import threading as _th
+    from clipengine import admission as ADM
+    root = str(tmp_path)
+    order, gate = [], _th.Event()
+    def job(kind, delay):
+        time.sleep(delay)
+        with ADM.slot("x", kind=kind, root=root, slots=1, min_free_gb=1.0, poll_s=0.05, free=lambda: None if gate.is_set() else 0.2):
+            order.append(kind)
+    import os as _os
+    # threads share a pid, so waiters are told apart by priority + arrival; memory gates everyone at first
+    ts = [_th.Thread(target=job, args=("sweep", 0.0)), _th.Thread(target=job, args=("live", 0.2))]
+    for t in ts: t.start()
+    time.sleep(0.6)
+    assert order == []                                           # 0 GB free: nothing heavy starts
+    gate.set()
+    for t in ts: t.join(timeout=10)
+    assert set(order) == {"sweep", "live"}
+    assert ADM.kind_of(["x", "sentinel"]) == "live" and ADM.kind_of(["x", "catchup", "--sweep"]) == "sweep"
+    assert ADM.kind_of(["x", "publish-queued"]) == "publish"
+
+
+def test_admission_is_reentrant_inside_one_job(tmp_path):
+    from clipengine import admission as ADM
+    with ADM.slot("render", kind="publish", root=str(tmp_path), slots=1, min_free_gb=0):
+        with ADM.slot("transcribe", kind="publish", root=str(tmp_path), slots=1, min_free_gb=0):
+            pass                                                 # would deadlock if not re-entrant
+
+
+def test_catchup_window_uses_the_watermark_or_refuses_to_guess(tmp_path):
+    from clipengine import autopilot as AP
+    cov = str(tmp_path / "coverage.json")
+    with pytest.raises(ValueError, match="no coverage watermark"):
+        AP.catchup_window(None, 10_000.0, path=cov)
+    with pytest.raises(ValueError, match="empty"):
+        AP.catchup_window("10000", 9_000.0, path=cov)
+    assert AP.catchup_window("5000", 10_000.0, path=cov) == (5000.0, "from --since")
+    AP.mark_covered(8_000.0, path=cov)
+    AP.mark_covered(7_000.0, path=cov)                                   # never moves backwards
+    assert AP.catchup_window(None, 10_000.0, path=cov)[0] == 8_000.0
+    since, how = AP.catchup_window(None, 8_000.0 + 20 * 3600, path=cov)
+    assert since == 8_000.0 + 8 * 3600 and "capped" in how
+    with pytest.raises(ValueError, match="no coverage watermark"):
+        AP.catchup_window(None, 10_000.0, sweep=True, path=cov)          # the sweep has its own watermark
+
+
+def test_a_loop_with_a_custom_cycle_never_reexecs_into_a_real_one(tmp_path, monkeypatch):
+    """Regression (Nov 20): a test loop re-exec'd into a real autopilot when the code changed mid-run."""
+    from clipengine import autopilot as AP
+    monkeypatch.setattr(AP, "APSTATE", str(tmp_path / "ap.json"))
+    monkeypatch.setattr(AP.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(AP, "_maybe_restart", lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-exec")))
+    AP.autopilot_run(0.0001, rounds=1, cycle_cmd=[sys.executable, "-c", "print(1)"])
+    # rounds=None with a custom cycle is how the SIGTERM drill runs; it must not call _maybe_restart either
+    stop = {"now": False, "sig": None}
+    lease = __import__("clipengine.supervise", fromlist=["x"]).Lease(str(tmp_path / "r")); assert lease.acquire()
+    hb = type("HB", (), {"set_phase": lambda self, p: stop.update(now=(p == "sleep"))})()
+    AP._loop(0.0001, False, None, [sys.executable, "-c", "print(1)"], stop, hb, lease, str(tmp_path / "r"))
+    lease.release()
+

@@ -236,6 +236,14 @@ def better_pass(first: dict, second: dict) -> bool:
 
 
 def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:
+    """Transcription is heavy work: it waits its turn for a heavy-job slot (admission.py) so recording keeps
+    the machine first."""
+    from .admission import slot
+    with slot("transcribe"):
+        return _transcribe(x, model_name, offset, prompt)
+
+
+def _transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:
     """faster-whisper on a PCM array. Times are shifted by `offset` so they
     can be expressed in VOD seconds. Same JSON shape as v1 caption.py
     (segments[].words[].w/start/end) so caption_logic and HyperFrames keep

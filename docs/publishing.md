@@ -45,7 +45,7 @@ See [checking the engine’s calls](judging.md) for headline evidence and skip r
 ## Verify and review
 
 - Run `clipengine doctor --accounts` in agent mode to check the public profiles configured in your brand pack.
-- After posting in your browser, `clipengine posted` checks the live YouTube or TikTok author before recording it. For Instagram, open the post and compare its author to the configured username, then add `--confirmed`.
+- After posting in your browser, `clipengine posted` checks the live YouTube or TikTok author before recording it. For Instagram, open the post and compare its author to the configured username, then add `--confirmed`. `posted` only records what the gate approved: a clip that went through `publish` / `publish-queued`, on a platform its drop lists. If your user has a clip posted anyway, record it with `--override "reason"` (plus `--login` and `--moment-at` when there was no drop, so the repeat guard knows the moment). The ledger keeps the reason, and `learn` leaves overrides out of its weights.
 - `clipengine review --id ID [--title "…" --quote "…"]` writes a portable HTML review for the draft. It includes frames, a payoff marker, the transcript, the score, safety flags, and the headline check.
 - `clipengine facecam-setup --channel LOGIN` proposes a refined webcam box and saves a check image. Approve a reviewed box with `--yes x,y,w,h`, or use `--no` for a creator with no webcam overlay.
 - `clipengine import-posts --from FILE` accepts live ledger records with creator and moment metadata. It also accepts a JSON object or list with `slug`, `creator`, `moment_at`, and a `links` object keyed by platform.

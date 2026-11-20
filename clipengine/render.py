@@ -226,7 +226,14 @@ def facecam_geometry(box: list[float], src_w: int, src_h: int, max_frac: float =
     return {"cam": (cw, ch, cx, cy), "top": top, "bottom": bot, "game_w": gw, "game_x": gx // 2 * 2}
 
 
-def render(source: str, source_t0: float, start_s: float, end_s: float,
+def render(*a, **k) -> dict:
+    """The final encode is heavy work: it waits its turn for a heavy-job slot (admission.py)."""
+    from .admission import slot
+    with slot("render"):
+        return _render(*a, **k)
+
+
+def _render(source: str, source_t0: float, start_s: float, end_s: float,
            words: list[dict], out: str, crop: str = "blur", header: str | None = None,
            hook: str | None = None, hook_s: float = 2.0, watermark: str | None = WATERMARK,
            censor: bool = True, mute_audio: bool = False, layout: str = "single",
@@ -452,7 +459,13 @@ def card_position(bp: dict, slot: dict, card_h: int, card_mid: int) -> int:
     return 150                                              # below the platforms' top bar
 
 
-def burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: dict, trim_start: float = 0.0,
+def burn_card(*a, **k):
+    from .admission import slot
+    with slot("finish"):
+        return _burn_card(*a, **k)
+
+
+def _burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: dict, trim_start: float = 0.0,
               dur: float | None = None, censor: bool = True, captions: str | None = None,
               payoff_s: float | None = None) -> dict:
     """The last step of a pre-rendered draft: overlay the headline card on the finished clip (captions,

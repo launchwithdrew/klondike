@@ -30,6 +30,7 @@ import sys
 import time
 
 from . import attention as AT
+from . import supervise as SV
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(REPO, "runs")
@@ -386,6 +387,38 @@ def catchup_targets(roster: dict, sentinel_cover: dict | None = None, restricted
             and not l.startswith("yt") and l.lower() not in restricted]
 
 
+COVERAGE = os.path.join(RUNS, "coverage.json")
+MAX_CATCHUP_H = 12.0
+
+
+def catchup_window(since_arg, until: float, sweep: bool = False, path: str | None = None) -> tuple[float, str]:
+    """(since, how): an explicit --since, else the last completed coverage watermark (bounded to 12 h). No
+    watermark and no --since is an error — never a silent guess."""
+    if since_arg not in (None, ""):
+        since = float(since_arg)
+        how = "from --since"
+    else:
+        mark = _json(path or COVERAGE).get("sweep_until" if sweep else "catchup_until")
+        if not mark:
+            raise ValueError("catchup: no coverage watermark yet — give --since (unix seconds) for the first run")
+        since = max(float(mark), until - MAX_CATCHUP_H * 3600)
+        how = "from the last completed coverage" + (" (capped at 12 h)" if since > float(mark) else "")
+    if since >= until:
+        raise ValueError(f"catchup: the window is empty (since {since:.0f} ≥ until {until:.0f}) — nothing to scan")
+    if until - since > MAX_CATCHUP_H * 3600 * 2:
+        raise ValueError(f"catchup: a {(until - since) / 3600:.0f} h window is too long — give a --since within 24 h")
+    return since, how
+
+
+def mark_covered(until: float, sweep: bool = False, path: str | None = None) -> None:
+    path = path or COVERAGE
+    st = _json(path)
+    key = "sweep_until" if sweep else "catchup_until"
+    st[key] = max(float(st.get(key) or 0), until)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(st, open(path, "w"))
+
+
 def maybe_catchup(state: dict, now: float, cfg: dict) -> str | None:
     """cycle: after a gap, start a background catch-up scan of the missed window (one line, or None)."""
     last = state.get("cycle_at")
@@ -719,22 +752,41 @@ def _new_code_starts() -> tuple[bool, str]:
         return False, str(exc)[:120]
 
 
+def _root() -> str:
+    return os.path.dirname(APSTATE)
+
+
+def _leader() -> dict | None:
+    """The live capture leader: whoever holds the lease (a pid file alone proves nothing — pids get reused).
+    A loop from before the lease existed counts by its pid until it restarts onto this code."""
+    lead = SV.holder(_root())
+    if lead:
+        return lead
+    pid = _read_pid(PID)
+    if not SV.ever_started(_root()) and _alive(pid):
+        return {"pid": pid, "legacy": True}
+    return None
+
+
 def autopilot_status() -> dict:
     st = _json(APSTATE)
-    pid = _read_pid(PID)
-    st["running"] = _alive(pid)
-    st["pid"] = pid
+    lead = _leader()
+    st["running"] = lead is not None
+    st["pid"] = (lead or {}).get("pid") or _read_pid(PID)
     return st
 
 
-def autopilot_start(every_min: float | None = None, sessions: bool = False) -> str:
+def autopilot_start(every_min: float | None = None, sessions: bool = False, by: str = "manual") -> str:
     from .ops import config, _detach
     st = autopilot_status()
     if st["running"]:
         return f"autopilot already running (pid {st['pid']}) — `clipengine autopilot stop` first to change it"
+    SV.clear_stopped(_root())
+    if SV.installed() and SV.service_start():
+        return "autopilot started by its service (`clipengine supervisor status`)"
     every = float(every_min or config().get("autopilot_every_min", 5))
     cmd = [sys.executable, "-m", "clipengine", "autopilot", "run", "--every", str(every)] + (["--sessions"] if sessions else [])
-    pid = _detach(cmd, LOG)
+    pid = _detach(cmd, LOG, env={"CLIPENGINE_STARTED_BY": by})
     os.makedirs(RUNS, exist_ok=True)
     open(PID, "w").write(str(pid))
     return (f"autopilot started (pid {pid}): cycle every {every:g} min"
@@ -759,6 +811,10 @@ def uptime(now: float | None = None, hours: float = 24.0, root: str | None = Non
     since = now - hours * 3600
     recent = [d for d in st.get("deaths") or [] if since <= d.get("at", 0) <= now]
     gaps = [max(0.0, d["at"] - max(since, d.get("dark_from", d["at"]))) / 60 for d in recent]
+    for inc in SV.incidents(root or _root(), since=since):
+        end = inc.get("recovered_at") or now
+        recent.append({"cause": inc.get("cause")})
+        gaps.append(max(0.0, end - max(since, inc.get("dark_from", end))) / 60)
     running = _alive(_read_pid(os.path.join(root, "autopilot.pid"))) if root else autopilot_status()["running"]
     return {"deaths": len(recent), "dark_min": round(sum(gaps)), "running": running,
             "dark_periods": [round(minutes) for minutes in gaps if minutes > 15],
@@ -766,15 +822,17 @@ def uptime(now: float | None = None, hours: float = 24.0, root: str | None = Non
 
 
 def autopilot_died() -> bool:
-    """Started and never stopped on purpose (stop removes the pid file), but its process is gone."""
-    return os.path.exists(PID) and not _alive(_read_pid(PID))
+    """Started and never stopped on purpose, but nobody holds the leader lease now."""
+    if SV.stopped(_root()):
+        return False
+    return (SV.ever_started(_root()) or os.path.exists(PID)) and _leader() is None
 
 
 def revive_if_dead(by: str, now: float | None = None, min_gap_s: float = 900) -> str | None:
     """Called by the always-running sentinels: if the autopilot died (not stopped), start it again with its
     last settings — at most once per 15 min, and only one sentinel does it (a lock file)."""
-    if not autopilot_died():
-        return None
+    if not autopilot_died() or SV.installed():
+        return None                                        # alive, or its service restarts it
     now = now or time.time()
     lock = os.path.join(RUNS, ".ap-revive.lock")
     try:
@@ -801,10 +859,11 @@ def revive_if_dead(by: str, now: float | None = None, min_gap_s: float = 900) ->
         cause = next((l for l in reversed(last) if any(k in l for k in ("Traceback", "Error", "error", "Killed",
                                                                           "restarting", "MemoryError"))), "")
         dark_from = float(st.get("last_cycle_at") or st.get("started_at") or now)
-        deaths = (st.get("deaths") or [])[-19:] + [{"at": now, "dark_from": dark_from, "by": by,
-                                                     "cause": cause[:200], "last": last[-5:]}]
-        _write_ap(deaths=deaths)
-        msg = autopilot_start(st.get("every"), bool(st.get("sessions")))
+        if not SV.ever_started(_root()):                   # a pre-lease loop: the old death record
+            deaths = (st.get("deaths") or [])[-19:] + [{"at": now, "dark_from": dark_from, "by": by,
+                                                         "cause": cause[:200], "last": last[-5:]}]
+            _write_ap(deaths=deaths)
+        msg = autopilot_start(st.get("every"), bool(st.get("sessions")), by=f"revive:{by}")
         AT.event("failure", f"autopilot had stopped unexpectedly — restarted by the {by} sentinel after "
                  f"{(now - dark_from) / 60:.0f} min dark" + (f"; last: {cause[:100]}" if cause else ""),
                  key=f"ap-revive:{int(now) // 900}")
@@ -817,9 +876,15 @@ def revive_if_dead(by: str, now: float | None = None, min_gap_s: float = 900) ->
 
 
 def autopilot_stop() -> str:
-    pid = _read_pid(PID)
+    SV.mark_stopped("operator", _root())                   # first: the loop and its service both honour it
+    SV.service_stop()
+    pid = (_leader() or {}).get("pid") or _read_pid(PID)
     if not _alive(pid):
-        return "autopilot was not running"
+        try:
+            os.remove(PID)
+        except OSError:
+            pass
+        return "autopilot stopped (it stays stopped across restarts until `clipengine autopilot start`)"
     try:
         os.killpg(os.getpgid(pid), signal.SIGTERM)
     except OSError:
@@ -835,7 +900,8 @@ def autopilot_stop() -> str:
         os.remove(PID)
     except OSError:
         pass
-    return "autopilot stopped (sentinels keep running; `clipengine stop --all` stops them too)"
+    return ("autopilot stopped — it stays stopped across restarts until `clipengine autopilot start` "
+            "(sentinels keep running; `clipengine stop --all` stops them too)")
 
 
 def autopilot_status_line() -> str:
@@ -855,7 +921,7 @@ def _write_ap(**kw) -> None:
     json.dump(st, open(APSTATE, "w"), indent=1)
 
 
-def _maybe_restart(stamp: float, every_min: float, sessions: bool, t0: float) -> float:
+def _maybe_restart(stamp: float, every_min: float, sessions: bool, t0: float, lease=None) -> float:
     """The loop's own code changed: restart on it — but only if the new code starts; else keep this loop."""
     if _code_stamp() == stamp:
         return stamp
@@ -867,6 +933,8 @@ def _maybe_restart(stamp: float, every_min: float, sessions: bool, t0: float) ->
                  "old loop; cycles already use the new code", key=f"ap-restart:{int(t0) // 3600}")
         return _code_stamp()
     print("[autopilot] engine updated — restarting on the new version", flush=True)
+    if lease is not None:
+        SV.record_exit(lease.generation, "update", 0, lease.root)   # the lock drops on exec; not an incident
     try:
         os.execv(sys.executable, [sys.executable, "-m", "clipengine", "autopilot", "run", "--every",
                                   str(every_min)] + (["--sessions"] if sessions else []))
@@ -879,11 +947,87 @@ def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None =
                   cycle_cmd: list[str] | None = None) -> None:
     """The loop itself (runs detached). Each round runs `cycle` as a child process, so a crash in one cycle
     never stops the loop, and re-execs itself when the engine's code changed."""
-    stop = {"now": False}
-    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    stop = {"now": False, "sig": None}
+    root = _root()
+    by = os.environ.get("CLIPENGINE_STARTED_BY", "manual")
+    if SV.stopped(root) and by == "service":
+        print("[autopilot] stopped on purpose (`clipengine autopilot start` resumes) — not starting", flush=True)
+        return
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda n, _f: stop.update(now=True, sig=signal.Signals(n).name))
+    lease = SV.Lease(root)
+    if not lease.acquire(wait_s=1e12 if by == "service" else 0.0, poll_s=30.0,
+                         should_stop=lambda: stop["now"] or bool(SV.stopped(root))):
+        lead = SV.holder(root) or {}
+        print(f"[autopilot] another leader holds the lease (pid {lead.get('pid')}) — not starting a second one",
+              flush=True)
+        return
+    SV.reconcile(recovered_by=by, root=root)
+    try:
+        from .ops import config as _cfg
+        ping = _cfg().get("heartbeat_url")
+    except Exception:
+        ping = None
+    hb = SV.Heartbeat(lease, ping_url=ping)
+    hb.start()
+    try:
+        _loop(every_min, sessions, rounds, cycle_cmd, stop, hb, lease, root)
+    except BaseException as exc:
+        if not isinstance(exc, SystemExit):
+            SV.record_exit(lease.generation, f"crash: {type(exc).__name__}: {str(exc)[:160]}", SV.EXIT_RESTART, root)
+        raise
+    finally:
+        hb.halt.set()
+    if stop["sig"] and not SV.stopped(root):
+        SV.record_exit(lease.generation, f"signal:{stop['sig']} (not an operator stop)", SV.EXIT_RESTART, root)
+        lease.release()
+        if rounds is None:
+            sys.exit(SV.EXIT_RESTART)                         # a service restarts it
+        return
+    SV.record_exit(lease.generation, "stop", SV.EXIT_STOPPED, root)
+    lease.release()
+
+
+CYCLE_TIMEOUT_S = 1800
+
+
+def run_cycle(cmd: list[str], timeout: float, out_path: str) -> tuple[str, int]:
+    """One cycle in its own process group, output to a file (never a pipe: a grandchild that keeps a pipe open
+    would hang the loop after a timeout). On timeout the whole group is killed. (output, exit code; -1 = hung)"""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w+") as fh:
+        p = subprocess.Popen(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        try:
+            rc = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(p.pid, sig)
+                except OSError:
+                    pass
+                try:
+                    p.wait(timeout=10)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            rc = -1
+        fh.seek(0)
+        out = fh.read()[-20000:].strip()
+    return (out if rc != -1 else (out + f"\ncycle took over {timeout / 60:.0f} min — stopped it").strip()), rc
+
+
+def _loop(every_min, sessions, rounds, cycle_cmd, stop, hb, lease, root) -> None:
+    delay = SV.crash_loop_delay(root)
+    if delay:
+        print(f"[autopilot] crash loop — waiting {delay:.0f} s before cycling", flush=True)
+        end = time.time() + delay
+        while not stop["now"] and time.time() < end:
+            time.sleep(1)
     stamp = _code_stamp()
     cmd = cycle_cmd or [sys.executable, "-m", "clipengine", "cycle"]
-    _write_ap(pid=os.getpid(), every=every_min, sessions=sessions, started_at=time.time())
+    _write_ap(pid=os.getpid(), every=every_min, sessions=sessions, started_at=time.time(),
+              generation=lease.generation)
     n = 0
     print(f"[autopilot] {dt.datetime.now():%H:%M:%S} every {every_min:g} min{' (stream hours only)' if sessions else ''}",
           flush=True)
@@ -891,23 +1035,24 @@ def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None =
         t0 = time.time()
         if sessions and not in_session(load_schedule()) and not _json(os.path.join(RUNS, ".cycle.json")).get("any_live"):
             _write_ap(idle=True, checked_at=t0)
+            hb.set_phase("idle")
         else:
             _write_ap(idle=False)
-            try:
-                r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1800)
-                out, rc = (r.stdout + r.stderr).strip(), r.returncode
-            except subprocess.TimeoutExpired:
-                out, rc = "cycle took over 30 min — stopped it", -1
-                AT.event("failure", "a cycle hung for 30 min and was stopped", key=f"cycle-hang:{int(t0)}")
+            hb.set_phase("cycle")
+            out, rc = run_cycle(cmd, CYCLE_TIMEOUT_S, os.path.join(root, ".cycle.out"))
+            if rc == -1:
+                AT.event("failure", f"a cycle hung for {CYCLE_TIMEOUT_S // 60} min and was stopped",
+                         key=f"cycle-hang:{int(t0)}")
             print(f"[autopilot] {dt.datetime.now():%H:%M:%S} cycle exit {rc}\n" + "\n".join(
                 "  " + l for l in out.splitlines()[-12:]), flush=True)
             if rc not in (0,):
                 AT.event("failure", f"cycle failed (exit {rc}): {(out.splitlines() or [''])[-1][:80]}",
                          key=f"cycle-fail:{int(t0) // 3600}")
             _write_ap(last_cycle_at=t0, last_rc=rc)
+            hb.set_phase("sleep")
         n += 1
-        if rounds is None:
-            stamp = _maybe_restart(stamp, every_min, sessions, t0)
+        if rounds is None and cycle_cmd is None:            # a loop with a custom cycle (a test) never re-execs
+            stamp = _maybe_restart(stamp, every_min, sessions, t0, lease)
         while not stop["now"] and time.time() < t0 + every_min * 60 and (rounds is None or n < rounds):
             time.sleep(1)
     print("[autopilot] stopped", flush=True)

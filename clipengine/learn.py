@@ -250,6 +250,10 @@ def learn(perf: list[dict], ledger: list[dict], clipped_rows: list[dict], creato
     import time
     now = now or time.time()
     previous = previous or {}
+    # posts the owner overrode past the gate measure the owner's call, not the engine's — keep them out
+    overridden = {(r.get("slug"), r.get("platform")) for r in ledger if r.get("override")}
+    perf = [r for r in perf if (r.get("slug"), r.get("platform")) not in overridden]
+    ledger = [r for r in ledger if not r.get("override")]
     live_at = {(r["slug"], r["platform"]): _ts(r.get("at")) for r in ledger if r.get("status") == "live"}
     titles = {r["slug"]: r.get("title") for r in ledger if r.get("title")}
     clipped = {r["slug"]: r for r in clipped_rows if r.get("slug")}

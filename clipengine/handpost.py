@@ -120,8 +120,26 @@ def show() -> list[dict]:
     return items
 
 
-def mark(slug: str, platform: str, url: str, confirmed: bool = False) -> str:
+OVERRIDE_HALF_WINDOW_S = 30   # an override with no drop: the moment is guarded ±30 s around --moment-at
+
+
+def _drop_meta(slug: str) -> tuple[str, dict]:
+    """The clip's drop folder (outbox/ while platforms are due, posted/ once all are done) and its post.json."""
+    outbox, posted, _, _ = _dirs()
+    for d in (os.path.join(outbox, slug), os.path.join(posted, slug)):
+        if os.path.isfile(os.path.join(d, "post.json")):
+            return d, json.load(open(os.path.join(d, "post.json")))
+    return os.path.join(outbox, slug), {}
+
+
+def mark(slug: str, platform: str, url: str, confirmed: bool = False, override: str | None = None,
+         login: str | None = None, moment_at: str | None = None) -> str:
+    """Record a live post. Only what the gate approved records by itself: the clip needs a drop (publish /
+    publish-queued) and the platform must be one the drop lists. Anything else is an operator override — it
+    needs `override` (the reason, kept in the ledger, and learn leaves it out of the weights); with no drop it
+    also needs the creator and moment time, so the repeat guard still knows the moment."""
     from . import attention
+    from . import moments
     from . import verify
 
     outbox, posted, ledger_p, _ = _dirs()
@@ -129,8 +147,23 @@ def mark(slug: str, platform: str, url: str, confirmed: bool = False) -> str:
         raise SystemExit(f"platform must be one of {', '.join(PLATFORMS)}")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
         raise SystemExit("--slug must be the clip's slug")
-    d = os.path.join(outbox, slug)
-    meta = json.load(open(os.path.join(d, "post.json"))) if os.path.isdir(d) else {}
+    override = (override or "").strip() or None
+    d, meta = _drop_meta(slug)
+    guard: dict = {}
+    if not meta:
+        if not override:
+            raise SystemExit(f"POST NOT RECORDED: {slug} has no drop — only clips that went through publish / "
+                             "publish-queued record by themselves. Posted anyway on the owner's say-so? Re-run with "
+                             '--override "reason" --login CREATOR --moment-at ISO-TIME')
+        t = moments.timestamp(moment_at) if moment_at else None
+        if not login or t is None:
+            raise SystemExit("POST NOT RECORDED: an override with no drop needs --login CREATOR and --moment-at "
+                             "(the moment's UTC time, e.g. 2026-11-19T21:42:37Z) so the repeat guard knows it")
+        guard = moments.metadata(login, t - OVERRIDE_HALF_WINDOW_S, t + OVERRIDE_HALF_WINDOW_S)
+        guard["moment_at"] = moments.iso(t)
+    elif meta.get("platforms") and platform not in meta["platforms"] and not override:
+        raise SystemExit(f"POST NOT RECORDED: the gate approved {slug} for {', '.join(meta['platforms'])} only, "
+                         f'not {platform}. Posted anyway on the owner\'s say-so? Re-run with --override "reason"')
     clip = os.path.join(d, "clip.mp4")
     sha = _sha(clip) if os.path.isfile(clip) else None
     ledger = _ledger()
@@ -146,11 +179,13 @@ def mark(slug: str, platform: str, url: str, confirmed: bool = False) -> str:
     rec = {"platform": platform, "slug": slug, "sha256": sha, "title": meta.get("title", slug), "url": url,
            "status": "live", "verified_by": verification, "posted_by": "agent", "at": dt.datetime.now(dt.timezone.utc).isoformat()}
     for field in ("login", "moment_at", "moment_start_at", "moment_end_at"):
-        if meta.get(field):
-            rec[field] = meta[field]
-    if meta.get("moment_at"):
+        if meta.get(field) or guard.get(field):
+            rec[field] = meta.get(field) or guard[field]
+    if override:
+        rec["override"] = override
+    if rec.get("moment_at"):
         try:
-            m = dt.datetime.fromisoformat(meta["moment_at"].replace("Z", "+00:00"))
+            m = dt.datetime.fromisoformat(rec["moment_at"].replace("Z", "+00:00"))
             rec["moment_to_live_min"] = round((dt.datetime.now(dt.timezone.utc) - m).total_seconds() / 60)
         except ValueError:
             pass
@@ -167,13 +202,17 @@ def mark(slug: str, platform: str, url: str, confirmed: bool = False) -> str:
         if draft.get("slug") == slug and not draft.get("posted_at"):
             sentinel.note(draft, posted_at=rec["at"])
     left = [p for p in (meta.get("platforms") or list(PLATFORMS)) if not _live(p, slug, sha, ledger)]
-    if os.path.isdir(d) and not left:
+    if not meta:
+        _sync([ledger_p], f"posted by agent (override): {slug} ({platform})")
+        return f"{slug}: live on {platform} — recorded as an override (outside the gate; not learned from)"
+    if os.path.isdir(d) and d.startswith(outbox) and not left:
         os.makedirs(posted, exist_ok=True)
         shutil.move(d, os.path.join(posted, slug))
         _sync([ledger_p, d, os.path.join(posted, slug)], f"posted by agent: {slug} ({platform})")
         return f"{slug}: live on {platform} — all platforms done, moved to posted/"
-    _sync([ledger_p], f"posted by agent: {slug} ({platform})")
-    return f"{slug}: live on {platform}" + (f" — still to post: {', '.join(left)}" if left else "")
+    _sync([ledger_p], f"posted by agent{' (override)' if override else ''}: {slug} ({platform})")
+    note = " (override: outside the gate; not learned from)" if override else ""
+    return f"{slug}: live on {platform}{note}" + (f" — still to post: {', '.join(left)}" if left else "")
 
 
 def _sync(paths: list[str], msg: str) -> None:

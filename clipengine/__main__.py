@@ -142,6 +142,11 @@ def main(argv: list[str] | None = None) -> int:
     ap_.add_argument("--every", type=float, help="minutes between cycles (default config/ops.json autopilot_every_min, 5)")
     ap_.add_argument("--sessions", action="store_true", help="only inside the roster's usual stream hours (clipengine schedule)")
     ap_.add_argument("--rounds", type=int, help=argparse.SUPPRESS)
+    sub.add_parser("jobs", help="heavy jobs (transcription, encodes): who runs, who waits and why, 24 h timings")
+    sv_ = sub.add_parser("supervisor", help="the native service that keeps the autopilot alive (install/status/stop/resume/uninstall)")
+    sv_.add_argument("action", choices=["install", "status", "stop", "resume", "uninstall"])
+    sv_.add_argument("--every", type=float, help="minutes between cycles (default config/ops.json autopilot_every_min, 5)")
+    sv_.add_argument("--sessions", action="store_true", help="only inside the roster's usual stream hours")
     at_ = sub.add_parser("attention", help="ONE line of what needs you now (nothing when nothing does)")
     at_.add_argument("--seen", action="store_true", help="mark what it shows as read")
     sc_ = sub.add_parser("schedule", help="each roster creator's usual stream hours and the next session (local time)")
@@ -223,6 +228,10 @@ def main(argv: list[str] | None = None) -> int:
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
     pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
     pd.add_argument("--confirmed", action="store_true", help="you checked the Instagram post and its author")
+    pd.add_argument("--override", metavar="REASON", help="the owner had it posted outside the gate (no drop, or a "
+                    "platform the drop didn't list): recorded with this reason, left out of learning")
+    pd.add_argument("--login", help="with --override and no drop: the creator")
+    pd.add_argument("--moment-at", help="with --override and no drop: the moment's UTC time (ISO), for the repeat guard")
     ip = sub.add_parser("import-posts", help="import live posts from another engine for the repeat guard")
     ip.add_argument("--from", dest="file", required=True)
     vw = sub.add_parser("views", help="(post_with: agent) record a view count you read off a post")
@@ -314,6 +323,25 @@ def main(argv: list[str] | None = None) -> int:
         caption_kw["truth_override"] = a.truth_override.strip()
     if getattr(a, "bleep", None):
         caption_kw["extra_censor"] = {w.lower() for w in a.bleep}
+    if a.cmd == "jobs":
+        from . import admission as ADM
+        print("\n".join(ADM.show()))
+        return 0
+    if a.cmd == "supervisor":
+        from . import autopilot as AP, ops as O, supervise as SV
+        if a.action == "install":
+            print(SV.install(a.every or O.config().get("autopilot_every_min", 5), a.sessions))
+        elif a.action == "uninstall":
+            print(SV.uninstall())
+        elif a.action == "stop":
+            print(AP.autopilot_stop())
+        elif a.action == "resume":
+            print(AP.autopilot_start(a.every, a.sessions))
+        else:
+            if AP.autopilot_died():
+                SV.reconcile(None, root=AP._root())
+            print("\n".join(SV.status_lines(AP._root())))
+        return 0
     if a.cmd in ("autopilot", "attention", "schedule", "catchup", "backup", "restore"):
         from . import autopilot as AP
         if a.cmd == "autopilot":
@@ -330,7 +358,9 @@ def main(argv: list[str] | None = None) -> int:
             from . import attention as AT
             items = AT.pending()
             if AP.autopilot_died():
-                items = [{"kind": "failure", "text": "autopilot stopped unexpectedly → clipengine autopilot start"}] + items
+                from . import supervise as SV
+                SV.reconcile(None, root=AP._root())         # records the outage once (and alerts once)
+                items = [{"kind": "failure", "text": "autopilot stopped unexpectedly → clipengine autopilot start"}] + AT.pending()
             text = AT.line(items)
             if text:
                 print(text)
@@ -342,12 +372,20 @@ def main(argv: list[str] | None = None) -> int:
             import time as _t
             if a.spikes:
                 AP.catchup_spikes(json.load(open(a.spikes))["spikes"])
-            elif not a.since:
-                ap.error("catchup needs --since")
-            elif a.sweep:
-                AP.sweep(float(a.since), float(a.until) if a.until else _t.time(), a.channel)
             else:
-                AP.catchup(float(a.since), float(a.until) if a.until else _t.time(), a.channel)
+                until = float(a.until) if a.until else _t.time()
+                try:
+                    since, how = AP.catchup_window(a.since, until, sweep=a.sweep)
+                except ValueError as exc:
+                    ap.error(str(exc))
+                print(f"catch-up window: {_t.strftime('%Y-%m-%d %H:%M', _t.localtime(since))} → "
+                      f"{_t.strftime('%H:%M', _t.localtime(until))} ({(until - since) / 60:.0f} min, {how})", flush=True)
+                if a.sweep:
+                    AP.sweep(since, until, a.channel)
+                else:
+                    AP.catchup(since, until, a.channel)
+                if not a.channel:
+                    AP.mark_covered(until, sweep=a.sweep)          # only completed coverage moves the watermark
         elif a.cmd == "backup":
             AP.backup(a.to)
         else:
@@ -456,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "to-post":
             HP.show()
         elif a.cmd == "posted":
-            print(HP.mark(a.slug, a.platform, a.url, a.confirmed))
+            print(HP.mark(a.slug, a.platform, a.url, a.confirmed, a.override, a.login, a.moment_at))
         elif a.cmd == "to-measure":
             HP.show_measure()
         elif a.cmd == "followers":
