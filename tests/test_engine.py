@@ -4716,3 +4716,89 @@ def test_two_posters_racing_for_the_same_platform_get_one_claim(tmp_path, monkey
     [t.start() for t in ts]; go.set(); [t.join(10) for t in ts]
     assert len(wins) == 1 and len(losses) == 19 and all("holds win on tiktok" in x for x in losses)
     assert [e["ev"] for e in BK.events()] == ["claim"]
+
+
+# ---- host capacity (spec §2): effective limits, not the host's; bench predictions ------------------------
+
+def _cg(tmp_path, files: dict):
+    for rel, text in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    return str(tmp_path)
+
+
+def test_a_container_is_sized_by_its_cgroup_limits_not_by_the_host(tmp_path, monkeypatch):
+    from clipengine import host as H
+    root = _cg(tmp_path, {"cgroup.controllers": "cpu memory", "cpu.max": "max 100000",
+                          "slice/cgroup.controllers": "", "slice/cpu.max": "200000 100000",
+                          "slice/box/cpu.max": "150000 100000",                           # the tester's 1.5 vCPU
+                          "slice/box/memory.max": str(6 * 10**9),
+                          "slice/box/memory.current": str(int(4.5 * 10**9)),
+                          "slice/box/memory.stat": f"anon 1\ninactive_file {10**9}\n",
+                          "slice/box/cpu.stat": "usage_usec 9000000\n"})
+    pc = "0::/slice/box\n"
+    monkeypatch.setattr(H.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(H.os, "sched_getaffinity", lambda pid: set(range(16)), raising=False)
+    assert H.cpu_quota(root, pc) == 1.5                                     # the tightest along the path
+    n, src = H.cpus(root, pc)
+    assert n == 1.5 and src == "cgroup quota (host has 16)"
+    lim = H.mem_limit(root, pc)
+    assert lim == (6.0, 3.5)                                                 # 4.5 used − 1 GB reclaimable cache
+    assert H.mem_available_gb(root, pc, host=60.0) == 2.5                    # not the host's 60 GB
+    assert H.mem_available_gb(root, pc, host=1.0) == 1.0                     # never more than the host has
+    assert H.cpu_used_s(root, pc) == 9.0
+    # unlimited (no cgroup v2 here, no v1 limit): the host's numbers
+    empty = str(tmp_path / "none"); os.makedirs(empty)
+    assert H.cpu_quota(empty, "") is None and H.mem_limit(empty, "") is None
+    assert H.mem_available_gb(empty, "", host=7.25) == 7.25
+    # cgroup v1
+    v1 = _cg(tmp_path / "v1", {"cpu,cpuacct/cpu.cfs_quota_us": "50000", "cpu,cpuacct/cpu.cfs_period_us": "100000",
+                               "memory/memory.limit_in_bytes": str(2 * 10**9),
+                               "memory/memory.usage_in_bytes": str(10**9),
+                               "memory/memory.stat": "total_inactive_file 0\n"})
+    assert H.cpu_quota(v1, "") == 0.5 and H.mem_limit(v1, "") == (2.0, 1.0)
+
+
+def test_busy_is_this_containers_share_of_its_own_cpus(tmp_path, monkeypatch):
+    from clipengine import host as H
+    root = _cg(tmp_path, {"cgroup.controllers": "", "cpu.max": "200000 100000", "cpu.stat": "usage_usec 0\n"})
+    monkeypatch.setattr(H, "_v2_dirs", lambda r=None, pc=None: [root])
+    monkeypatch.setattr(H.os, "sched_getaffinity", lambda pid: set(range(16)), raising=False)
+    state = {}
+    H.busy(state, now=1000.0, root=root)
+    (tmp_path / "cpu.stat").write_text("usage_usec 30000000\n")              # 30 CPU-s in 20 s on 2 CPUs
+    assert H.busy(state, now=1020.0, root=root) == 0.75
+
+
+def test_heavy_jobs_and_whisper_use_the_effective_limits(monkeypatch):
+    from clipengine import admission as ADM, audio as A, host as H, ops as O
+    monkeypatch.setattr(H, "mem_available_gb", lambda *a, **k: 0.4)
+    assert ADM.free_gb() == 0.4 and O._mem_available_gb() == 0.4            # the memory floor sees the container
+    monkeypatch.setattr(H, "cpus", lambda *a, **k: (1.5, "cgroup quota (host has 16)"))
+    monkeypatch.setattr(H, "mem_total_gb", lambda *a, **k: 6.0)
+    assert H.threads() == 2 and A._threads() == 2                             # not 16 Whisper threads
+    assert O.machine() == {"ram_gb": 6.0, "cores": 1.5}
+    assert "1.5 CPUs" in O.suggest_profile(6.0, 1.5, "full")
+
+
+def test_bench_predicts_the_speed_targets_and_compares_two_hosts(tmp_path):
+    from clipengine import bench as BN
+    slow = {"host": {"host": "tester", "cpus": 1.5, "mem_total_gb": 6.0}, "settings": {"profile": "full",
+            "preset": "veryfast", "model": "small"}, "encode": {"realtime": 0.4},
+            "render": {"realtime": 0.2, "layout": "facecam"}, "transcribe": {"model": "small", "realtime": 0.2, "load_s": 9}}
+    slow["predict"] = BN.predict(slow["render"], slow["transcribe"])
+    assert slow["predict"] == {"draft_s": 245, "draft_ok": False, "render_s": 150, "render_ok": False}
+    text = "\n".join(BN.lines(slow))
+    assert "✗ over target" in text and "misses a speed target" in text and "bench --profile lite" in text
+    fast = json.loads(json.dumps(slow)); fast["host"].update(host="candidate", cpus=4)
+    fast["render"]["realtime"], fast["transcribe"]["realtime"] = 1.5, 1.0
+    fast["predict"] = BN.predict(fast["render"], fast["transcribe"])
+    assert fast["predict"]["draft_ok"] and fast["predict"]["render_ok"]
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    a.write_text(json.dumps(slow)); b.write_text(json.dumps(fast))
+    rows = BN.compare(str(a), str(b))
+    assert "tester" in rows[0] and "candidate" in rows[0]
+    assert any(r.split()[:2] == ["render", "s"] and r.split()[-2:] == ["150", "20"] for r in rows)
+    assert BN.lines({**slow, "transcribe": {"skipped": "Whisper 'small' isn't downloaded here"}, "predict": {}})[2] \
+        .strip().startswith("whisper  Whisper 'small' isn't downloaded")

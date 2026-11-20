@@ -55,3 +55,9 @@ claimed, uncertain or live. Before uploading, `clipengine claim --slug S --platf
 uploaded with `attempt --release`. If the lease runs out with no outcome, the platform becomes uncertain: nobody
 can claim it until someone checks the account and records `posted` or `attempt --failed`, and it shows as
 overdue on the attention line.
+
+## Is this machine big enough?
+In a container the engine sizes itself by its real limits (the cgroup CPU quota and memory limit), not the host's.
+`doctor` prints them, plus the measured encode speed and any hardware encoder that works. `clipengine bench`
+times the real pipeline in about a minute and predicts the speed targets: a draft under 3 min, a render under
+2 min. `--profile lite` tries the small-machine settings; `bench --compare A.json B.json` compares two hosts.

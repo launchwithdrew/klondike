@@ -64,6 +64,14 @@ def settings() -> tuple[int, float]:
 
 
 def free_gb() -> float | None:
+    """Memory free for a heavy job: a container's headroom under its limit (host.py), not the host's."""
+    try:
+        from . import host as H
+        v = H.mem_available_gb()
+        if v is not None:
+            return v
+    except Exception:
+        pass
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"):

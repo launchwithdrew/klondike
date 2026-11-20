@@ -152,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
     fn_.add_argument("--no-still", action="store_true", help="approve: skip the reference frame")
     fn_.add_argument("--still", action="store_true", help="check: re-render the reference frame and compare it now")
     fn_.add_argument("--version", type=int, help="restore: this version (default: the approved one)")
+    bn_ = sub.add_parser("bench", help="measure this host on the real pipeline and predict the speed targets")
+    bn_.add_argument("--profile", choices=["lite", "full"], help="measure that profile's settings (config unchanged)")
+    bn_.add_argument("--seconds", type=float, default=10.0, help="length of the synthetic clip (default 10)")
+    bn_.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"), help="two saved results side by side")
     sub.add_parser("jobs", help="heavy jobs (transcription, encodes): who runs, who waits and why, 24 h timings")
     sv_ = sub.add_parser("supervisor", help="the native service that keeps the autopilot alive (install/status/stop/resume/uninstall)")
     sv_.add_argument("action", choices=["install", "status", "stop", "resume", "uninstall", "boot", "keep"])
@@ -381,6 +385,13 @@ def main(argv: list[str] | None = None) -> int:
                 if st:
                     print("  reference frame on this engine: " + ("same as approved" if st.get("same") else
                                                                  "DIFFERENT — " + st.get("why", "")))
+        return 0
+    if a.cmd == "bench":
+        from . import bench as BN
+        if a.compare:
+            print("\n".join(BN.compare(*a.compare)))
+        else:
+            BN.run(a.profile, a.seconds)
         return 0
     if a.cmd == "jobs":
         from . import admission as ADM

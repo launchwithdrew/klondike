@@ -60,19 +60,16 @@ def whisper_model() -> str:
 
 
 def machine() -> dict:
-    """RAM (GB) and CPU cores of this machine."""
-    try:
-        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-    except (ValueError, OSError, AttributeError):
-        ram = 0.0
-    return {"ram_gb": round(ram, 1), "cores": os.cpu_count() or 1}
+    """RAM (GB) and CPUs this engine may really use — a container's limits, not the host's (host.py)."""
+    from . import host as H
+    return {"ram_gb": H.mem_total_gb(), "cores": H.cpus()[0]}
 
 
 def suggest_profile(ram_gb: float, cores: int, current: str) -> str | None:
     """doctor: a small machine on the full profile should switch to lite (and only then)."""
     if current == "lite" or (ram_gb >= 8 and cores >= 4) or ram_gb <= 0:
         return None
-    return (f"this machine is small ({ram_gb:.0f} GB RAM, {cores} cores) — set \"profile\": \"lite\" in "
+    return (f"this machine is small ({ram_gb:.0f} GB RAM, {cores:g} CPUs) — set \"profile\": \"lite\" in "
             "config/ops.json (2 sentinels, Whisper tiny, faster renders, 1.5 h buffer)")
 
 
@@ -380,7 +377,12 @@ def _free_gb() -> float:
 
 
 def _mem_available_gb() -> float | None:
-    """Memory free for new work (Linux: MemAvailable; macOS: free + inactive + speculative pages)."""
+    """Memory free for new work: a container's headroom under its limit (host.py), else MemAvailable / vm_stat."""
+    try:
+        from . import host as H
+        return H.mem_available_gb()
+    except Exception:
+        pass
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"):
@@ -695,10 +697,8 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
     now = time.time()
     roster = creators()
     if not top:
-        try:
-            lpc = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
-        except OSError:
-            lpc = None
+        from . import host as H
+        lpc = H.busy(state, now)                  # this container's share of its own CPUs (not the host's load)
         top, cap_why = scout_cap(state, cfg, lpc, _mem_available_gb(), int(state.get("last_holes") or 0),
                                  int(state.get("live_roster") or 0), now)
         if cap_why.startswith(("more", "fewer")):
@@ -976,7 +976,8 @@ def doctor(accounts: bool = False) -> bool:
           "clipengine init makes one (brand/kit/logo.png), or set logo.file in brand/brand.json")
     check("fonts", os.path.exists(os.path.join(REPO, "assets", "fonts", "NotoColorEmoji.ttf")), "git pull (assets/ is in the repo)")
     # R2 / W4: headroom against the profile, stated rather than discovered
-    cores = os.cpu_count() or 1
+    from . import host as _H
+    cores, _from = _H.cpus()
     try:
         lpc = os.getloadavg()[0] / cores
     except OSError:
@@ -985,10 +986,23 @@ def doctor(accounts: bool = False) -> bool:
     from . import autopilot as _AP
     buf = _AP.buffer_hours(config(), _free_gb(), _AP.explicit_buffer())
     small = cores < MIN_CORES or (mem is not None and mem < MIN_FREE_RAM_GB)
-    print(f"  {'!' if small else '\u2713'} machine: {cores} cores, load {lpc:.2f}/core" if lpc is not None else
-          f"  {'!' if small else '\u2713'} machine: {cores} cores", end="")
+    print(f"  {'!' if small else '\u2713'} machine: {cores:g} CPUs ({_from}), load {lpc:.2f}/CPU" if lpc is not None else
+          f"  {'!' if small else '\u2713'} machine: {cores:g} CPUs ({_from})", end="")
     print(f", {mem:.1f} GB memory free" if mem is not None else "", end="")
-    print(f", {_free_gb():.0f} GB disk free, recording buffer {buf:g} h per sentinel")
+    _lim = _H.mem_limit()
+    print((f", memory limit {_lim[0]:.1f} GB" if _lim else "")
+          + f", {_free_gb():.0f} GB disk free, recording buffer {buf:g} h per sentinel")
+    try:                                                     # what a render costs here, measured (cached a day)
+        _pre = config().get("render_preset") or "veryfast"
+        _enc = _H.encoder_probe(_pre)
+        _rt = _enc.get("x264_realtime")
+        _hw = [k for k, ok in (_enc.get("hardware") or {}).items() if ok]
+        print(f"  {'\u2713' if _rt and _rt >= 1 else '!'} encoder: x264 {_pre} "
+              + (f"{_rt:g}× realtime (a 30 s clip ≈ {30 / _rt:.0f} s to encode)" if _rt else "did not run")
+              + (f" · hardware that works here: {', '.join(_hw)}" if _hw else " · no working hardware encoder")
+              + ("" if not _rt or _rt >= 1 else " — slower than realtime: `clipengine bench` predicts stage times"))
+    except Exception as exc:
+        print(f"  · encoder: not measured ({str(exc)[:80]})")
     if small:
         print(f"    below the comfortable minimum ({MIN_CORES} cores, {MIN_FREE_RAM_GB:g} GB free): expect slow scans — "
               "set \"profile\": \"lite\" in config/ops.json, or use a bigger machine")
@@ -1110,7 +1124,7 @@ def doctor(accounts: bool = False) -> bool:
               "chmod 700 chrome-profile")
     mc = machine()
     tip = suggest_profile(mc["ram_gb"], mc["cores"], config().get("profile", "full"))
-    print(f"! {tip}" if tip else f"✓ machine ({mc['ram_gb']:.0f} GB RAM, {mc['cores']} cores, profile "
+    print(f"! {tip}" if tip else f"✓ machine ({mc['ram_gb']:.0f} GB RAM, {mc['cores']:g} CPUs, profile "
           f"{config().get('profile', 'full')})")
     free = _free_gb()
     check(f"disk ({free:.0f} GB free)", free >= config()["min_free_gb"], f"free up space (needs {config()['min_free_gb']} GB)")

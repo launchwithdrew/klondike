@@ -144,3 +144,22 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.10
+
+- Sizing by real limits. In a container, the engine now reads the CPU quota and memory limit it actually runs under (cgroup v1 and v2, plus CPU affinity) instead of the host's numbers. That corrects:
+  - the adaptive scout cap, which now uses this container's share of its own CPUs rather than the host's load;
+  - the heavy-job memory floor, which now uses the container's headroom so it no longer lets in a job the container's out-of-memory killer will end;
+  - Whisper's thread count, which now matches the real CPUs (a 1.5-CPU container on a 16-core host gets 2 threads, not 16);
+  - the profile suggestion.
+- `doctor` prints the effective CPUs and memory limit, with where each comes from. It also measures the x264 encode speed at your preset and lists the hardware encoders that actually work here (each one is tried). The result is cached for a day.
+- `clipengine bench` times the real pipeline in about a minute at the lowest priority, so capture still goes first. It measures encode, the full render of your look, and Whisper on recorded speech, then predicts the two speed targets: moment to draft under 3 min, and draft to render under 2 min.
+  - `--profile lite|full` measures the other profile without changing the config.
+  - `bench --compare A.json B.json` puts two hosts side by side.
+
+Export diff
+- Added (2): `clipengine/bench.py`, `clipengine/host.py`
+- Changed (8): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/admission.py`, `clipengine/audio.py`, `clipengine/ops.py`, `docs/reliability.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

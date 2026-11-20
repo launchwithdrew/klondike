@@ -69,6 +69,15 @@ def write_wav(x: np.ndarray, path: str) -> None:
 _MODELS: dict = {}
 
 
+def _threads() -> int:
+    """Whisper's threads = the CPUs this engine may use (a 1.5-CPU container on a 16-core host gets 2, not 16)."""
+    try:
+        from . import host as H
+        return H.threads()
+    except Exception:
+        return os.cpu_count() or 4
+
+
 def model(name: str):
     if name not in _MODELS:
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -76,7 +85,7 @@ def model(name: str):
         # Models are cached by setup; never re-check the hub on load — each
         # check hits the model CDN and fires a network-approval prompt.
         _MODELS[name] = WhisperModel(name, device="cpu", compute_type="int8",
-                                     cpu_threads=os.cpu_count() or 4,
+                                     cpu_threads=_threads(),
                                      local_files_only=True)
     return _MODELS[name]
 
