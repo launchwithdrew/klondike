@@ -85,3 +85,17 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.7
+
+- Fix: `posted` can record a TikTok or YouTube post when the platform won't confirm its author from your host. TikTok often blocks automated reads.
+  - Open the post, check that it plays as your account, and re-run with `--confirmed`. The ledger records it as `operator-confirmed`, with the reason.
+  - A post that the platform says belongs to a different account is still refused. So is a TikTok link to another account's post.
+  - Before this fix, such a post could not be recorded at all, so it was missing from the ledger and from view tracking.
+
+Export diff
+- Added (0)
+- Changed (6): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/verify.py`, `docs/publishing.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

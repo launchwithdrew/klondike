@@ -4480,3 +4480,29 @@ def test_an_install_from_before_the_keeper_is_read_back_from_its_service_file(tm
     assert SV.settings() == {"kind": "systemd", "every": 5.0, "sessions": True}
     SV.save_settings(every=10, sessions=False, kind="systemd")
     assert SV.settings()["every"] == 10                                   # a saved choice wins
+
+
+def test_a_tiktok_post_records_with_confirmation_when_tiktok_wont_answer_this_host(tmp_path, monkeypatch):
+    import json
+    import urllib.error
+    from clipengine import handpost, verify
+    monkeypatch.setattr(handpost, "REPO", str(tmp_path))
+    monkeypatch.setattr(handpost, "_sync", lambda *a: None)
+    monkeypatch.setattr(verify, "account", lambda platform: ("ourchannel", ""))
+    def blocked(url):
+        raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+    monkeypatch.setattr(verify, "_json", blocked)
+    drop = tmp_path / "outbox" / "win"; drop.mkdir(parents=True)
+    (drop / "post.json").write_text(json.dumps({"slug": "win", "platforms": ["tiktok"]}))
+    url = "https://www.tiktok.com/@ourchannel/video/7710343703629532446"
+    with pytest.raises(SystemExit, match=r"oEmbed unavailable \(HTTP 403\).*--confirmed"):
+        handpost.mark("win", "tiktok", url)
+    with pytest.raises(SystemExit, match="@someoneelse's post, not @ourchannel"):
+        handpost.mark("win", "tiktok", "https://www.tiktok.com/@someoneelse/video/1", confirmed=True)
+    assert "live on tiktok" in handpost.mark("win", "tiktok", url, confirmed=True)
+    row = handpost._ledger()[-1]
+    assert row["verified_by"] == "operator-confirmed (oEmbed unavailable (HTTP 403))" and row["url"] == url
+    # when TikTok DOES answer, a different author is refused even with --confirmed
+    monkeypatch.setattr(verify, "_json", lambda url: {"author_unique_id": "impostor"})
+    with pytest.raises(ValueError, match="author does not match"):
+        verify.post("tiktok", url, confirmed=True)

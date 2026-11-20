@@ -230,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
     pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
-    pd.add_argument("--confirmed", action="store_true", help="you checked the Instagram post and its author")
+    pd.add_argument("--confirmed", action="store_true", help="you opened the post and saw it plays as our account (Instagram always; TikTok/YouTube when the platform won't confirm the author from this host)")
     pd.add_argument("--override", metavar="REASON", help="the owner had it posted outside the gate (no drop, or a "
                     "platform the drop didn't list): recorded with this reason, left out of learning")
     pd.add_argument("--login", help="with --override and no drop: the creator")

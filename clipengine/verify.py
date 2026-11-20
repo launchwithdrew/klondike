@@ -76,6 +76,10 @@ def post(platform: str, url: str, confirmed: bool = False) -> str:
         if not confirmed:
             raise ValueError(f"open the link and confirm it's @{expected}, then rerun with --confirmed")
         return "operator-confirmed"
+    if platform == "tiktok":                                 # a full link names its account: it must be ours
+        m = re.fullmatch(r"https://www\.tiktok\.com/@([\w.-]+)/video/\d+", canonical)
+        if m and m[1].casefold() != expected.casefold():
+            raise ValueError(f"the link is @{m[1]}'s post, not @{expected}")
     target = PROFILE_URLS[platform].split("@", 1)[0].rstrip("/") + "/oembed"
     query = {"url": canonical}
     if platform == "youtube":
@@ -85,7 +89,10 @@ def post(platform: str, url: str, confirmed: bool = False) -> str:
     except (OSError, ValueError) as exc:
         status = getattr(exc, "code", None)
         suffix = f" (HTTP {status})" if status else ""
-        raise ValueError(f"{platform} oEmbed unavailable{suffix}; verify the post is public and retry") from None
+        if confirmed:            # the platform won't answer this host (TikTok blocks automated reads): the operator saw it
+            return f"operator-confirmed (oEmbed unavailable{suffix})"
+        raise ValueError(f"{platform} oEmbed unavailable{suffix} — the platform won't confirm the author from here; "
+                         f"open the link, check it plays as @{expected}, then rerun with --confirmed") from None
     if platform == "tiktok":
         actual = str(info.get("author_unique_id") or "").strip().lstrip("@")
     else:
