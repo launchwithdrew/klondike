@@ -946,8 +946,9 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
     floor = min(r["min_score"] for r in GT.config()["platforms"].values())
     now = time.time()
     rows = []
+    from . import triage as TR
     for r in load_queue(root):
-        age_h = (now - r["stop"]) / 3600
+        age_h = (now - TR.moment_time(r)) / 3600         # the moment's age — a re-queue never makes it fresh
         if not all_ and (r.get("status") != "new" or r.get("unsafe") or r.get("best", 0) < floor or age_h > max_age_h):
             continue
         rows.append({**r, "age_min": round(age_h * 60)})
@@ -976,6 +977,12 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
             confidence.append("speaker tags uncertain")
         if confidence:
             mark += " · " + " · ".join(confidence)
+        if r.get("triage") in ("preview", "review") and r.get("status") == "new":
+            exp = r.get("expires_at")
+            mark += (f" · {r['triage']}: {UT.quote(r.get('triage_reason') or '', 50)}"
+                     + (f" · expires {time.strftime('%H:%M', time.localtime(exp))}" if exp else ""))
+        if r.get("repaired_from"):
+            mark += " · re-cut on speech boundaries"
         if r.get("angles"):
             mark += f" · same moment, {len(r['angles'])} angles"
         if r.get("seen_at"):

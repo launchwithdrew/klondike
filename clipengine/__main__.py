@@ -142,6 +142,9 @@ def main(argv: list[str] | None = None) -> int:
     ap_.add_argument("--every", type=float, help="minutes between cycles (default config/ops.json autopilot_every_min, 5)")
     ap_.add_argument("--sessions", action="store_true", help="only inside the roster's usual stream hours (clipengine schedule)")
     ap_.add_argument("--rounds", type=int, help=argparse.SUPPRESS)
+    tr_ = sub.add_parser("triage", help="route every new draft (preview / review / repair / archive) — cycle runs this")
+    tr_.add_argument("--keep", metavar="ID", help="keep an old draft as evergreen (needs --why)")
+    tr_.add_argument("--why", help="the editorial reason it is still worth posting")
     sub.add_parser("jobs", help="heavy jobs (transcription, encodes): who runs, who waits and why, 24 h timings")
     sv_ = sub.add_parser("supervisor", help="the native service that keeps the autopilot alive (install/status/stop/resume/uninstall)")
     sv_.add_argument("action", choices=["install", "status", "stop", "resume", "uninstall"])
@@ -323,6 +326,19 @@ def main(argv: list[str] | None = None) -> int:
         caption_kw["truth_override"] = a.truth_override.strip()
     if getattr(a, "bleep", None):
         caption_kw["extra_censor"] = {w.lower() for w in a.bleep}
+    if a.cmd == "triage":
+        from . import sentinel as SN, triage as TR
+        if a.keep:
+            if not (a.why or "").strip():
+                ap.error("triage --keep needs --why \"the editorial reason\"")
+            hit = [r for r in SN.load_queue() if r["id"] == a.keep]
+            if not hit:
+                ap.error(f"no draft {a.keep}")
+            TR.keep(hit[0], a.why)
+            print(f"{a.keep}: kept as evergreen — {a.why.strip()}")
+        else:
+            print(TR.apply() or "triage: nothing new")
+        return 0
     if a.cmd == "jobs":
         from . import admission as ADM
         print("\n".join(ADM.show()))

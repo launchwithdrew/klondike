@@ -32,3 +32,20 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.4
+
+- Automatic triage. `cycle` routes every new draft before anything renders, so you never have to choose which draft to render.
+  - Fresh, plausible drafts are pre-rendered and show when they expire.
+  - Quiet visual moments and cuts that couldn't be repaired go to review, with what's missing.
+  - A clip cut mid-sentence is re-cut once on speech boundaries, keeping the payoff.
+  - Drafts whose moment is over 6 hours old are archived with the reason, and so are drafts with chat laughter but no reaction, no viewer clips and a dull picture. Freshness is measured from the moment itself, so re-queuing an old draft doesn't make it fresh.
+  - `clipengine triage --keep ID --why "…"` keeps an old moment on purpose.
+- Saved-stream windows are checked before transcription. Missing audio, a fully muted window, or a copyright-muted payoff is refused with a rights-review reason instead of spending a transcription. A constant, flat audio bed is flagged. The compute saved is counted.
+
+Export diff
+- Added (1): `clipengine/triage.py`
+- Changed (8): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/audio.py`, `clipengine/ops.py`, `clipengine/sentinel.py`, `docs/judging.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

@@ -4158,3 +4158,103 @@ def test_a_loop_with_a_custom_cycle_never_reexecs_into_a_real_one(tmp_path, monk
     AP._loop(0.0001, False, None, [sys.executable, "-c", "print(1)"], stop, hb, lease, str(tmp_path / "r"))
     lease.release()
 
+
+# ---- phase 2 replay gate (spec §3): triage, freshness, repair, early mute probe ------------------------
+
+def _draft(tmp_path, did, **kw):
+    d = tmp_path / "rec"; d.mkdir(exist_ok=True)
+    now = 1_800_000_000.0
+    e = {"id": did, "login": "streamer", "rec": str(d), "start": now - 60, "stop": now - 30, "payoff": now - 40,
+         "at": dt_iso(now - 40), "best": 70, "status": "new", "flags": [], "liveliness": 0.7,
+         "judgment": {"speech_s": 12.0, "parts": {"reaction": 0.4, "crowd": 0, "audio": 0.3}}, "said": "no way"}
+    e.update(kw)
+    with open(d / "queue.jsonl", "a") as fh:
+        fh.write(json.dumps(e) + "\n")
+    return e, now
+
+
+def dt_iso(t):
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).isoformat()
+
+
+def test_triage_archives_the_stale_75_and_the_driving_67_and_previews_a_fresh_winner(tmp_path):
+    from clipengine import triage as TR, sentinel as SN
+    stale, now = _draft(tmp_path, "s-1", best=75, at=dt_iso(1_800_000_000.0 - 11 * 3600),
+                        drafted_at=dt_iso(1_800_000_000.0 - 60))            # re-queued a minute ago: still 11 h old
+    a = TR.assess(stale, now)
+    assert a["route"] == "archive" and a["reason"].startswith("stale: the moment is 11 h old")
+    driving, _ = _draft(tmp_path, "s-2", best=67, liveliness=0.22, chat="LMAO lol",
+                        flags=["nothing happening (no streamer talk, reaction, chat or viewers) ×0.6"],
+                        judgment={"speech_s": 1.0, "parts": {"reaction": 0.05, "crowd": 0, "audio": 0.1}})
+    a = TR.assess(driving, now)
+    assert a["route"] == "archive" and a["reason"].startswith("no corroborated payoff: chat alone")
+    fresh, _ = _draft(tmp_path, "s-3")
+    a = TR.assess(fresh, now)
+    assert a["route"] == "preview" and a["expires_at"] == now - 40 + 2 * 3600
+    assert "streamer reaction" in a["reason"]
+    line = TR.apply(root=str(tmp_path), now=now, floor=60)
+    assert "2 archived" in line and "1 preview" in line
+    rows = {r["id"]: r for r in SN.load_queue(str(tmp_path))}
+    assert rows["s-1"]["status"] == "archived" and rows["s-2"]["status"] == "archived"
+    assert rows["s-3"]["triage"] == "preview"
+    TR.keep(rows["s-1"], "evergreen: the jet escape still trends")
+    rows = {r["id"]: r for r in SN.load_queue(str(tmp_path))}
+    assert rows["s-1"]["status"] == "new" and TR.assess(rows["s-1"], now)["route"] == "preview"
+
+
+def test_a_quiet_visual_winner_reaches_review_without_words(tmp_path):
+    from clipengine import triage as TR
+    quiet, now = _draft(tmp_path, "q-1", said="", liveliness=0.85, crowd=3, best=64,
+                        judgment={"speech_s": 0.0, "parts": {"reaction": 0.0, "crowd": 0.8, "audio": 0.2}})
+    a = TR.assess(quiet, now)
+    assert a["route"] == "review" and "viewers clipped it" in a["reason"] and "no words" in a["reason"]
+
+
+def test_a_mid_sentence_cut_is_repaired_once_into_the_handles(tmp_path):
+    from clipengine import triage as TR, sentinel as SN
+    now = 1_800_000_000.0
+    t0 = now - 120
+    words = []
+    t = t0
+    for i, w in enumerate("so we drive over there and then the jet just took off with me inside it wow. no way.".split()):
+        words.append({"w": w, "start": round(t, 2), "end": round(t + 0.35, 2), "spk": "streamer"})
+        t += 0.45 if not w.endswith(".") else 1.2
+    wf = tmp_path / "d.words.json"
+    wf.write_text(json.dumps({"start": t0 - 20, "stop": t + 20, "words": words}))
+    payoff = words[10]["start"]
+    e, _ = _draft(tmp_path, "m-1", start=words[2]["start"] + 0.1, stop=words[13]["start"] + 0.1,
+                  payoff=payoff, at=dt_iso(payoff), words=str(wf), rec=str(tmp_path / "rec"))
+    assert TR.cut_mid_sentence(words, e["start"], e["stop"]) == "end"
+    assert TR.assess(e, now)["route"] == "repair"
+    line = TR.apply(root=str(tmp_path), now=now, floor=60)
+    assert "1 repaired" in line
+    r = [x for x in SN.load_queue(str(tmp_path)) if x["id"] == "m-1"][0]
+    assert r["repairs"] == 1 and r["start"] < payoff < r["stop"] and not TR.cut_mid_sentence(words, r["start"], r["stop"])
+    assert TR.assess({**r, "start": e["start"], "stop": e["stop"]}, now)["route"] == "review"   # never a second repair
+
+
+def test_the_early_probe_skips_whisper_on_a_muted_vod_and_a_muted_payoff(tmp_path, monkeypatch):
+    import numpy as np
+    from clipengine import audio as A
+    calls = []
+    monkeypatch.setattr(A, "transcribe", lambda *a, **k: calls.append(1) or {"segments": []})
+    sr = A.SR
+    loud = (0.2 * np.sin(np.linspace(0, 2000, sr * 60))).astype(np.float32)
+    loud *= (1 + 0.8 * np.sin(np.linspace(0, 30, sr * 60))).astype(np.float32)     # speech-like level changes
+    def probe(x, peak):
+        monkeypatch.setattr(A, "decode_pcm", lambda *a, **k: x)
+        return A.probe_audio("unused.ts", 0.0, 0.0, 60.0, peak)
+    p = probe(np.zeros(sr * 60, np.float32), 40)
+    assert p.observation == "muted" and not calls                          # fully muted: zero ASR
+    half = loud.copy(); half[15 * sr:46 * sr] = 0                           # the beat region is silent
+    p = probe(half, 40)
+    assert p.observation == "payoff muted" and not calls and p.muted_frac < 0.9
+    verdict = A.assess(p, {"start_s": 20, "end_s": 50, "words": 0, "speech_s": 0, "first_word_at": 30,
+                           "longest_gap": 30, "muted_frac": 0.2}, 40)
+    assert verdict["hard_fail"].startswith("copyright-muted over the payoff")
+    p = probe(np.zeros(0, np.float32), 40)
+    assert p.observation == "no audio" and not calls
+    p = probe(loud, 40)
+    assert p.observation == "ok" and calls == [1]                          # real audio: transcribed once
+

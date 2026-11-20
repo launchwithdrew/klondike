@@ -879,6 +879,13 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
         lines.append(line)
 
     # 3d. pre-render queued drafts the sentinels didn't (an older draft, a failed try): publish takes seconds
+    try:                                                     # route every new draft before anything renders
+        from . import triage as TR
+        tline = TR.apply()
+        if tline:
+            lines.append(tline)
+    except Exception as exc:
+        AT.event("failure", f"triage failed ({str(exc)[:80]})", key=f"triage:{int(time.time()) // 3600}")
     line = maybe_prerender(cfg)
     if line:
         lines.append(line)

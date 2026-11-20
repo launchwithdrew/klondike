@@ -19,10 +19,12 @@ and the window is slid so the clip opens on speech instead of silence.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -297,6 +299,7 @@ class Probe:
     excitement_db: float = 0.0        # that second vs the window median
     mute_map: list = field(default_factory=list)   # per-second: True = digital silence
     repeated_lines: int = 0
+    observation: str = "ok"          # ok | muted | payoff muted | no audio | flat audio — why ASR ran or didn't
 
     def muted_in(self, a: float, b: float) -> float:
         """Share of [a, b) that is copyright-muted (digital silence)."""
@@ -309,22 +312,59 @@ class Probe:
         return sum(self.mute_map[i0:i1]) / (i1 - i0)
 
 
+PAYOFF_MUTE_SKIP = 0.8          # this much of the beat region copyright-muted: the payoff can't be heard
+
+
+def early_observation(p: "Probe", peak_s: float, sec_db, no_audio: bool) -> str:
+    """Before any transcription: is there anything to hear where the moment is? The beat region is the
+    25 s before chat peaks to 5 s after (the moment usually comes 2–20 s before chat reacts)."""
+    if no_audio:
+        return "no audio"
+    if p.muted_frac > 0.9:
+        return "muted"
+    if p.muted_in(peak_s - 25, peak_s + 5) >= PAYOFF_MUTE_SKIP:
+        return "payoff muted"
+    live = [v for v in sec_db if v > MUTE_DB]
+    if len(live) >= 5 and float(np.std(live)) < 0.75:
+        return "flat audio"                           # a constant bed (replacement tone / noise): transcribed, flagged
+    return "ok"
+
+
+def log_probe(p: "Probe", seconds: float, skipped: bool) -> None:
+    """Count what the probe saved: each window it stopped before Whisper (runs/heavy/probes.jsonl)."""
+    try:
+        from .admission import _dir
+        d = _dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "probes.jsonl"), "a") as fh:
+            fh.write(json.dumps({"at": time.time(), "obs": p.observation, "skipped_asr": skipped,
+                                 "asr_s_saved": round(seconds, 1) if skipped else 0.0}) + "\n")
+    except OSError:
+        pass
+
+
 def probe_audio(audio_path: str, file_t0: float, win_start: float, win_end: float,
                 peak_s: float, model_name: str = "small", transcript: dict | None = None,
                 login: str | None = None) -> Probe:
     """Measure + transcribe [win_start, win_end] (VOD seconds) of an audio
     file whose first sample is VOD second file_t0. Pass `transcript` to
     reuse an earlier one (re-scoring without re-running Whisper)."""
-    x = decode_pcm(audio_path, win_start - file_t0, win_end - win_start)
-    db = frame_db(x)
+    try:
+        x = decode_pcm(audio_path, win_start - file_t0, win_end - win_start)
+    except Exception:                                    # missing / corrupt audio: an observation, not a crash
+        x = np.zeros(0, dtype=np.float32)
+    db = frame_db(x) if len(x) else np.zeros(0)
     muted = float((db < MUTE_DB).mean()) if len(db) else 1.0
     active = db[db > MUTE_DB]
     mean_db = float(10 * np.log10(np.mean(10 ** (active / 10)))) if len(active) else -120.0
     p = Probe(win_start, win_end, round(mean_db, 1), round(muted, 2))
-    sec_db = frame_db(x, 1.0)
+    sec_db = frame_db(x, 1.0) if len(x) else np.zeros(0)
     p.mute_map = [bool(v < MUTE_DB) for v in sec_db]
-    if muted > 0.9:
+    p.observation = early_observation(p, peak_s, sec_db, len(x) == 0)
+    if p.observation in ("no audio", "muted", "payoff muted"):
+        log_probe(p, win_end - win_start, skipped=True)
         return p
+    log_probe(p, win_end - win_start, skipped=False)
     tr = transcript or transcribe(x, model_name, offset=win_start, prompt=vocab_prompt(login=login))
     p.transcript = tr
     p.words = real_words(tr)
@@ -463,6 +503,13 @@ def assess(p: Probe, win: dict, peak_s: float | None = None) -> dict:
     muted = win.get("muted_frac", p.muted_frac)
     if muted > 0.5 or (p.muted_frac > 0.9 and not p.words):
         hard = f"copyright-muted ({int(max(muted, p.muted_frac) * 100)}% digital silence)"
+    obs = getattr(p, "observation", "ok")
+    if not hard and obs == "payoff muted":
+        hard = "copyright-muted over the payoff (rights review: the beat can't be heard; not transcribed)"
+    elif not hard and obs == "no audio":
+        hard = "no audio in the source window (missing or corrupt)"
+    elif obs == "flat audio":
+        flags.append("flat audio (a constant bed — replaced or muted sound?)")
     elif win["words"] < 12 or win["speech_s"] < 6:
         hard = f"only {win['words']} words / {win['speech_s']}s of speech — nothing to caption"
     if not hard and win["speech_s"] < 15:
