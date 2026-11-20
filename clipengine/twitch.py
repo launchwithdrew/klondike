@@ -241,7 +241,7 @@ _CLIPS = """query($login: String!, $period: ClipsPeriod) { user(login: $login) {
       video { id } } } } } }"""
 
 
-def crowd_moments(vod: "Vod", start_s: float = 0, end_s: float | None = None) -> list[dict]:
+def crowd_moments(vod: "Vod", start_s: float = 0, end_s: float | None = None, wide: bool = False) -> list[dict]:
     """Where viewers clipped this VOD, merged into moments, most-viewed first.
 
     Viewers clip within seconds of a moment, publicly, with the exact VOD
@@ -249,6 +249,10 @@ def crowd_moments(vod: "Vod", start_s: float = 0, end_s: float | None = None) ->
     is viral" signal there is — the crowd has already voted. Launch week
     The most-clipped moments of a launch day reached thousands of views
     within hours.
+
+    Twitch lists a channel's top 100 clips per period (later pages need a browser integrity token, which we
+    don't fake), so on a long or busy stream smaller moments fall off the list. `wide=True` (training labels)
+    also reads the neighbouring periods and merges them, so more of the stream's clipped moments are known.
     """
     import datetime
     end_s = vod.length_s if end_s is None else end_s
@@ -258,10 +262,18 @@ def crowd_moments(vod: "Vod", start_s: float = 0, end_s: float | None = None) ->
     except ValueError:
         age_h = 999
     period = "LAST_DAY" if age_h < 24 else "LAST_WEEK" if age_h < 24 * 7 else "LAST_MONTH"
-    u = gql(_CLIPS, {"login": vod.login, "period": period}).get("user") or {}
-    clips = [e["node"] for e in ((u.get("clips") or {}).get("edges") or [])
-             if (e["node"].get("video") or {}).get("id") == vod.id
-             and e["node"].get("videoOffsetSeconds") is not None]
+    periods = [period]
+    if wide:
+        periods = ["LAST_DAY", "LAST_WEEK"] if age_h < 24 * 2 else ["LAST_WEEK", "LAST_MONTH"] \
+            if age_h < 24 * 7 else ["LAST_MONTH", "ALL_TIME"]
+    seen: dict[str, dict] = {}
+    for per in periods:
+        u = gql(_CLIPS, {"login": vod.login, "period": per}).get("user") or {}
+        for e in ((u.get("clips") or {}).get("edges") or []):
+            n = e["node"]
+            if (n.get("video") or {}).get("id") == vod.id and n.get("videoOffsetSeconds") is not None:
+                seen.setdefault(n["slug"], n)
+    clips = list(seen.values())
     clips = [c for c in clips if start_s - 60 <= c["videoOffsetSeconds"] < end_s]
     clips.sort(key=lambda c: c["videoOffsetSeconds"])
     now = datetime.datetime.now(datetime.timezone.utc)

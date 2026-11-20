@@ -168,7 +168,7 @@ class Judge:
         self.p_recent.append((now, p))
         m = self.m
         if self.cur is None:
-            if p >= m["trigger"] and now - self.last_end >= SN.COOLDOWN_S:
+            if p >= m["trigger"] and now - self.last_end >= SN.cooldown(m):
                 self.cur = {"fire": now, "peak": now, "p": p, "end": now}
             return None
         if p > self.cur["p"]:

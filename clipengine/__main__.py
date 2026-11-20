@@ -299,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
     tn.add_argument("--hours", type=float, default=4.0)
     tn.add_argument("--dry", action="store_true")
     tn.add_argument("--out", help="write the model here instead of config/sentinel_model.json")
+    tn.add_argument("--per", type=int, default=2, help="recent broadcasts per streamer (default 2)")
+    tn.add_argument("--force", action="store_true", help="write the model even if the one in use scores better")
     ln = sub.add_parser("learn", help="turn view counts into streamer weights (data/weights.json) + a calibration report")
     ln.add_argument("--dry", action="store_true", help="report only, don't write data/weights.json")
     fc = sub.add_parser("facecam", help="find a streamer's webcam box (for the facecam layout); saves a check image")
@@ -710,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["ok"] else 1
     if a.cmd == "train":
         from . import train as TR
-        TR.run(a.channel or None, a.vod or None, a.hours, write=not a.dry, out=a.out)
+        TR.run(a.channel or None, a.vod or None, a.hours, write=not a.dry, out=a.out, force=a.force, per=a.per)
         return 0
     if a.cmd == "learn":
         from . import learn as LN

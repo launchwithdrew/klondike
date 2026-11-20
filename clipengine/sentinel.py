@@ -176,14 +176,22 @@ def series(msgs: list[dict], start: float, end: float, m: dict | None = None,
     return out
 
 
+def cooldown(m: dict) -> float:
+    """Seconds after a moment ends before the next can fire. A trained model sets its own (`cooldown_s`): a long
+    one plus a low release kept the trigger busy through the loud chat AFTER a moment, so the next real one in a
+    busy stretch never fired (F1, Nov 20: re-arming quickly recovered ~a fifth of the missed moments)."""
+    return float(m.get("cooldown_s", COOLDOWN_S))
+
+
 def moments_from_series(ser: list[dict], m: dict | None = None) -> list[dict]:
     """Trigger/release over a probability series -> [{start, peak, end, p}] in the series' clock."""
     m = m or model()
+    cool = cooldown(m)
     out, cur, last_end = [], None, -1e9
     for row in ser:
         t, p = row["t"], row["p"]
         if cur is None:
-            if p >= m["trigger"] and t - last_end >= COOLDOWN_S:
+            if p >= m["trigger"] and t - last_end >= cool:
                 cur = {"fire": t, "peak": t, "p": p, "end": t}
         else:
             if p > cur["p"]:
@@ -414,7 +422,7 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
             except Exception as exc:
                 print(f"[sentinel] crowd draft check failed ({str(exc)[:80]})", flush=True)
         if cur is None:
-            if p >= m["trigger"] and now - last_end >= COOLDOWN_S:
+            if p >= m["trigger"] and now - last_end >= cooldown(m):
                 cur = {"fire": now, "peak": now, "p": p, "end": now, "chat": chat.window(now - 20, now),
                        "features": {k: round(v, 3) for k, v in f.items()}}
                 print(f"[sentinel] {login}: FIRED p={p:.2f} {json.dumps({k: round(v, 2) for k, v in f.items()})}", flush=True)

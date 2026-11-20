@@ -4885,3 +4885,94 @@ def test_publish_live_killed_after_transcribing_resumes_without_transcribing_aga
     assert calls == [1]                                                    # the rerun reused the transcript
     L.render_window(str(rec), 1000.0, 1040.0, out, model="tiny")
     assert calls == [1, 1]                                                 # another window: transcribed afresh
+
+
+# ---- F1: sentinel recall (re-arm, training on held-out streamers) --------------------------------
+
+def test_sentinel_rearms_after_its_models_cooldown():
+    """Two moments 45 s apart in a busy stretch: the old fixed 60 s cooldown swallowed the second; a model's own
+    shorter cooldown (and a release near the trigger) fires on both."""
+    from clipengine import sentinel as SN
+    ser = [{"t": float(t), "p": 0.1} for t in range(0, 400, 5)]
+    for row in ser:
+        if 100 <= row["t"] <= 110 or 155 <= row["t"] <= 165:
+            row["p"] = 0.9
+        elif 115 <= row["t"] <= 150:
+            row["p"] = 0.5                                   # chat still loud between them
+    old = {"trigger": 0.8, "release": 0.4}
+    assert [f["fire"] for f in SN.moments_from_series(ser, old)] == [100.0]
+    new = {"trigger": 0.8, "release": 0.76, "cooldown_s": 20}
+    assert [f["fire"] for f in SN.moments_from_series(ser, new)] == [100.0, 155.0]
+    assert SN.cooldown({}) == SN.COOLDOWN_S and SN.cooldown(new) == 20.0
+
+
+def test_tier1_judge_uses_the_models_cooldown(monkeypatch):
+    from clipengine import sentinel as SN, tier1 as TR
+    j = TR.Judge("streamera", {**SN.DEFAULT_MODEL, "weights": dict(SN.DEFAULT_MODEL["weights"]), "trigger": 0.8,
+                               "release": 0.76, "cooldown_s": 20})
+    ps = iter([0.9, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.9, 0.9, 0.1, 0.1, 0.1])
+    monkeypatch.setattr(SN, "prob", lambda f, m: next(ps))
+    j.hist = {"users": [1] * SN.MIN_HISTORY}
+    spikes = [j.step(1000 + i * 5.0, []) for i in range(12)]
+    assert sum(1 for s in spikes if s) == 2                  # 60 s fixed cooldown would have allowed only one
+
+
+def test_train_window_is_the_most_clipped_gta_stretch():
+    from clipengine import train as TRN, twitch as T
+    v = T.Vod(id="1", length_s=20 * 3600, login="streamera",
+              chapters=[T.Chapter(0, 3 * 3600, "Just Chatting"), T.Chapter(3 * 3600, 20 * 3600, TRN.GAME)])
+    crowd = [{"start": s, "end": s + 30, "views": 50} for s in (3.5 * 3600, 15 * 3600, 15.5 * 3600, 16 * 3600, 17 * 3600)]
+    crowd.append({"start": 1 * 3600, "end": 1 * 3600 + 30, "views": 999})          # not GTA VI: never chosen
+    n, s, e = TRN.window(v, crowd, hours=4)
+    assert n == 4 and 3 * 3600 <= s <= 15 * 3600 - 120 and e - s == 4 * 3600 and e <= v.length_s - 600
+    assert TRN.window(T.Vod(id="2", length_s=9 * 3600, game="Just Chatting"), crowd, 4) is None
+    short = T.Vod(id="3", length_s=9 * 3600, chapters=[T.Chapter(0, 1800, TRN.GAME), T.Chapter(1800, 9 * 3600, "Minecraft")])
+    assert TRN.window(short, crowd, 4) is None                 # under an hour of GTA VI: skipped
+
+
+def test_train_leaves_time_near_small_clips_out_of_the_negatives():
+    from clipengine import train as TRN
+    ser = [{"t": float(t), "f": {k: 0.0 for k in TRN.CHAT_FEATURES}} for t in range(0, 3000, 5)]
+    crowd = [{"start": 1000, "end": 1030, "views": 40}]
+    small = [{"start": 2000, "end": 2030, "views": 3}]
+    X, y = TRN.design(ser, crowd, crowd + small)
+    Xn, yn = TRN.design(ser, crowd)
+    assert len(y) < len(yn) and y.sum() == yn.sum() > 0       # the small clip's neighbourhood is ambiguous, not "nothing"
+
+
+def test_train_holds_out_whole_streamers_and_keeps_the_better_model(monkeypatch, tmp_path):
+    import numpy as np
+    from clipengine import sentinel as SN, train as TRN
+    rng = np.random.default_rng(0)
+
+    def fake(vod_id, hours, cache_dir, min_views=10, game=TRN.GAME):
+        login = "streamer" + "abcd"[int(vod_id) % 4]
+        ser, crowd = [], []
+        for i in range(800):
+            t = i * 5.0
+            hot = i % 100 in (50, 51, 52)
+            f = {k: float(rng.normal()) for k in TRN.CHAT_FEATURES}
+            f["z_users"] = 6.0 if hot else float(rng.normal())
+            ser.append({"t": t, "f": f})
+            if i % 100 == 50:
+                crowd.append({"start": t - 20, "end": t + 5, "views": 100})
+        X, y = TRN.design(ser, crowd, crowd)
+        return {"vod": vod_id, "login": login, "start": 0.0, "end": 4000.0, "n_msgs": 9999, "crowd": crowd,
+                "crowd_all": crowd, "ser": ser, "X": X, "y": y}
+
+    monkeypatch.setattr(TRN, "vod_dataset", fake)
+    seen = []
+    real = TRN.fit
+    monkeypatch.setattr(TRN, "fit", lambda X, y, **kw: (seen.append(len(y)), real(X, y, iters=300))[1])
+    out = tmp_path / "m.json"
+    m = TRN.run(vods=[str(i) for i in range(8)], write=True, out=str(out), force=True)
+    assert m["eval"]["held_out"] == "held-out streamers" and len(m["eval"]["streamers"]) == 4
+    assert len(seen) == 5                                                 # 4 folds (one per streamer) + the final fit
+    assert m["eval"]["held_out_recall_top10"] >= 0.9 and out.exists() and m["cooldown_s"] in TRN.COOLDOWNS
+    # the model in use scores better on these streams (it is the same object for every stream): not written
+    monkeypatch.setattr(TRN, "sweep", lambda sets, models, target: {
+        "trigger": 0.8, "release_ratio": 0.95, "cooldown_s": 20.0, "fph": 1.0, "per_vod": [],
+        "recall": 0.9 if models[0] is models[1] else 0.6})
+    out2 = tmp_path / "m2.json"
+    m2 = TRN.run(vods=[str(i) for i in range(8)], write=True, out=str(out2))
+    assert m2["written"] is False and not out2.exists()

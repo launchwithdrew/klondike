@@ -179,3 +179,21 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.12
+
+- `train` is stricter and catches more moments.
+  - Held-out scores now hold out a whole streamer at a time, so the number you see is for streamers the model has never seen.
+  - It trains on each streamer's 2 newest broadcasts of the game (`--per N`), using the 4 hours with the most viewer clips, not the last 4 hours.
+  - Viewer-clip labels read the neighbouring clip periods too, because Twitch lists only a channel's top 100 clips per period. That finds 2–5× more labelled moments on a busy channel.
+  - Time near a clip with too few views to count is left out of training. It is no longer treated as "nothing happened".
+- The trigger re-arms. A trained model now carries its own release and cooldown, and `train` tunes them together with the trigger. The old trigger stayed busy through the loud chat after a moment, then waited 60 s, so the next moment in a busy stretch never fired. On 61 held-out streams, re-arming caught about a fifth more top moments at the same false-fire rate. The live sentinel and the chat-only watcher both use it.
+- `train` writes a new model only if it does at least as well as the one in use on the same streams. It prints both. `--force` writes it anyway.
+- Fitting standardises features first, so small-scale signals aren't under-fitted.
+
+Export diff
+- Added (0)
+- Changed (8): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/sentinel.py`, `clipengine/tier1.py`, `clipengine/train.py`, `clipengine/twitch.py`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.
