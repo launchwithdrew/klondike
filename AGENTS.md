@@ -29,8 +29,8 @@ sign-in): run it with remote debugging (e.g. `--remote-debugging-port=9222`), ad
 `"browser_cdp_url": "http://127.0.0.1:9222"` to `config/ops.json`, skip `--login`, then run `--check`.
 **Your signed-in browser isn't on this machine** (e.g. a cloud browser your tools open tabs in)? Post
 with it yourself: add `"post_with": "agent"` to `config/ops.json` and skip the engine's sign-in. The
-engine still picks, cuts, checks and schedules every clip; `clipengine to-post` lists what's due (the
-file and the exact text for each platform), you upload it with your browser, then record it:
+engine still picks, cuts, checks and schedules every clip; `clipengine to-post` lists what's due;
+`clipengine claim --slug S --platform P` before you upload (see `bank`), then record it:
 `clipengine posted --slug S --platform P --url LINK`.
 
 Give the user `brand/kit/` (profile picture, banner, bios) and walk them through `brand/kit/checklist.md`.

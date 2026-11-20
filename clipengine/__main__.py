@@ -234,6 +234,17 @@ def main(argv: list[str] | None = None) -> int:
     prg = pr_.add_mutually_exclusive_group(required=True)
     prg.add_argument("--pending", action="store_true", help="every eligible draft without one (what cycle runs)")
     prg.add_argument("--id", action="append", help="this draft (repeatable); re-renders it")
+    cl_ = sub.add_parser("claim", help="(post_with: agent) take a due clip × platform before uploading it (leased)")
+    cl_.add_argument("--slug", required=True)
+    cl_.add_argument("--platform", required=True, choices=["youtube", "instagram", "tiktok"])
+    cl_.add_argument("--by", help="who is posting (default: CLIPENGINE_POSTER or this host)")
+    at_ = sub.add_parser("attempt", help="close a claimed upload that did not post: --failed WHY, or --release")
+    at_.add_argument("--slug", required=True)
+    at_.add_argument("--platform", required=True, choices=["youtube", "instagram", "tiktok"])
+    at_g = at_.add_mutually_exclusive_group(required=True)
+    at_g.add_argument("--failed", metavar="WHY", help="the upload failed or isn't on the account")
+    at_g.add_argument("--release", action="store_true", help="claimed but never handed to the browser")
+    sub.add_parser("bank", help="every finished clip per platform: waiting / ready / claimed / uncertain / live")
     sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
     pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
@@ -544,6 +555,24 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("stop --channel LOGIN, or stop --all")
             return 2
+        return 0
+    if a.cmd in ("claim", "attempt", "bank"):
+        from . import bank as BK
+        if a.cmd == "bank":
+            BK.show()
+        elif a.cmd == "claim":
+            r = BK.claim(a.slug, a.platform, a.by)
+            c = r["caption"]
+            print(f"claimed {a.slug} → {a.platform} (attempt {r['attempt']}, until {BK._iso(r['until'])})\n"
+                  f"  file: {r['file']}\n"
+                  + (f"  title: {c['title']}\n  description: {c['description']}" if a.platform == "youtube"
+                     else f"  caption: {c['caption']}")
+                  + f"\n  then: clipengine posted --slug {a.slug} --platform {a.platform} --url <link>"
+                  f"  (failed: clipengine attempt --slug {a.slug} --platform {a.platform} --failed \"why\")")
+        else:
+            aid = BK.close(a.slug, a.platform, "released" if a.release else "failed", why=a.failed)
+            print(f"attempt {aid} on {a.slug} → {a.platform}: " + ("released — ready again" if a.release else
+                                                                  f"failed ({a.failed}) — ready again"))
         return 0
     if a.cmd in ("to-post", "posted", "views", "to-measure", "followers"):
         from . import handpost as HP

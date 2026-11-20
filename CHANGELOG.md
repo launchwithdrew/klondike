@@ -120,3 +120,27 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.9
+
+- The bank. `clipengine bank` lists every finished clip on each platform with one state:
+  - waiting: scheduled, reserve inventory;
+  - ready;
+  - claimed;
+  - uncertain;
+  - live.
+- Claim before uploading. `clipengine claim --slug S --platform P` takes the platform under a 30-minute lease (`claim_lease_min` in `config/ops.json`) and records the attempt before the clip goes to the browser.
+  - Claims are atomic: two posters can't take the same platform.
+  - The claim prints the file and the exact text to use.
+- `posted` closes the attempt. Close an attempt that didn't post with `attempt --failed "why"`, or `attempt --release` if it never reached the browser. The platform is then ready again, and the failure count and reason are kept.
+- Reconcile before retry. When a lease runs out with no outcome, the platform becomes uncertain. Nobody can claim it again until someone checks the account and records `posted` (if it is live) or `attempt --failed`. It shows as overdue on the attention line.
+  - This prevents a double post after a session dies mid-upload.
+- `to-post` shows each due platform's state and the command for its next step.
+- Every step is one line in `data/attempts.jsonl`, committed like the ledger.
+
+Export diff
+- Added (1): `clipengine/bank.py`
+- Changed (9): `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/handpost.py`, `clipengine/ops.py`, `clipengine/verify.py`, `docs/reliability.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

@@ -107,16 +107,28 @@ def show() -> list[dict]:
         if not it["now"]:
             print(f"{it['slug']}: scheduled — " + ", ".join(f"{p} at {a}" for p, a in it["later"].items()))
             continue
+        from . import bank
         print(f"{it['slug']}  file: {it['file']}")
         for p in it["now"]:
+            st = bank.state(it["slug"], p, sha=it["sha256"])
+            if st["state"] == "uncertain":
+                print(f"  {p} — " + bank.reconcile_hint({**st, "slug": it["slug"], "platform": p}))
+                continue
+            if st["state"] == "claimed":
+                print(f"  {p} — claimed by {st['by']} (attempt {st['attempt']}) until "
+                      f"{bank._iso(st['until'])}: upload it, then `posted`")
+            else:
+                print(f"  {p} — claim it first: clipengine claim --slug {it['slug']} --platform {p}"
+                      + (f"  ({st['failures']} failed before: {st['last_failure']})" if st["failures"] else ""))
             c = it["captions"][p]
             if p == "youtube":
-                print(f"  youtube (Shorts upload) — title: {c['title']}\n    description: {c['description']}")
+                print(f"    title: {c['title']}\n    description: {c['description']}")
             else:
-                print(f"  {p} — caption: {c['caption']}")
+                print(f"    caption: {c['caption']}")
         if it["later"]:
             print("  later: " + ", ".join(f"{p} at {a}" for p, a in it["later"].items()))
-        print(f"  then: clipengine posted --slug {it['slug']} --platform <p> --url <link>")
+        print(f"  then: clipengine posted --slug {it['slug']} --platform <p> --url <link>  "
+              "(an upload that failed: clipengine attempt --slug … --platform … --failed \"why\")")
     return items
 
 
@@ -196,21 +208,26 @@ def mark(slug: str, platform: str, url: str, confirmed: bool = False, override: 
             return f"{slug} on {platform}: already recorded as live"
         fh.write(json.dumps(rec) + "\n")
     ledger.append(rec)
+    from . import bank
+    aid = bank.close(slug, platform, "live", url=url)       # ends the claim / reconciles an uncertain attempt
+    attempts = bank._paths()[0]
     attention.event("resolved", "", key=event_key, root=attention_root)
+    if aid:
+        attention.event("resolved", "", key=f"reconcile:{aid}", root=attention_root)
     from . import sentinel
     for draft in sentinel.load_queue(attention_root):
         if draft.get("slug") == slug and not draft.get("posted_at"):
             sentinel.note(draft, posted_at=rec["at"])
     left = [p for p in (meta.get("platforms") or list(PLATFORMS)) if not _live(p, slug, sha, ledger)]
     if not meta:
-        _sync([ledger_p], f"posted by agent (override): {slug} ({platform})")
+        _sync([ledger_p, attempts], f"posted by agent (override): {slug} ({platform})")
         return f"{slug}: live on {platform} — recorded as an override (outside the gate; not learned from)"
     if os.path.isdir(d) and d.startswith(outbox) and not left:
         os.makedirs(posted, exist_ok=True)
         shutil.move(d, os.path.join(posted, slug))
-        _sync([ledger_p, d, os.path.join(posted, slug)], f"posted by agent: {slug} ({platform})")
+        _sync([ledger_p, attempts, d, os.path.join(posted, slug)], f"posted by agent: {slug} ({platform})")
         return f"{slug}: live on {platform} — all platforms done, moved to posted/"
-    _sync([ledger_p], f"posted by agent{' (override)' if override else ''}: {slug} ({platform})")
+    _sync([ledger_p, attempts], f"posted by agent{' (override)' if override else ''}: {slug} ({platform})")
     note = " (override: outside the gate; not learned from)" if override else ""
     return f"{slug}: live on {platform}{note}" + (f" — still to post: {', '.join(left)}" if left else "")
 

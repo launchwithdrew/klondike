@@ -86,6 +86,10 @@ def post(platform: str, url: str, confirmed: bool = False) -> str:
         query["format"] = "json"
     try:
         info = _json(target + "?" + urlencode(query))
+        if platform == "tiktok" and not str(info.get("author_unique_id") or "").strip():
+            # TikTok sometimes answers with a stub (HTTP 200) that carries no author
+            # when it blocks automated reads. Treat that as "won't confirm".
+            raise ValueError("tiktok oEmbed returned no author")
     except (OSError, ValueError) as exc:
         status = getattr(exc, "code", None)
         suffix = f" (HTTP {status})" if status else ""

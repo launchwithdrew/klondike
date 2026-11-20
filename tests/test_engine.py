@@ -4508,6 +4508,29 @@ def test_a_tiktok_post_records_with_confirmation_when_tiktok_wont_answer_this_ho
         verify.post("tiktok", url, confirmed=True)
 
 
+def test_a_tiktok_post_records_with_confirmation_when_oembed_returns_no_author(tmp_path, monkeypatch):
+    import json
+    from clipengine import handpost, verify
+    monkeypatch.setattr(handpost, "REPO", str(tmp_path))
+    monkeypatch.setattr(handpost, "_sync", lambda *a: None)
+    monkeypatch.setattr(verify, "account", lambda platform: ("ourchannel", ""))
+    # TikTok answers HTTP 200 but with a stub that carries no author (blocks automated reads).
+    monkeypatch.setattr(verify, "_json", lambda url: {"author_unique_id": None, "author_name": None, "author_url": None})
+    drop = tmp_path / "outbox" / "win"; drop.mkdir(parents=True)
+    (drop / "post.json").write_text(json.dumps({"slug": "win", "platforms": ["tiktok"]}))
+    url = "https://www.tiktok.com/@ourchannel/video/7710348600303209758"
+    with pytest.raises(SystemExit, match=r"oEmbed unavailable.*--confirmed"):
+        handpost.mark("win", "tiktok", url)
+    assert "live on tiktok" in handpost.mark("win", "tiktok", url, confirmed=True)
+    row = handpost._ledger()[-1]
+    assert row["verified_by"] == "operator-confirmed (oEmbed unavailable)" and row["url"] == url
+    # a stub with an empty string author behaves the same
+    monkeypatch.setattr(verify, "_json", lambda url: {"author_unique_id": ""})
+    with pytest.raises(ValueError, match="oEmbed unavailable"):
+        verify.post("tiktok", url, confirmed=False)
+    assert verify.post("tiktok", url, confirmed=True) == "operator-confirmed (oEmbed unavailable)"
+
+
 # ---- the approved finish (spec §4): approval record, receipts, drop gate, byte-level cache ---------------
 
 def _finish_pack(tmp_path, monkeypatch, **over):
@@ -4602,3 +4625,94 @@ def test_the_reference_frame_catches_a_look_change_the_settings_alone_would_not(
     assert FN.check()["state"] == "ok"                                             # settings + files unchanged...
     st = FN.check_still(force=True)
     assert not st["same"] and "looks different" in st["why"]                       # ...but the frame shows it
+
+
+# ---- the bank (spec §5): states, atomic leased claims, attempts before hand-off, reconcile before retry ----
+
+def _bank(tmp_path, monkeypatch, platforms=("tiktok", "youtube"), schedule=None):
+    from clipengine import handpost as HP, verify
+    monkeypatch.setattr(HP, "REPO", str(tmp_path))
+    monkeypatch.setattr(HP, "_sync", lambda *a: None)
+    monkeypatch.setattr(verify, "post", lambda platform, url, confirmed=False: "oembed")
+    d = tmp_path / "outbox" / "win"; d.mkdir(parents=True)
+    (d / "clip.mp4").write_bytes(b"clip-bytes")
+    (d / "post.json").write_text(json.dumps({"slug": "win", "title": "Agent got DROPPED", "description": "d",
+                                             "platforms": list(platforms), "schedule": schedule or {}}))
+    return d
+
+
+def test_a_claimed_upload_is_recorded_before_the_browser_and_closed_by_posted(tmp_path, monkeypatch):
+    from clipengine import bank as BK, handpost as HP
+    _bank(tmp_path, monkeypatch)
+    now = time.time()
+    assert {r["platform"]: r["state"] for r in BK.inventory(now)} == {"tiktok": "ready", "youtube": "ready"}
+    r = BK.claim("win", "tiktok", by="muse", now=now)
+    assert r["state"] == "claimed" and r["caption"]["caption"].startswith("Agent got DROPPED")
+    ev = BK.events()
+    assert ev[-1]["ev"] == "claim" and ev[-1]["by"] == "muse" and ev[-1]["sha256"]          # on disk before upload
+    with pytest.raises(SystemExit, match="muse holds win on tiktok"):
+        BK.claim("win", "tiktok", by="laptop", now=now + 60)
+    HP.mark("win", "tiktok", "https://www.tiktok.com/@ourchannel/video/1")
+    assert [e["ev"] for e in BK.events()] == ["claim", "live"] and BK.events()[-1]["id"] == r["attempt"]
+    with pytest.raises(SystemExit, match="already live"):
+        BK.claim("win", "tiktok", now=now + 120)
+    assert BK.state("win", "youtube", now)["state"] == "ready"
+
+
+def test_an_upload_with_no_outcome_must_be_reconciled_before_anyone_retries(tmp_path, monkeypatch):
+    from clipengine import bank as BK, handpost as HP, ops as O
+    _bank(tmp_path, monkeypatch)
+    monkeypatch.setattr(HP, "enabled", lambda: True)
+    t0 = time.time()
+    a = BK.claim("win", "tiktok", by="muse", now=t0)["attempt"]
+    later = t0 + (BK.lease_min() + 1) * 60                                     # the session died mid-upload
+    assert BK.state("win", "tiktok", later)["state"] == "uncertain"
+    with pytest.raises(SystemExit, match=f"RECONCILE FIRST: attempt {a}"):
+        BK.claim("win", "tiktok", by="muse", now=later)                        # no blind retry: no double post
+    items = O._attention_items([], {}, {}, later)
+    assert any(i["key"] == f"reconcile:{a}" and i["kind"] == "overdue" for i in items)
+    assert BK.close("win", "tiktok", "failed", why="upload spinner never finished; not on the profile",
+                    now=later) == a
+    st = BK.state("win", "tiktok", later)
+    assert st["state"] == "ready" and st["failures"] == 1 and "spinner" in st["last_failure"]
+    b = BK.claim("win", "tiktok", by="muse", now=later)["attempt"]
+    assert b != a
+    BK.close("win", "tiktok", "released", now=later)                            # never reached the browser
+    assert BK.state("win", "tiktok", later)["state"] == "ready"
+    c = BK.claim("win", "tiktok", by="muse", now=later)["attempt"]
+    assert BK.state("win", "tiktok", later + 3600)["state"] == "uncertain"
+    HP.mark("win", "tiktok", "https://www.tiktok.com/@ourchannel/video/2")     # it HAD posted: reconciled as live
+    assert BK.events()[-1] == {**BK.events()[-1], "ev": "live", "id": c}
+    with pytest.raises(SystemExit, match="no open attempt"):
+        BK.close("win", "youtube", "failed", why="x")
+
+
+def test_scheduled_platforms_wait_in_the_bank_and_cannot_be_claimed_early(tmp_path, monkeypatch, capsys):
+    import datetime as _dt
+    from clipengine import bank as BK
+    at = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=3)).isoformat()
+    _bank(tmp_path, monkeypatch, schedule={"youtube": at})
+    assert BK.state("win", "youtube")["state"] == "ready"                      # state alone ignores schedules
+    assert {r["platform"]: r["state"] for r in BK.inventory()}["youtube"] == "waiting"
+    with pytest.raises(SystemExit, match="scheduled for"):
+        BK.claim("win", "youtube")
+    BK.show()
+    out = capsys.readouterr().out
+    assert out.startswith("bank: 1 ready, 1 waiting") and "claim --slug win --platform tiktok" in out
+
+
+def test_two_posters_racing_for_the_same_platform_get_one_claim(tmp_path, monkeypatch):
+    import threading as _th
+    from clipengine import bank as BK
+    _bank(tmp_path, monkeypatch)
+    wins, losses, go = [], [], _th.Event()
+    def poster(n):
+        go.wait()
+        try:
+            wins.append(BK.claim("win", "tiktok", by=f"poster{n}")["by"])
+        except SystemExit as exc:
+            losses.append(str(exc))
+    ts = [_th.Thread(target=poster, args=(n,)) for n in range(20)]
+    [t.start() for t in ts]; go.set(); [t.join(10) for t in ts]
+    assert len(wins) == 1 and len(losses) == 19 and all("holds win on tiktok" in x for x in losses)
+    assert [e["ev"] for e in BK.events()] == ["claim"]

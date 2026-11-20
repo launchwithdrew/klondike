@@ -626,6 +626,10 @@ def _attention_items(rows: list[dict], cfg: dict, state: dict, now: float) -> li
                 items.append({"kind": "overdue" if late else "due",
                               "key": f"{'overdue' if late else 'due'}:{it['slug']}:{p}",
                               "text": f"{it['slug']} {p}" + (f" ({(now - ts) / 60:.0f} min late)" if late else "")})
+        from . import bank as BK
+        for r in BK.uncertain(now):                        # an upload with no outcome: reconcile before any retry
+            items.append({"kind": "overdue", "key": f"reconcile:{r['attempt']}",
+                          "text": f"reconcile {r['slug']} {r['platform']} (attempt {r['attempt']}: posted or failed?)"})
     for item in HP.to_measure(now, lookback_h=float("inf")):
         if item["missing"]:
             slug, platform = item["slug"], item["platform"]
