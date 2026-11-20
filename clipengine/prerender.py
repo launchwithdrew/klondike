@@ -14,9 +14,11 @@ minutes. Anything else falls back to the full render, as before.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
+import re
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +27,18 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _floor() -> float:
     from . import gate as GT
     return min(r["min_score"] for r in GT.config()["platforms"].values())
+
+
+def _alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def brand_key() -> str:
@@ -79,12 +93,18 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
     if have and not force and have.get("brand") == key:
         return have
     lock = meta_path + ".lock"
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode()); os.close(fd)
     except FileExistsError:
-        if time.time() - os.path.getmtime(lock) < 900:
+        try:
+            owner = int(open(lock).read().strip() or 0)
+        except (OSError, ValueError):
+            owner = 0
+        if _alive(owner) and time.time() - os.path.getmtime(lock) < 900:
             return None                                # another process is on it
+        # its owner was killed mid-render (or it's stale): take over now, not 15 min later
         os.remove(lock)
         return prerender(entry, listen, force)
     t0 = time.time()
@@ -101,7 +121,14 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
             if early.observation in A.SKIP_OBS:
                 raise RuntimeError(A.skip_reason(early.observation))
             words = A.real_words(A.transcribe(x, O.whisper_model(), offset=first))
-        tmp = mp4 + ".part.mp4"
+        tmp = mp4.rsplit(".mp4", 1)[0] + f".part{os.getpid()}.mp4"   # per process: an orphan can't race a retry
+        for old in glob.glob(mp4.rsplit(".mp4", 1)[0] + ".part*"):     # leftovers of a killed run
+            m = re.search(r"\.part(\d+)", old)
+            if m and int(m.group(1)) != os.getpid() and not _alive(int(m.group(1))):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
         try:
             with FC.creator(entry.get("login")):
                 info = V.render(src, first, s, e, words, tmp, crop="blur", layout="stack",

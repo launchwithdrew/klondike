@@ -4802,3 +4802,86 @@ def test_bench_predicts_the_speed_targets_and_compares_two_hosts(tmp_path):
     assert any(r.split()[:2] == ["render", "s"] and r.split()[-2:] == ["150", "20"] for r in rows)
     assert BN.lines({**slow, "transcribe": {"skipped": "Whisper 'small' isn't downloaded here"}, "predict": {}})[2] \
         .strip().startswith("whisper  Whisper 'small' isn't downloaded")
+
+
+# ---- M1: a render killed mid-way resumes; nothing half-made ever looks ready ---------------------------
+
+def _recording_from(src, d, t0):
+    seg = d / "segments"; seg.mkdir(parents=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-c", "copy", "-f", "segment", "-segment_time", "2",
+                    "-reset_timestamps", "1", str(seg / "s%03d.ts")], check=True)
+    files = sorted(os.listdir(seg))
+    (d / "index.jsonl").write_text("".join(json.dumps({"t": t0 + 2 * i, "d": 2.0, "f": f}) + "\n"
+                                           for i, f in enumerate(files)))
+    (d / "recording.json").write_text(json.dumps({"login": "streamera"}))
+
+
+def test_a_prerender_killed_mid_encode_is_retaken_at_once_and_never_looks_ready(src, tmp_path, monkeypatch):
+    import signal as _sig
+    from clipengine import prerender as PR, live as L
+    monkeypatch.setenv("CLIPENGINE_NO_AUDIT", "1")
+    t0 = 1_800_000_000.0
+    rec = tmp_path / "rec"; rec.mkdir()
+    _recording_from(src, rec, t0)
+    wf = rec / "w.json"
+    wf.write_text(json.dumps({"start": t0 + 1, "stop": t0 + 15, "words": [
+        {"w": " no", "start": t0 + 5, "end": t0 + 5.3, "spk": "streamer"},
+        {"w": " way", "start": t0 + 5.4, "end": t0 + 5.8, "spk": "streamer"}]}))
+    entry = {"id": "streamera-1", "login": "streamera", "rec": str(rec), "start": t0 + 3, "stop": t0 + 13,
+             "payoff": t0 + 9, "words": str(wf), "status": "new", "best": 80}
+    (rec / "queue.jsonl").write_text(json.dumps(entry) + "\n")
+    mp4, meta = PR.paths(entry)
+    env = {**os.environ, "CLIPENGINE_NO_AUDIT": "1", "CLIPENGINE_NO_SYNC": "1"}
+    code = (f"import sys, json; sys.path.insert(0, {REPO!r}); from clipengine import prerender as PR, render as V; "
+            "V.render_preset = lambda: 'veryslow'; "
+            f"PR.prerender(json.loads({json.dumps(json.dumps(entry))}), listen=False)")
+    p = subprocess.Popen([sys.executable, "-c", code], env=env, start_new_session=True)
+    try:
+        drafts = rec / "drafts"
+        for _ in range(300):
+            if drafts.exists() and any(".part" in f and f.endswith(".part") for f in os.listdir(drafts)):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the encode never started")
+        os.kill(p.pid, _sig.SIGKILL)                     # the engine dies mid-encode; its ffmpeg is orphaned
+        p.wait(10)
+        assert not os.path.exists(mp4) and PR.load(entry) is None   # nothing half-made looks ready
+        assert int(open(meta + ".lock").read()) == p.pid             # its lock is left behind…
+        m = PR.prerender(entry, listen=False)                         # …and taken over at once, not in 15 min
+        assert m and m["ok"] and os.path.exists(mp4) and PR.load(entry)["ok"]
+        assert abs(L.media_duration(mp4) - 10) < 1.0
+        assert not [f for f in os.listdir(drafts) if f".part{p.pid}" in f and not f.endswith(".part")]
+    finally:
+        try:
+            os.killpg(p.pid, _sig.SIGKILL)               # the orphaned encoder
+        except OSError:
+            pass
+
+
+def test_publish_live_killed_after_transcribing_resumes_without_transcribing_again(tmp_path, monkeypatch):
+    import numpy as np
+    from clipengine import live as L, audio as A, render as V
+    rec = tmp_path / "rec"; rec.mkdir()
+    (rec / "recording.json").write_text(json.dumps({"login": "streamera"}))
+    monkeypatch.setattr(L, "cut_source", lambda d, a, b, out: open(out, "wb").write(b"x") and a)
+    sr = A.SR
+    loud = (0.2 * np.sin(np.linspace(0, 2000, sr * 40))).astype(np.float32)
+    loud *= (1 + 0.8 * np.sin(np.linspace(0, 30, sr * 40))).astype(np.float32)
+    monkeypatch.setattr(A, "decode_pcm", lambda *a, **k: loud)
+    calls = []
+    monkeypatch.setattr(A, "transcribe", lambda *a, **k: calls.append(1) or {"segments": [
+        {"text": "no way", "start": 1003.0, "words": [{"w": " no", "start": 1003.0, "end": 1003.3, "p": 0.9}]}]})
+    def killed(*a, **k):
+        raise KeyboardInterrupt("SIGTERM mid-render")
+    monkeypatch.setattr(V, "render", killed)
+    out = str(tmp_path / "clip.mp4")
+    with pytest.raises(KeyboardInterrupt):
+        L.render_window(str(rec), 1000.0, 1030.0, out, model="tiny")
+    assert calls == [1] and os.path.exists(out + ".words.json")
+    monkeypatch.setattr(V, "render", lambda *a, **k: {"out": a[5]})
+    monkeypatch.setattr(L, "media_duration", lambda p: 60.0)
+    L.render_window(str(rec), 1000.0, 1030.0, out, model="tiny")
+    assert calls == [1]                                                    # the rerun reused the transcript
+    L.render_window(str(rec), 1000.0, 1040.0, out, model="tiny")
+    assert calls == [1, 1]                                                 # another window: transcribed afresh

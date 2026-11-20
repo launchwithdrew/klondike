@@ -456,6 +456,15 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
     src = out + ".src.ts"
     say(f"cutting {end_ts - start_ts:.0f} s from the recording…")
     first = cut_source(rec_dir, start_ts - 3, end_ts + 3, src)
+    ck = out + ".words.json"                     # resume: a run killed after transcribing doesn't transcribe again
+    if words is None:
+        try:
+            c = json.load(open(ck))
+            if c.get("start") == start_ts and c.get("end") == end_ts:
+                words = c["words"]
+                say("resuming: reusing the transcript a killed run already made")
+        except (OSError, ValueError, KeyError):
+            pass
     if words is None:
         say("transcribing (the slow part: a few minutes on a CPU)…")
         if not model:
@@ -469,6 +478,9 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
         with open(os.path.join(rec_dir, "recording.json")) as stream:
             login = json.load(stream).get("login")
         words = A.real_words(A.transcribe(x, model, offset=first, prompt=A.vocab_prompt(login=login)))
+        with open(ck + ".tmp", "w") as fh:
+            json.dump({"start": start_ts, "end": end_ts, "words": words}, fh)
+        os.replace(ck + ".tmp", ck)
     else:
         say("reusing the draft's transcript (no second transcription)")
         words = [dict(w) for w in words]

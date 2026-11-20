@@ -163,3 +163,19 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.11
+
+- A render killed mid-way recovers by itself and never leaves a half-made clip that looks ready.
+  - Burning the card onto a pre-rendered clip now writes to a temporary file and renames it only when finished, like the main render already did. A kill mid-encode leaves no finished-looking clip.
+  - Temporary encode files are per process, so an encoder orphaned by a killed engine can't overwrite a retry's output. A retry clears the leftovers of dead runs.
+  - A pre-render whose owner was killed is taken over at once, instead of being blocked for 15 minutes by the lock it left behind.
+  - `publish-live` saves the transcript as soon as it has one. A run killed after transcribing resumes without transcribing again, as long as the window is the same.
+- Drills: a real pre-render process is killed mid-encode (SIGKILL, encoder orphaned). Nothing looks ready, the retry takes over immediately, and the finished clip has the right length.
+
+Export diff
+- Added (0)
+- Changed (6): `VERSION`, `clipengine/__init__.py`, `clipengine/live.py`, `clipengine/prerender.py`, `clipengine/render.py`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

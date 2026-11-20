@@ -384,11 +384,12 @@ def _render(source: str, source_t0: float, start_s: float, end_s: float,
     # -t as an OUTPUT option: as an input option it is ignored for .ts
     # sources once a filter graph is attached (test caught 17.4 s for 10 s)
     cmd += ["-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", render_preset(), "-crf", "20", "-r", "30",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-f", "mp4", out + ".part"]
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-f", "mp4", f"{out}.{os.getpid()}.part"]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg failed: " + p.stderr[-1500:])
-    os.replace(out + ".part", out)            # a killed encode never leaves a finished-looking clip
+    os.replace(f"{out}.{os.getpid()}.part", out)    # a killed encode never leaves a finished-looking clip
+                                                      # (per process: an orphaned encoder can't race a retry)
     transcript = {"clip_start_vod_s": start_s, "clip_end_vod_s": end_s,
                   "segments": [{"start": c["start"], "end": c["end"], "text": c["text"],
                                 "words": [{"w": c["text"], "start": c["start"], "end": c["end"]}]}
@@ -520,10 +521,11 @@ def _burn_card(pre: str, out: str, title: str | None, quote: str | None, slot: d
     if dur:
         cmd += ["-t", f"{dur:.3f}"]
     cmd += ["-c:v", "libx264", "-preset", render_preset(), "-crf", "20", "-r", "30", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", out]
+            "-movflags", "+faststart", "-f", "mp4", f"{out}.{os.getpid()}.part"]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg (card) failed: " + p.stderr[-1500:])
+    os.replace(f"{out}.{os.getpid()}.part", out)            # a killed card burn never leaves a finished-looking clip
     want = dur if dur else max(0.0, float((ffprobe(pre).get("format") or {}).get("duration") or 0) - trim_start)
     rep_audit = audit(out, want, payoff_s, max((c["end"] for c in cards), default=None) if cap and cap.get("cards") else None)
     return {"out": out, "card": bool(card_png), "title": title, "quote": quote, "audit": rep_audit}
