@@ -44,7 +44,10 @@ cause.
 ## Catch-up
 After a gap, `cycle` scans the saved streams of the missing time once. By hand, `clipengine catchup` without
 `--since` resumes from the last completed coverage (at most 12 hours back). With no coverage on record it asks for
-`--since` instead of guessing.
+`--since` instead of guessing. It checks the whole batch first: an unknown or never-clip channel stops it before
+anything runs (exit 2). It prints the plan, then a summary that keeps "found nothing" apart from "couldn't look".
+A source that failed holds the coverage mark before its window, so the next run retries it (exit 3). `jobs` lists
+the last batches.
 
 ## Posting without doubles
 `clipengine bank` lists every finished clip on each platform with its state: waiting (scheduled), ready,

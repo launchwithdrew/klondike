@@ -1051,6 +1051,14 @@ def doctor(accounts: bool = False) -> bool:
                                                                               else "DIFFERENT: " + _st.get("why", ""))))
     except Exception as exc:
         print(f"  \u00b7 finish: not checked ({str(exc)[:80]})")
+    from . import migrate as _MG
+    from . import autopilot as _AP
+    _role = _MG.role()
+    check(f"machine role: {_role}" + ("" if _role == "leader" else f" — {_MG.may_publish()[1]}"), _role == "leader",
+          "`clipengine migrate status`; `migrate takeover` makes this machine the leader")
+    _rp = _AP.restore_pending()
+    if _rp:
+        check(_rp, False, "finish it before relying on this install's data")
     cdp = config().get("browser_cdp_url")
     from . import handpost as _HP
     if _HP.enabled():

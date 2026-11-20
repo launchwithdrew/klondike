@@ -126,6 +126,9 @@ def drop(file: str, slug: str, title: str, description: str, moment_at: str, pos
          push: bool = True, check_only: bool = False, platforms: list[str] | None = None,
          schedule: dict | None = None, grade: dict | None = None, moment_window: dict | None = None) -> None:
     from . import finish as FN
+    from . import migrate as MG
+    if post and not check_only:
+        MG.guard_publish()                       # a shadow or handed-over machine never drops for posting
     receipt = FN.gate(file)                      # a clip with a look other than the approved finish never drops
     cmd = ["node", os.path.join(REPO, "tools", "drop.mjs"), "--file", file, "--slug", slug,
            "--title", title, "--description", description, "--moment-at", moment_at, "--brand-safe"]

@@ -4976,3 +4976,207 @@ def test_train_holds_out_whole_streamers_and_keeps_the_better_model(monkeypatch,
     out2 = tmp_path / "m2.json"
     m2 = TRN.run(vods=[str(i) for i in range(8)], write=True, out=str(out2))
     assert m2["written"] is False and not out2.exists()
+
+
+# ---- T8: batch scheduling (validate before launch, honest outcomes, watermark over completed coverage) ----
+
+def _batch_env(tmp_path, monkeypatch, fail_vod="222", fail_list=()):
+    from clipengine import autopilot as AP, pipeline as P, sentinel as SN, publish as PB, admission as AD
+    monkeypatch.setattr(AP, "RUNS", str(tmp_path))
+    monkeypatch.setenv("CLIPENGINE_ADMISSION_ROOT", str(tmp_path))
+    monkeypatch.setattr(PB, "creators", lambda: {"streamera": {}, "streamerb": {}, "streamerc": {},
+                                                 "streamerd": {"policy": "never"}})
+    monkeypatch.setattr(AP, "_queue_rows", lambda root=None: SN.load_queue(str(tmp_path)))
+    monkeypatch.setattr(AP.AT, "RUNS", str(tmp_path))
+    created = "2026-11-19T06:00:00Z"
+    c0 = AP._epoch(created)
+    vods = {"streamera": "111", "streamerb": "222", "streamerc": "333"}
+
+    def lister(l, s, u):
+        if l in fail_list:
+            raise RuntimeError("timed out")
+        return [{"id": vods[l], "created": c0, "length_s": 7200, "a": s - c0, "b": u - c0}]
+    monkeypatch.setattr(AP, "vods_overlapping", lister)
+    scans = []
+
+    def fake_scan(vod, out, a, b, top=12, probe=6):
+        scans.append(vod)
+        if vod == fail_vod:
+            raise RuntimeError("HTTP 502 from the playlist")
+        if vod == "333":
+            raise RuntimeError("no chat in this window")
+        cand = {"rank": 1, "probed": True, "hard_fail": None, "peak_s": a + 600, "chat_score": 9.0, "audio_factor": 1.1,
+                "window": {"start_s": a + 575, "end_s": a + 620}, "flags": [], "transcript_text": "no way",
+                "safety": {"flagged": False}, "crowd": {"views": 900, "views_per_min": 30}, "top_text": "LMAO",
+                "clip_start_s": a + 570, "clip_end_s": a + 630}
+        return {"vod": {"id": vod, "created_at": created, "login": "streamera"}, "candidates": [cand]}
+    monkeypatch.setattr(P, "scan", fake_scan)
+    return AP, c0, scans
+
+
+def test_batch_plan_refuses_bad_input_before_anything_runs(tmp_path, monkeypatch):
+    AP, c0, scans = _batch_env(tmp_path, monkeypatch, fail_list=("streamerc",))
+    bad = AP.plan_batch(c0 + 3600, c0 + 5400, ["streamera", "nobody", "streamerd"])
+    assert bad["items"] == [] and any("nobody: not on the roster" in w for w in bad["invalid"]) \
+        and any("never" in w for w in bad["invalid"])
+    with pytest.raises(ValueError, match="not on the roster"):
+        AP.catchup(c0 + 3600, c0 + 5400, ["nobody"])
+    assert scans == []                                                    # invalid input: nothing scanned or queued
+    plan = AP.plan_batch(c0 + 3600, c0 + 5400)
+    assert plan["targets"]["streamera"].startswith("ok (1") and plan["targets"]["streamerc"].startswith("source failed")
+    assert "streamerd" not in plan["targets"] and len(plan["items"]) == 2
+
+
+def test_batch_outcomes_and_the_watermark_stop_at_a_failed_source(tmp_path, monkeypatch):
+    AP, c0, scans = _batch_env(tmp_path, monkeypatch)
+    since, until = c0 + 3600, c0 + 5400
+    out = {}
+    got = AP.catchup(since, until, outcome=out)
+    res = {w.get("vod"): w["result"] for w in out["windows"]}
+    assert res["111"] == "queued 1" and res["333"].startswith("nothing strong (no chat)")
+    assert [f["vod"] for f in out["failed"]] == ["222"] and "502" in out["failed"][0]["why"]
+    assert len(got) == 1
+    line = AP.summary(out, len(got))
+    assert "1 moment(s) queued from 2 window(s)" in line and "1 with nothing strong" in line \
+        and "NOT covered (source failed: streamerb)" in line
+    assert AP.covered_until(since, until, out) == since                  # streamerb's whole window failed: hold
+    assert AP.covered_until(since, until, {"failed": []}) == until
+    assert AP.covered_until(since, until, {"failed": [{"from": since + 900}]}) == since + 900
+    again = {}
+    assert AP.catchup(since, until, outcome=again) == []                  # replayed batch: no second artifact
+    assert {w.get("vod"): w["result"] for w in again["windows"]}["111"].startswith("nothing strong")
+
+
+def test_catchup_cli_exit_codes_watermark_and_journal(tmp_path, monkeypatch, capsys):
+    from clipengine import __main__ as M, admission as AD
+    AP, c0, scans = _batch_env(tmp_path, monkeypatch)
+    since, until = c0 + 3600, c0 + 5400
+    with pytest.raises(SystemExit) as e:
+        M.main(["catchup", "--since", str(int(since)), "--until", str(int(until)), "--channel", "nobody"])
+    assert e.value.code == 2 and scans == []
+    assert M.main(["catchup", "--since", str(int(since)), "--until", str(int(until))]) == 3   # finished, not all covered
+    assert AP._json(AP._coverage()).get("catchup_until") is None            # held: streamerb's window starts at since
+    jb = AP.batches(str(tmp_path))
+    assert jb[-1]["queued"] == 1 and jb[-1]["failed"][0]["login"] == "streamerb" and jb[-1]["covered_until"] == since
+    assert "NOT covered: streamerb" in "\n".join(AD.batch_lines(str(tmp_path)))
+    _batch_env(tmp_path, monkeypatch, fail_vod="none")                     # the source is back
+    assert M.main(["catchup", "--until", str(int(until)), "--since", str(int(since))]) == 0
+    assert AP._json(AP._coverage())["catchup_until"] == until               # now fully covered: moves to until
+    assert "plan: streamera ok" in capsys.readouterr().out
+
+
+def test_sweep_starts_from_completed_coverage_not_from_its_last_launch(monkeypatch, tmp_path):
+    from clipengine import autopilot as AP, ops as O
+    started = []
+    monkeypatch.setattr(AP, "CATCHUP_PID", str(tmp_path / "c.pid"))
+    monkeypatch.setattr(AP, "RUNS", str(tmp_path))
+    monkeypatch.setattr(O, "_detach", lambda cmd, log, cwd=None: started.append(cmd) or 777)
+    monkeypatch.setattr(AP, "_alive", lambda pid: False)
+    now = 1_800_000_000.0
+    st = {"sweep_at": now - 3600, "sweep_until": now - 600}              # last launch — which failed part-way
+    AP.mark_covered(now - 2400, sweep=True)                               # what was actually covered
+    AP.maybe_sweep(st, now, {})
+    assert float(started[0][started[0].index("--since") + 1]) == int(now - 2400)
+
+
+# ---- T8: migration (snapshot + checksums, isolated verify, shadow, one leadership handoff, rollback) -------
+
+def _install(root, posts=2):
+    for rel, text in {"brand/brand.json": "{}", "brand/finish/approved.json": '{"version": 1}',
+                      "config/ops.json": '{"post_with": "agent"}', "ledger.jsonl": '{"slug": "a"}\n' * posts,
+                      "data/clipped.jsonl": '{"login": "streamera", "moment_at": "t1"}\n{"login": "streamerb", "moment_at": "t2"}\n',
+                      "data/attempts.jsonl": '{"id": "x"}\n', "outbox/a/a.mp4": "VIDEO",
+                      "chrome-profile/Default/Cookies": "SECRET", "config/token.txt": "SECRET",
+                      "runs/coverage.json": '{"catchup_until": 5000.0, "sweep_until": 4800.0}'}.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+
+def test_migrate_snapshot_verifies_in_isolation_and_keeps_credentials_out(tmp_path):
+    import zipfile
+    from clipengine import migrate as MG
+    src = tmp_path / "old"; _install(src)
+    snap = MG.snapshot(str(tmp_path / "nas"), root=str(src))
+    names = zipfile.ZipFile(snap).namelist()
+    assert "outbox/a/a.mp4" in names and "MANIFEST.json" in names
+    assert not any("Cookies" in n or "token" in n or "chrome-profile" in n for n in names)
+    res = MG.verify(snap, str(tmp_path / "check"))
+    assert res["ok"], res["checks"]
+    assert {c[0] for c in res["checks"]} >= {"checksums", "no credentials", "ledger posts", "clipped moments",
+                                             "finished clips", "approved finish"}
+    assert (tmp_path / "check" / "brand" / "finish" / "approved.json").exists()
+    assert res["manifest"]["coverage"]["catchup_until"] == 5000.0
+    # a snapshot changed after it was made: not verified, and nothing takes the final name
+    bad = tmp_path / "bad.zip"
+    with zipfile.ZipFile(snap) as zin, zipfile.ZipFile(bad, "w") as zout:
+        for n in zin.namelist():
+            zout.writestr(n, b"POSTS" if n == "ledger.jsonl" else zin.read(n))
+    res2 = MG.verify(str(bad), str(tmp_path / "check2"))
+    assert not res2["ok"] and not (tmp_path / "check2").exists() and res2["dir"].endswith(".staging")
+    assert any(c[0] == "checksums" and not c[1] for c in res2["checks"])
+    with pytest.raises(SystemExit, match="isolated"):
+        MG.verify(snap, MG.REPO)
+
+
+def test_migrate_shadow_release_takeover_and_rollback(tmp_path, monkeypatch):
+    import shutil
+    from clipengine import migrate as MG, bank as BK, autopilot as AP
+    old, new = tmp_path / "old", tmp_path / "new"
+    _install(old); _install(new)
+    (new / "runs" / "coverage.json").write_text("{}")
+    assert MG.role(str(old)) == "leader" and MG.may_publish(str(old))[0]          # no record: leads, as before
+    MG.shadow(str(new))
+    assert MG.role(str(new)) == "shadow" and not MG.may_publish(str(new))[0] and MG.may_lead(str(new))[0]
+    with pytest.raises(SystemExit, match="takeover"):
+        MG.takeover(str(new), push=False, start=lambda: "started")                # nothing released yet
+    stops = []
+    out = MG.release(str(old), push=False, stop=lambda: stops.append(1) or "autopilot stopped")
+    assert stops and "takeover" in out and MG.role(str(old)) == "released"
+    assert not MG.may_lead(str(old))[0] and not MG.may_publish(str(old))[0]
+    shutil.copy(old / MG.RECORD, new / MG.RECORD)                                   # git pull on the new machine
+    msg = MG.takeover(str(new), push=False, start=lambda: "autopilot started")
+    assert "is the leader" in msg and MG.role(str(new)) == "leader" and MG.may_publish(str(new))[0]
+    assert json.loads((new / "runs" / "coverage.json").read_text())["catchup_until"] == 5000.0   # resumes there
+    shutil.copy(new / MG.RECORD, old / MG.RECORD)
+    assert MG.role(str(old)) == "released"                                          # leadership moved once
+    with pytest.raises(SystemExit, match="still leads"):
+        MG.takeover(str(old), push=False, start=lambda: "x")
+    # rollback: the new machine releases, the old one takes over again
+    MG.release(str(new), push=False, stop=lambda: "stopped")
+    shutil.copy(new / MG.RECORD, old / MG.RECORD)
+    assert "is the leader" in MG.takeover(str(old), push=False, start=lambda: "started")
+    assert MG.role(str(old)) == "leader" and len(MG.record(str(old))["history"]) == 4
+    # the guards on the real entry points
+    monkeypatch.setattr(MG, "role", lambda root=None: "released")
+    monkeypatch.setattr(MG, "record", lambda root=None: {"leader": "newhost:1"})
+    with pytest.raises(SystemExit, match="HANDED OVER"):
+        BK.claim("a", "tiktok")
+    assert "HANDED OVER" in AP.autopilot_start()
+
+
+def test_publish_drop_refuses_on_a_shadow_machine(monkeypatch):
+    from clipengine import migrate as MG, publish as PB, finish as FN
+    monkeypatch.setattr(MG, "role", lambda root=None: "shadow")
+    monkeypatch.setattr(FN, "gate", lambda f: (_ for _ in ()).throw(AssertionError("gate reached")))
+    with pytest.raises(SystemExit, match="SHADOW HOST"):
+        PB.drop("x.mp4", "s", "t", "d", "2026-11-20T00:00:00Z", post=True)
+
+
+def test_an_interrupted_restore_is_reported_then_finished(tmp_path):
+    import zipfile
+    from clipengine import autopilot as AP
+    root = tmp_path / "inst"; _install(root)
+    snap = AP.backup(str(tmp_path / "b"), root=str(root))
+    (root / "ledger.jsonl").write_text("changed\n")
+    # simulate a kill after unpacking: staging + marker exist, nothing moved yet
+    stage = root / "runs" / "restore-staging"
+    with zipfile.ZipFile(snap) as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        z.extractall(stage, names)
+    (root / "runs" / "restore-in-progress.json").write_text(json.dumps({"from": snap, "names": names, "before": "", "at": 0}))
+    assert "interrupted" in AP.restore_pending(str(root))
+    assert (root / "ledger.jsonl").read_text() == "changed\n"                     # nothing half-applied silently
+    assert AP._finish_restore(str(root)) == len(names)
+    assert AP.restore_pending(str(root)) is None and (root / "ledger.jsonl").read_text() == '{"slug": "a"}\n' * 2
+    assert AP.restore(snap, root=str(root)) and AP.restore_pending(str(root)) is None

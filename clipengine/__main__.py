@@ -175,6 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     bk_.add_argument("--to", help="folder for the zip (default runs/backups)")
     rs_ = sub.add_parser("restore", help="put a backup zip back (backs up what's there first)")
     rs_.add_argument("file")
+    mg_ = sub.add_parser("migrate", help="move to another machine: snapshot, verify, shadow, release, takeover, status")
+    mg_.add_argument("action", choices=["snapshot", "verify", "shadow", "release", "takeover", "status"])
+    mg_.add_argument("file", nargs="?", help="verify: the snapshot zip")
+    mg_.add_argument("--to", help="snapshot: folder for the zip (e.g. a mounted NAS share; default runs/backups)")
+    mg_.add_argument("--into", help="verify: isolated folder to restore into (default a new temp folder)")
     it = sub.add_parser("init", help="set up this channel: brand pack, profile kit, roster (unique look by default)")
     it.add_argument("--name"); it.add_argument("--youtube", help="@handle"); it.add_argument("--instagram")
     it.add_argument("--tiktok"); it.add_argument("--category", help='game or category, e.g. "Grand Theft Auto VI"')
@@ -421,6 +426,27 @@ def main(argv: list[str] | None = None) -> int:
                 SV.reconcile(None, root=AP._root())
             print("\n".join(SV.status_lines(AP._root())))
         return 0
+    if a.cmd == "migrate":
+        from . import migrate as MG
+        if a.action == "snapshot":
+            MG.snapshot(a.to)
+        elif a.action == "verify":
+            if not a.file:
+                ap.error("migrate verify FILE")
+            res = MG.verify(a.file, a.into)
+            for name, ok, detail in res["checks"]:
+                print(f"  {'✓' if ok else '✗'} {name}: {detail}")
+            print(("VERIFIED — restored copy in " if res["ok"] else "NOT VERIFIED — staging left in ") + res["dir"])
+            return 0 if res["ok"] else 1
+        elif a.action == "shadow":
+            print(MG.shadow())
+        elif a.action == "release":
+            print(MG.release())
+        elif a.action == "takeover":
+            print(MG.takeover())
+        else:
+            print("\n".join(MG.status_lines()))
+        return 0
     if a.cmd in ("autopilot", "attention", "schedule", "catchup", "backup", "restore"):
         from . import autopilot as AP
         if a.cmd == "autopilot":
@@ -460,12 +486,30 @@ def main(argv: list[str] | None = None) -> int:
                     ap.error(str(exc))
                 print(f"catch-up window: {_t.strftime('%Y-%m-%d %H:%M', _t.localtime(since))} → "
                       f"{_t.strftime('%H:%M', _t.localtime(until))} ({(until - since) / 60:.0f} min, {how})", flush=True)
+                outcome: dict = {}
                 if a.sweep:
-                    AP.sweep(since, until, a.channel)
+                    if a.channel:
+                        bad = AP.plan_batch(since, until, a.channel, lister=lambda *x: [])["invalid"]
+                        if bad:
+                            ap.error("catchup: " + "; ".join(bad))
+                    got = AP.sweep(since, until, a.channel, outcome=outcome)
                 else:
-                    AP.catchup(since, until, a.channel)
-                if not a.channel:
-                    AP.mark_covered(until, sweep=a.sweep)          # only completed coverage moves the watermark
+                    plan = AP.plan_batch(since, until, a.channel)
+                    if plan["invalid"]:
+                        ap.error("catchup: " + "; ".join(plan["invalid"]))   # invalid input: nothing queued
+                    print("plan: " + (" · ".join(f"{k} {v}" for k, v in plan["targets"].items()) or "no targets"),
+                          flush=True)
+                    got = AP.catchup(since, until, a.channel, outcome=outcome, plan=plan)
+                mark = AP.covered_until(since, until, outcome)
+                if not a.channel and mark > since:
+                    AP.mark_covered(mark, sweep=a.sweep)            # only completed coverage moves the watermark
+                AP.journal({"id": f"{'sweep' if a.sweep else 'catchup'}-{int(since)}-{int(until)}", "at": _t.time(),
+                            "kind": "sweep" if a.sweep else "catchup", "since": since, "until": until,
+                            "channels": a.channel or "roster", "queued": len(got),
+                            "windows": len(outcome.get("windows", [])), "failed": outcome.get("failed", []),
+                            "covered_until": mark})
+                if outcome.get("failed"):
+                    return 3                                        # finished, but some sources weren't covered
         elif a.cmd == "backup":
             AP.backup(a.to)
         else:

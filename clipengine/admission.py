@@ -238,7 +238,21 @@ def show(root: str | None = None) -> list[str]:
     pl = probe_line(root)
     if pl:
         lines.append(pl)
+    lines += batch_lines(root)
     return lines
+
+
+def batch_lines(root: str | None = None, n: int = 3) -> list[str]:
+    """The last catch-up / sweep batches: window, what they queued, and any source they could NOT cover."""
+    from . import autopilot as AP
+    out = []
+    for b in AP.batches(root, n):
+        when = time.strftime("%m-%d %H:%M", time.localtime(b["since"])) + "→" + time.strftime("%H:%M", time.localtime(b["until"]))
+        fail = b.get("failed") or []
+        tail = (f" · NOT covered: {', '.join(sorted({f['login'] for f in fail}))} (watermark held at "
+                f"{time.strftime('%H:%M', time.localtime(b['covered_until']))})") if fail else " · fully covered"
+        out.append(f"  batch {b['kind']:<7} {when}: {b['queued']} queued from {b['windows']} window(s){tail}")
+    return out
 
 
 def probe_line(root: str | None = None, since_s: float = 86400) -> str | None:

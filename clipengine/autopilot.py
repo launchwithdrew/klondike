@@ -391,6 +391,11 @@ COVERAGE = os.path.join(RUNS, "coverage.json")
 MAX_CATCHUP_H = 12.0
 
 
+def _coverage() -> str:
+    """runs/coverage.json under the CURRENT runs folder (tests and other roots move RUNS)."""
+    return os.path.join(RUNS, "coverage.json")
+
+
 def catchup_window(since_arg, until: float, sweep: bool = False, path: str | None = None) -> tuple[float, str]:
     """(since, how): an explicit --since, else the last completed coverage watermark (bounded to 12 h). No
     watermark and no --since is an error — never a silent guess."""
@@ -398,7 +403,7 @@ def catchup_window(since_arg, until: float, sweep: bool = False, path: str | Non
         since = float(since_arg)
         how = "from --since"
     else:
-        mark = _json(path or COVERAGE).get("sweep_until" if sweep else "catchup_until")
+        mark = _json(path or _coverage()).get("sweep_until" if sweep else "catchup_until")
         if not mark:
             raise ValueError("catchup: no coverage watermark yet — give --since (unix seconds) for the first run")
         since = max(float(mark), until - MAX_CATCHUP_H * 3600)
@@ -411,7 +416,7 @@ def catchup_window(since_arg, until: float, sweep: bool = False, path: str | Non
 
 
 def mark_covered(until: float, sweep: bool = False, path: str | None = None) -> None:
-    path = path or COVERAGE
+    path = path or _coverage()
     st = _json(path)
     key = "sweep_until" if sweep else "catchup_until"
     st[key] = max(float(st.get(key) or 0), until)
@@ -521,68 +526,167 @@ def _sheet(thumbs: list[str], out: str) -> str | None:
         return None
 
 
-def catchup(since: float, until: float, logins: list[str] | None = None, keep: int = 3, probe: int = 6,
-            via: str | None = None) -> list[dict]:
-    """Scan the saved streams of [since, until] and queue the best moments. Returns the queued entries."""
-    from . import pipeline as P
+def plan_batch(since: float, until: float, logins: list[str] | None = None, roster: dict | None = None,
+               lister=None) -> dict:
+    """Validate a catch-up batch BEFORE anything is scanned or queued (spec §2): every target is a known, allowed
+    creator, and each one's saved streams in the window are listed now. Returns {"items": [{login, vod...}],
+    "targets": {login: status}, "invalid": [why...]}. status: "ok" (N windows) · "no broadcast in the window" ·
+    "subscriber-only" · "kick" (listed at scan time) · "source failed: …" (listing failed — counts as uncovered)."""
     from . import vodaccess as VA
-    from .publish import creators
-    roster = creators()
-    targets = logins or catchup_targets(roster)
-    queued = []
-    print(f"[catchup] {_hm(since)} → {_hm(until)}: {', '.join(targets) or 'no roster creators'}", flush=True)
+    if roster is None:
+        from .publish import creators
+        roster = creators()
+    lister = lister or vods_overlapping
+    invalid = []
+    if logins:
+        for l in logins:
+            if l not in roster:
+                invalid.append(f"{l}: not on the roster (config/creators.json)")
+            elif policy(l, roster) == "never":
+                invalid.append(f"{l}: clip policy is \"never\"")
+            elif l.startswith("yt"):
+                invalid.append(f"{l}: YouTube has no saved-stream catch-up")
+    targets = list(logins) if logins else catchup_targets(roster)
+    items, status = [], {}
+    if invalid:
+        return {"items": [], "targets": {}, "invalid": invalid}
     for login in targets:
-        if login.startswith("kick:"):                        # Kick: viewers' clips + the saved broadcast (kick.py)
-            try:
-                from . import kick as K
-                queued += K.catchup(login, since, until, keep=keep, via=via or "catch-up (saved stream)")
-            except Exception as exc:
-                print(f"[catchup] {login}: {str(exc)[:100]}", flush=True)
+        if login.startswith("kick:"):
+            status[login] = "kick"
+            items.append({"login": login, "kick": True})
             continue
         if VA.restricted(login):
-            continue                                   # subscriber-only VODs (learned): nothing to scan
-        try:
-            vods = vods_overlapping(login, since, until)
-        except Exception as exc:
-            AT.event("failure", f"catch-up couldn't list {login}'s broadcasts ({str(exc)[:60]})",
-                     key=f"catchup:{login}:{int(since)}")
+            status[login] = "subscriber-only"
             continue
-        for v in vods:
-            if v["b"] - v["a"] < 60:
-                continue
-            d = os.path.join(RUNS, f"catchup-{login}")
-            scan_dir = os.path.join(d, f"scan-{v['id']}-{int(v['a'])}")
+        try:
+            vods = [v for v in lister(login, since, until) if v["b"] - v["a"] >= 60]
+        except Exception as exc:
+            status[login] = f"source failed: couldn't list broadcasts ({str(exc)[:60]})"
+            continue
+        status[login] = f"ok ({len(vods)} window(s))" if vods else "no broadcast in the window"
+        items += [{"login": login, "vod": v} for v in vods]
+    return {"items": items, "targets": status, "invalid": []}
+
+
+BATCHES = "batches.jsonl"
+
+
+def journal(rec: dict, root: str | None = None) -> None:
+    """One line per finished batch in runs/heavy/batches.jsonl (`jobs` shows the last ones)."""
+    from .admission import _dir
+    d = _dir(root)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, BATCHES), "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
+def batches(root: str | None = None, n: int = 5) -> list[dict]:
+    from .admission import _dir
+    try:
+        rows = [json.loads(l) for l in open(os.path.join(_dir(root), BATCHES)) if l.strip()]
+    except (OSError, ValueError):
+        return []
+    return rows[-n:]
+
+
+def covered_until(since: float, until: float, outcome: dict) -> float:
+    """How far the watermark may move: to `until` when every window was covered, else to the start of the
+    earliest window whose source failed (the next run re-covers it; queue dedupe stops double drafts)."""
+    failed = [f["from"] for f in outcome.get("failed", [])]
+    return min([until] + [max(since, x) for x in failed])
+
+
+def catchup(since: float, until: float, logins: list[str] | None = None, keep: int = 3, probe: int = 6,
+            via: str | None = None, outcome: dict | None = None, plan: dict | None = None) -> list[dict]:
+    """Scan the saved streams of [since, until] and queue the best moments. Returns the queued entries.
+    `outcome` (a dict) is filled with what happened to each window: queued / nothing strong / source failed."""
+    from . import pipeline as P
+    from . import vodaccess as VA
+    out = outcome if outcome is not None else {}
+    out.setdefault("windows", []); out.setdefault("failed", [])
+    plan = plan or plan_batch(since, until, logins)
+    if plan["invalid"]:
+        raise ValueError("catchup: " + "; ".join(plan["invalid"]))
+    for login, st in plan["targets"].items():
+        if st.startswith("source failed"):
+            out["failed"].append({"login": login, "from": since, "why": st})
+            AT.event("failure", f"catch-up couldn't list {login}'s broadcasts ({st[30:90]})",
+                     key=f"catchup:{login}:{int(since)}")
+    queued = []
+    print(f"[catchup] {_hm(since)} → {_hm(until)}: {', '.join(plan['targets']) or 'no roster creators'}", flush=True)
+    skip: set[str] = set()
+    for it in plan["items"]:
+        login = it["login"]
+        if login in skip:
+            continue
+        if it.get("kick"):                                   # Kick: viewers' clips + the saved broadcast (kick.py)
             try:
-                res = P.scan(v["id"], scan_dir, v["a"], v["b"], top=12, probe=probe)
+                from . import kick as K
+                got = K.catchup(login, since, until, keep=keep, via=via or "catch-up (saved stream)")
+                queued += got
+                out["windows"].append({"login": login, "result": f"queued {len(got)}" if got else "nothing strong"})
             except Exception as exc:
-                msg = str(exc)
-                if VA.is_restricted_error(exc):        # subscriber-only VODs: remember, skip quietly from now on
-                    VA.mark(login, v["id"])
-                    print(f"[catchup] {login}: saved streams are subscriber-only — skipped from now on "
-                          "(a full sentinel records them live)", flush=True)
-                    break
-                if "no chat" not in msg:
-                    AT.event("failure", f"catch-up scan of {login} failed ({msg[:60]})", key=f"catchup:{login}:{v['id']}")
-                print(f"[catchup] {login} {v['id']}: {msg[:100]}", flush=True)
+                out["failed"].append({"login": login, "from": since, "why": f"source failed: {str(exc)[:80]}"})
+                print(f"[catchup] {login}: {str(exc)[:100]}", flush=True)
+            continue
+        v = it["vod"]
+        d = os.path.join(RUNS, f"catchup-{login}")
+        scan_dir = os.path.join(d, f"scan-{v['id']}-{int(v['a'])}")
+        try:
+            res = P.scan(v["id"], scan_dir, v["a"], v["b"], top=12, probe=probe)
+        except Exception as exc:
+            msg = str(exc)
+            if VA.is_restricted_error(exc):        # subscriber-only VODs: remember, skip quietly from now on
+                VA.mark(login, v["id"])
+                print(f"[catchup] {login}: saved streams are subscriber-only — skipped from now on "
+                      "(a full sentinel records them live)", flush=True)
+                out["windows"].append({"login": login, "vod": v["id"], "result": "subscriber-only"})
+                skip.add(login)
                 continue
-            rows = _queue_rows()
-            entries = []
-            for c in res["candidates"]:
-                q = queue_entry_from_candidate(c, res["vod"], scan_dir, login)
-                if q and not q["unsafe"] and not _overlaps_any(login, q["start"], q["stop"], rows + entries):
-                    entries.append(q)
-            entries.sort(key=lambda q: -q["best"])
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "queue.jsonl"), "a") as fh:
-                for q in entries[:keep]:
-                    if via:
-                        q["via"] = via + (" 🔥" if q["via"].endswith("🔥") else "")
-                    q["sheet"] = _sheet(q.pop("thumbs"), os.path.join(scan_dir, f"sheet-{q['pick']}.jpg"))
-                    fh.write(json.dumps(q) + "\n")
-                    queued.append(q)
-                    print(f"[catchup] queued {q['id']}: best {q['best']} {q['via']}", flush=True)
-    print(f"[catchup] done: {len(queued)} moment(s) queued", flush=True)
+            if "no chat" in msg:                   # a real answer: nobody chatted — nothing to find
+                out["windows"].append({"login": login, "vod": v["id"], "result": "nothing strong (no chat)"})
+            else:
+                AT.event("failure", f"catch-up scan of {login} failed ({msg[:60]})", key=f"catchup:{login}:{v['id']}")
+                out["failed"].append({"login": login, "vod": v["id"], "from": v["created"] + v["a"],
+                                      "why": f"source failed: {msg[:80]}"})
+            print(f"[catchup] {login} {v['id']}: {msg[:100]}", flush=True)
+            continue
+        rows = _queue_rows()
+        entries = []
+        for c in res["candidates"]:
+            q = queue_entry_from_candidate(c, res["vod"], scan_dir, login)
+            if q and not q["unsafe"] and not _overlaps_any(login, q["start"], q["stop"], rows + entries):
+                entries.append(q)
+        entries.sort(key=lambda q: -q["best"])
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "queue.jsonl"), "a") as fh:
+            for q in entries[:keep]:
+                if via:
+                    q["via"] = via + (" 🔥" if q["via"].endswith("🔥") else "")
+                q["sheet"] = _sheet(q.pop("thumbs"), os.path.join(scan_dir, f"sheet-{q['pick']}.jpg"))
+                fh.write(json.dumps(q) + "\n")
+                queued.append(q)
+                print(f"[catchup] queued {q['id']}: best {q['best']} {q['via']}", flush=True)
+        n = min(len(entries), keep)
+        out["windows"].append({"login": login, "vod": v["id"],
+                               "result": f"queued {n}" if n else
+                               f"nothing strong ({len(res['candidates'])} candidate(s), none new and safe)"})
+    print(f"[catchup] done: {summary(out, len(queued))}", flush=True)
     return queued
+
+
+def summary(outcome: dict, queued: int) -> str:
+    """One line that never confuses "found nothing" with "couldn't look"."""
+    w = outcome.get("windows", [])
+    empty = sum(1 for x in w if x["result"].startswith("nothing"))
+    fail = outcome.get("failed", [])
+    parts = [f"{queued} moment(s) queued from {len(w)} window(s)"]
+    if empty:
+        parts.append(f"{empty} with nothing strong")
+    if fail:
+        parts.append(f"{len(fail)} NOT covered (source failed: {', '.join(sorted({f['login'] for f in fail}))}) — "
+                     "the watermark stays before them, the next run retries")
+    return " · ".join(parts)
 
 
 # ---- the sweep: every 30 min, what the watchers missed ------------------------------------------------
@@ -608,7 +712,8 @@ def maybe_sweep(state: dict, now: float, cfg: dict) -> str | None:
             return None
     from .ops import _detach
     until = now - SWEEP_LAG_S
-    since = max(state.get("sweep_until") or until - every - 600, until - 3 * 3600)
+    mark = _json(_coverage()).get("sweep_until") or state.get("sweep_until")      # completed coverage, not launches
+    since = max(mark or until - every - 600, until - 3 * 3600)
     if until - since < 120:
         return None
     pid = _detach([sys.executable, "-m", "clipengine", "catchup", "--sweep", "--since", str(int(since)),
@@ -656,9 +761,11 @@ def sweep_pick(cands: list[dict], vod_id: str, created: float, login: str, rows:
     return out[: int(cfg.get("sweep_keep", 2))]
 
 
-def sweep(since: float, until: float, logins: list[str] | None = None) -> list[dict]:
+def sweep(since: float, until: float, logins: list[str] | None = None, outcome: dict | None = None) -> list[dict]:
     """Scan the roster's saved streams of [since, until] cheaply (chat + viewer clips) and queue the strong
-    moments nobody drafted, through the catch-up path. Returns the queued entries."""
+    moments nobody drafted, through the catch-up path. Returns the queued entries; `outcome` as catchup()."""
+    out = outcome if outcome is not None else {}
+    out.setdefault("windows", []); out.setdefault("failed", [])
     from . import twitch as T
     from .ops import config
     from .publish import creators
@@ -676,11 +783,13 @@ def sweep(since: float, until: float, logins: list[str] | None = None) -> list[d
                 print(f"[sweep] {login}: {len(got)} viewer-clipped moment(s) drafted", flush=True)
                 queued += got
             except Exception as exc:
+                out["failed"].append({"login": login, "from": since, "why": f"source failed: {str(exc)[:80]}"})
                 print(f"[sweep] {login}: couldn't read Kick ({str(exc)[:80]})", flush=True)
             continue
         try:
             vods = vods_overlapping(login, since, until)
         except Exception as exc:
+            out["failed"].append({"login": login, "from": since, "why": f"source failed: {str(exc)[:80]}"})
             print(f"[sweep] {login}: couldn't list broadcasts ({str(exc)[:80]})", flush=True)
             continue
         for v in vods:
@@ -694,15 +803,19 @@ def sweep(since: float, until: float, logins: list[str] | None = None) -> list[d
                 except Exception:
                     crowd = []
             except Exception as exc:
+                out["failed"].append({"login": login, "vod": v["id"], "from": v["created"] + v["a"],
+                                      "why": f"source failed: {str(exc)[:80]}"})
                 print(f"[sweep] {login} {v['id']}: {str(exc)[:100]}", flush=True)
                 continue
             picks = sweep_pick(light_moments(msgs, crowd), v["id"], v["created"], login, _queue_rows(), cfg)
+            if not picks:
+                out["windows"].append({"login": login, "vod": v["id"], "result": "nothing strong"})
             print(f"[sweep] {login} {v['id']}: {len(msgs)} messages, {len(crowd)} viewer-clipped moment(s) → "
                   f"{len(picks)} strong and new", flush=True)
             for c in picks:
                 queued += catchup(c["wall"][0] - 30, c["wall"][1] + 30, [login], keep=1, probe=2,
-                                  via="catch-up (sweep)")
-    print(f"[sweep] done: {len(queued)} moment(s) queued", flush=True)
+                                  via="catch-up (sweep)", outcome=out)
+    print(f"[sweep] done: {summary(out, len(queued))}", flush=True)
     return queued
 
 
@@ -778,6 +891,10 @@ def autopilot_status() -> dict:
 
 def autopilot_start(every_min: float | None = None, sessions: bool = False, by: str = "manual") -> str:
     from .ops import config, _detach
+    from . import migrate as MG
+    ok, why = MG.may_lead()
+    if not ok:
+        return why
     st = autopilot_status()
     if st["running"]:
         return f"autopilot already running (pid {st['pid']}) — `clipengine autopilot stop` first to change it"
@@ -968,6 +1085,11 @@ def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None =
     if SV.stopped(root) and by in ("service", "keeper"):
         print("[autopilot] stopped on purpose (`clipengine autopilot start` resumes) — not starting", flush=True)
         return
+    from . import migrate as MG
+    ok, why = MG.may_lead()
+    if not ok:
+        print(f"[autopilot] {why} — not starting", flush=True)
+        return
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda n, _f: stop.update(now=True, sig=signal.Signals(n).name))
     lease = SV.Lease(root)
@@ -1099,19 +1221,50 @@ def backup(to: str | None = None, root: str = REPO, now: float | None = None) ->
 
 
 def restore(path: str, root: str = REPO) -> list[str]:
-    """Put a backup back. Only the backed-up places are written; a backup of what's there now is made first."""
+    """Put a backup back. Only the backed-up places are written; a backup of what's there now is made first.
+    Everything is unpacked into a staging folder first; a restore killed part-way is finished (or reported) by the
+    next run instead of leaving a silent mix."""
+    import shutil
     import zipfile
+    stage = os.path.join(root, "runs", "restore-staging")
+    marker = os.path.join(root, "runs", "restore-in-progress.json")
+    if _json(marker):
+        print(f"restore: finishing an interrupted restore first ({_finish_restore(root)} file(s))")
     with zipfile.ZipFile(path) as z:
-        names = [n for n in z.namelist() if not n.endswith("/")]
+        names = [n for n in z.namelist() if not n.endswith("/") and n != "MANIFEST.json"]
         bad = [n for n in names if os.path.isabs(n) or ".." in n.replace("\\", "/").split("/")
-               or not any(n == p or n.startswith(p.rstrip("/") + "/") for p in BACKUP_PATHS)]
+               or not any(n == p or n.startswith(p.rstrip("/") + "/") for p in BACKUP_PATHS + ("outbox",))]
         if bad:
             raise SystemExit(f"RESTORE REFUSED: {path} has files outside the backed-up folders ({bad[0]})")
         before = backup(os.path.join(root, "runs", "backups"), root=root)
-        for n in names:
-            dest = os.path.join(root, n)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with z.open(n) as src, open(dest, "wb") as fh:
-                fh.write(src.read())
+        shutil.rmtree(stage, ignore_errors=True)
+        z.extractall(stage, names)                      # a kill here leaves the install untouched
+    json.dump({"from": path, "names": names, "before": before, "at": time.time()}, open(marker, "w"))
+    _finish_restore(root)
     print(f"restore: {len(names)} files from {path} (what was there before: {before})")
     return names
+
+
+def _finish_restore(root: str = REPO) -> int:
+    """Move a staged restore into place (also resumes one killed part-way). Returns files moved."""
+    import shutil
+    stage = os.path.join(root, "runs", "restore-staging")
+    marker = os.path.join(root, "runs", "restore-in-progress.json")
+    m = _json(marker)
+    if not m:
+        return 0
+    n = 0
+    for name in m["names"]:
+        src, dest = os.path.join(stage, name), os.path.join(root, name)
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.replace(src, dest)
+            n += 1
+    os.remove(marker)
+    shutil.rmtree(stage, ignore_errors=True)
+    return n
+
+
+def restore_pending(root: str = REPO) -> str | None:
+    m = _json(os.path.join(root, "runs", "restore-in-progress.json"))
+    return f"a restore from {m['from']} was interrupted — `clipengine restore {m['from']}` finishes it" if m else None

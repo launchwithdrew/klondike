@@ -135,6 +135,8 @@ def _row(slug: str, platform: str, now: float) -> dict | None:
 
 def claim(slug: str, platform: str, by: str | None = None, now: float | None = None) -> dict:
     """Take one clip × platform for posting: atomic, leased, and recorded BEFORE the browser hand-off."""
+    from . import migrate as MG
+    MG.guard_publish()                           # only the leading machine posts
     by = by or poster_name()
     with _locked():
         now = time.time() if now is None else now

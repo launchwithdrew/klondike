@@ -197,3 +197,24 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.13
+
+- Catch-up batches are checked before they start, and the coverage mark moves only over minutes that were actually covered.
+  - `clipengine catchup` checks the whole batch first. An unknown channel, or one whose clip policy is "never", stops it before anything is scanned or queued (exit 2). It then prints the plan: each creator's windows, or why it has none.
+  - Each window ends as queued, nothing strong, or source failed. The summary keeps "found nothing" apart from "couldn't look".
+  - A source that failed holds the coverage mark before its window, so the next run retries it and those minutes are never silently skipped (exit 3). The 30-minute sweep starts from completed coverage too, not from its last launch.
+  - Running the same batch twice queues nothing new. `jobs` shows the last batches and anything they couldn't cover.
+- Moving to another machine: `clipengine migrate` (`docs/moving.md`).
+  - `snapshot` saves your brand and approved look, config, data, the ledger and finished clips, with checksums. Credentials and the browser profile are never included.
+  - `verify` restores into a separate folder and checks every checksum, plus the post ledger, repeat guard, attempts and approved look.
+  - `shadow` makes the new machine capture without posting.
+  - `release` on the old machine and `takeover` on the new one hand over posting and the autopilot exactly once, and catch-up resumes from the old machine's coverage. Rollback is the same two steps the other way.
+- `restore` unpacks into a staging folder first. An interrupted restore is reported by `doctor`, and running the same restore again finishes it.
+
+Export diff
+- Added (2): `clipengine/migrate.py`, `docs/moving.md`
+- Changed (11): `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/admission.py`, `clipengine/autopilot.py`, `clipengine/bank.py`, `clipengine/ops.py`, `clipengine/publish.py`, `docs/reliability.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.
