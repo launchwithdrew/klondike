@@ -4258,3 +4258,90 @@ def test_the_early_probe_skips_whisper_on_a_muted_vod_and_a_muted_payoff(tmp_pat
     p = probe(loud, 40)
     assert p.observation == "ok" and calls == [1]                          # real audio: transcribed once
 
+
+
+def test_the_live_buffer_route_skips_whisper_on_a_silent_payoff(tmp_path, monkeypatch):
+    import json as _json
+    import numpy as np
+    from clipengine import audio as A
+    from clipengine import live as L
+    from clipengine import sentinel as SN
+    monkeypatch.setenv("CLIPENGINE_ADMISSION_ROOT", str(tmp_path))
+    rec = tmp_path / "rec"; (rec / "segments").mkdir(parents=True)
+    t0 = 1_800_000_000.0
+    with open(rec / "index.jsonl", "w") as fh:
+        for i in range(60):
+            (rec / "segments" / f"s{i}.ts").write_bytes(b"x")
+            fh.write(_json.dumps({"t": t0 + 2 * i, "d": 2.0, "f": f"s{i}.ts"}) + "\n")
+    calls = []
+    monkeypatch.setattr(A, "transcribe", lambda *a, **k: calls.append(1) or {"segments": []})
+    monkeypatch.setattr(SN, "stream_game", lambda login: None)
+    a_ = {}
+    def cut(rec_dir, a, b, src):
+        a_["a"], a_["b"] = a, b
+        open(src, "wb").write(b"x")
+        return a
+    monkeypatch.setattr(L, "cut_source", cut)
+    sr = A.SR
+    def pcm(silent):
+        n = int((a_["b"] - a_["a"]) * sr)
+        x = (0.2 * np.sin(np.linspace(0, 2000, n))).astype(np.float32)
+        x *= (1 + 0.8 * np.sin(np.linspace(0, 30, n))).astype(np.float32)
+        return np.zeros(n, np.float32) if silent else x
+    monkeypatch.setattr(A, "decode_pcm", lambda *a, **k: pcm(True))
+    moment = {"start": t0 + 40, "stop": t0 + 70, "fire": t0 + 70, "p": 0.9}
+    e = SN.draft_moment(str(rec), "streamer", moment, wait_s=0)
+    assert e["status"] == "dropped" and e["reason"].startswith("copyright-muted") and not calls
+    assert not list((rec / "drafts").glob("*.ts"))                             # the cut source is cleaned up
+    probes = [_json.loads(x) for x in open(tmp_path / "heavy" / "probes.jsonl")]
+    assert probes[-1]["route"] == "live" and probes[-1]["skipped_asr"]
+    assert "live 1" in "\n".join(__import__("clipengine.admission", fromlist=["x"]).show())
+
+
+def test_every_route_with_audio_in_hand_uses_the_same_early_probe(tmp_path, monkeypatch):
+    import numpy as np
+    from clipengine import audio as A
+    monkeypatch.setenv("CLIPENGINE_ADMISSION_ROOT", str(tmp_path))
+    sr = A.SR
+    loud = (0.2 * np.sin(np.linspace(0, 2000, sr * 40))).astype(np.float32)
+    loud *= (1 + 0.8 * np.sin(np.linspace(0, 30, sr * 40))).astype(np.float32)
+    t0 = 1000.0
+    assert A.gate(loud, t0, payoff=t0 + 20).observation == "ok"
+    hole = loud.copy(); hole[8 * sr:27 * sr] = 0                           # silent around the payoff only
+    p = A.gate(hole, t0, payoff=t0 + 20, route="prerender")
+    assert p.observation == "payoff muted" and not p.cached
+    assert A.skip_reason(p.observation).startswith("copyright-muted over the payoff")
+    again = A.gate(hole, t0, payoff=t0 + 20, route="prerender")             # a retry of the same audio: from the cache
+    assert again.observation == "payoff muted" and again.cached
+    assert A.gate(hole, t0, payoff=t0 + 5).observation == "ok"              # the payoff is somewhere audible
+    assert A.gate(np.zeros(0, np.float32), t0).observation == "no audio"
+    assert A.gate(np.zeros(sr * 40, np.float32), t0, region=(t0, t0 + 40)).observation == "muted"
+
+
+def test_the_probe_cache_never_downloads_or_decodes_a_known_muted_vod_window_twice(tmp_path, monkeypatch):
+    import numpy as np
+    from clipengine import audio as A
+    monkeypatch.setenv("CLIPENGINE_ADMISSION_ROOT", str(tmp_path))
+    decodes = []
+    def decode(*a, **k):
+        decodes.append(1)
+        return np.zeros(A.SR * 60, np.float32)
+    monkeypatch.setattr(A, "decode_pcm", decode)
+    monkeypatch.setattr(A, "transcribe", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no ASR")))
+    key = "vod:123:0:60"
+    assert A.probe_audio("unused.ts", 0.0, 0.0, 60.0, 40, key=key).observation == "muted"
+    assert A.cache_get(key)["obs"] == "muted"
+    p = A.probe_audio("unused.ts", 0.0, 0.0, 60.0, 40, key=key)
+    assert p.observation == "muted" and p.cached and decodes == [1]           # the second sweep: no decode
+    v = A.assess(p, {"start_s": 0, "end_s": 30, "words": 0, "speech_s": 0, "first_word_at": 30,
+                     "longest_gap": 30}, 40)
+    assert v["hard_fail"].startswith("copyright-muted")
+    # a failed download ("no audio") may work next time: it is never cached
+    monkeypatch.setattr(A, "decode_pcm", lambda *a, **k: np.zeros(0, np.float32))
+    assert A.probe_audio("unused.ts", 0.0, 0.0, 60.0, 40, key="vod:123:100:160").observation == "no audio"
+    assert A.cache_get("vod:123:100:160") is None
+    # entries expire: an old line is not trusted
+    import json as _json, time as _time
+    with open(tmp_path / "heavy" / "probe_cache.jsonl", "a") as fh:
+        fh.write(_json.dumps({"k": "vod:9:0:60", "at": _time.time() - 30 * 86400, "obs": "muted"}) + "\n")
+    assert A.cache_get("vod:9:0:60") is None

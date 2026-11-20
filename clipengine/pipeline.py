@@ -91,17 +91,25 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
     tmp_dir = os.path.join(out_dir, "probe")
     os.makedirs(tmp_dir, exist_ok=True)
 
+    def key(c):                                  # the probe cache: this VOD's window, judged before
+        return f"vod:{vod.id}:{int(c['peak_s'] - 45)}:{int(c['peak_s'] + 40)}"
+
     def fetch_audio(c):
         ws, we = c["peak_s"] - 45, c["peak_s"] + 40
         path = os.path.join(tmp_dir, f"audio_{int(c['peak_s'])}.ts")
+        if A.cache_get(key(c)):                  # already known unhearable: no download
+            return c, path, ws, ws, we
         first = T.download_window(audio_pl, ws, we, path, pad_s=1)
         return c, path, first, ws, we
 
     to_probe = cands[:probe]
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         fetched = list(ex.map(fetch_audio, to_probe))
-    probes = [(c, A.probe_audio(path, first, ws, we, c["peak_s"], model, login=vod.login), path, first, ws)
+    probes = [(c, A.probe_audio(path, first, ws, we, c["peak_s"], model, login=vod.login, key=key(c)), path, first, ws)
               for c, path, first, ws, we in fetched]   # ASR is CPU-bound: one at a time, all cores
+    n_cached = sum(1 for _, p, *_ in probes if p.cached)
+    if n_cached:
+        log(f"probe cache: {n_cached} window(s) already known unhearable — not downloaded or transcribed")
     prof = None
     try:                                     # who is talking: the session's voices across every candidate
         prof, tagged = tag_speakers(probes)

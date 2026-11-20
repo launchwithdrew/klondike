@@ -49,3 +49,21 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.5
+
+- The audio check before transcription now runs on every route, not only saved streams.
+  - Covered: live-recording drafts and their re-cut, pre-renders without a saved transcript, `publish-live`, and viewer-clip renders from a recording.
+  - A window with no audio, full digital silence, or silence over the payoff is refused with one reason line. No transcription is spent on it.
+- Probe cache. A saved-stream window found muted is remembered for 14 days, keyed by stream and window.
+  - Later sweeps and catch-up retries skip the download, the decode and the transcription.
+  - A failed download is never cached, so it is tried again.
+- `clipengine jobs` shows what the early check saved in the last 24 hours: windows stopped, seconds of audio, how many came from the cache, and the split by route.
+- Fix: a fully muted window now gets the copyright-muted reason. It used to be reported as "only 0 words — nothing to caption".
+
+Export diff
+- Added (0)
+- Changed (10): `VERSION`, `clipengine/__init__.py`, `clipengine/admission.py`, `clipengine/audio.py`, `clipengine/live.py`, `clipengine/pipeline.py`, `clipengine/prerender.py`, `clipengine/sentinel.py`, `docs/judging.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

@@ -227,4 +227,33 @@ def show(root: str | None = None) -> list[str]:
     for stage, s in sorted(stats(root, time.time() - 86400).items()):
         lines.append(f"  24 h {stage:<12} n={s['n']} wait p50 {s['wait_p50']} s / p90 {s['wait_p90']} s · "
                      f"run p50 {s['run_p50']} s / p90 {s['run_p90']} s")
+    pl = probe_line(root)
+    if pl:
+        lines.append(pl)
     return lines
+
+
+def probe_line(root: str | None = None, since_s: float = 86400) -> str | None:
+    """What the early mute probe saved in the last day: windows stopped before Whisper, by route."""
+    cut, rows = time.time() - since_s, []
+    try:
+        with open(os.path.join(_dir(root), "probes.jsonl")) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("at", 0) >= cut:
+                    rows.append(r)
+    except OSError:
+        return None
+    if not rows:
+        return None
+    skipped = [r for r in rows if r.get("skipped_asr")]
+    by: dict[str, int] = {}
+    for r in skipped:
+        by[r.get("route", "vod")] = by.get(r.get("route", "vod"), 0) + 1
+    return (f"  24 h early probe: {len(skipped)} of {len(rows)} windows stopped before transcription "
+            f"({sum(r.get('asr_s_saved', 0) for r in skipped):.0f} s of audio"
+            + (f"; {sum(1 for r in skipped if r.get('cached'))} from the cache" if any(r.get("cached") for r in skipped) else "")
+            + ")" + (" · " + ", ".join(f"{k} {v}" for k, v in sorted(by.items())) if by else ""))

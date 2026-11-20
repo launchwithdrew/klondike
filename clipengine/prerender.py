@@ -90,7 +90,11 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
         if words is None:                              # no saved transcript: transcribe like a publish would
             from . import audio as A
             from . import ops as O
-            words = A.real_words(A.transcribe(A.decode_pcm(src, 0, None), O.whisper_model(), offset=first))
+            x = A.decode_pcm(src, 0, None)
+            early = A.gate(x, first, entry.get("payoff"), route="prerender")
+            if early.observation in A.SKIP_OBS:
+                raise RuntimeError(A.skip_reason(early.observation))
+            words = A.real_words(A.transcribe(x, O.whisper_model(), offset=first))
         tmp = mp4 + ".part.mp4"
         try:
             with FC.creator(entry.get("login")):

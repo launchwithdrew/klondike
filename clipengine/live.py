@@ -418,6 +418,11 @@ def render_live(rec_dir: str, top: int = 3, out_dir: str | None = None, model: s
         src = os.path.join(out_dir, f"_src_{int(b['start'])}.ts")
         first = cut_source(rec_dir, b["start"] - 4, b["end"] + 4, src)
         x = A.decode_pcm(src, 0, None)
+        early = A.gate(x, first, route="live-clips", region=(b["start"], b["end"]))
+        if early.observation in A.SKIP_OBS:
+            os.remove(src)
+            print(f"[live] skipped {int(b['start'])}: {A.skip_reason(early.observation)}", flush=True)
+            continue
         tr = A.transcribe(x, model, offset=first, prompt=A.vocab_prompt(login=login))
         words = A.real_words(tr)
         s, e = b["start"], b["end"]
@@ -457,6 +462,10 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
             from . import ops as O
             model = O.whisper_model()
         x = A.decode_pcm(src, 0, None)
+        early = A.gate(x, first, route="publish-live", region=(start_ts, end_ts))
+        if early.observation in A.SKIP_OBS:
+            os.remove(src)
+            raise RuntimeError(f"{A.skip_reason(early.observation)} — {start_ts:.0f}–{end_ts:.0f}")
         with open(os.path.join(rec_dir, "recording.json")) as stream:
             login = json.load(stream).get("login")
         words = A.real_words(A.transcribe(x, model, offset=first, prompt=A.vocab_prompt(login=login)))

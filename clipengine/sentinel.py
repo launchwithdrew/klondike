@@ -762,6 +762,11 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     src = os.path.join(ddir, mid + ".ts")
     first = L.cut_source(out, a, b, src)
     x = A.decode_pcm(src, 0, None)
+    early = A.gate(x, first, payoff, route="live-recut" if _recut else "live")
+    if early.observation in A.SKIP_OBS:              # nothing to hear at the payoff: no Whisper, one queue line
+        os.remove(src)
+        return log_dropped(out, login, moment, A.skip_reason(early.observation), payoff=round(payoff, 1),
+                           muted_frac=early.muted_frac)
     words = A.real_words(A.transcribe(x, model_name, offset=first, prompt=A.vocab_prompt(login=login)))
     words = [w for w in words if a <= w["start"] <= b]
     # who is talking: the session's voice profile + what the screen shows (subtitles, cutscene editing)

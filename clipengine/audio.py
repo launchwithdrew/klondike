@@ -19,6 +19,7 @@ and the window is slid so the clip opens on speech instead of silence.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -300,6 +301,7 @@ class Probe:
     mute_map: list = field(default_factory=list)   # per-second: True = digital silence
     repeated_lines: int = 0
     observation: str = "ok"          # ok | muted | payoff muted | no audio | flat audio — why ASR ran or didn't
+    cached: bool = False             # the observation came from the probe cache (nothing fetched or decoded)
 
     def muted_in(self, a: float, b: float) -> float:
         """Share of [a, b) that is copyright-muted (digital silence)."""
@@ -315,14 +317,28 @@ class Probe:
 PAYOFF_MUTE_SKIP = 0.8          # this much of the beat region copyright-muted: the payoff can't be heard
 
 
-def early_observation(p: "Probe", peak_s: float, sec_db, no_audio: bool) -> str:
+SKIP_OBS = ("no audio", "muted", "payoff muted")      # nothing to hear where the moment is: no Whisper
+PROBE_CACHE_DAYS = 14                                 # a window found unhearable stays so (VOD mutes are permanent)
+
+
+def skip_reason(obs: str) -> str | None:
+    """The one-line refusal every route gives for an unhearable window (a rights review, not a crash)."""
+    return {"payoff muted": "copyright-muted over the payoff (rights review: the beat can't be heard; not transcribed)",
+            "muted": "copyright-muted (the whole window is digital silence; not transcribed)",
+            "no audio": "no audio in the source window (missing or corrupt)"}.get(obs)
+
+
+def early_observation(p: "Probe", peak_s: float, sec_db, no_audio: bool,
+                      region: tuple[float, float] | None = None) -> str:
     """Before any transcription: is there anything to hear where the moment is? The beat region is the
-    25 s before chat peaks to 5 s after (the moment usually comes 2–20 s before chat reacts)."""
+    25 s before chat peaks to 5 s after (the moment usually comes 2–20 s before chat reacts); a route that
+    already knows the payoff passes its own `region`."""
     if no_audio:
         return "no audio"
     if p.muted_frac > 0.9:
         return "muted"
-    if p.muted_in(peak_s - 25, peak_s + 5) >= PAYOFF_MUTE_SKIP:
+    lo, hi = region or (peak_s - 25, peak_s + 5)
+    if p.muted_in(lo, hi) >= PAYOFF_MUTE_SKIP:
         return "payoff muted"
     live = [v for v in sec_db if v > MUTE_DB]
     if len(live) >= 5 and float(np.std(live)) < 0.75:
@@ -330,29 +346,80 @@ def early_observation(p: "Probe", peak_s: float, sec_db, no_audio: bool) -> str:
     return "ok"
 
 
-def log_probe(p: "Probe", seconds: float, skipped: bool) -> None:
+def log_probe(p: "Probe", seconds: float, skipped: bool, route: str = "vod", cached: bool = False) -> None:
     """Count what the probe saved: each window it stopped before Whisper (runs/heavy/probes.jsonl)."""
     try:
         from .admission import _dir
         d = _dir()
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "probes.jsonl"), "a") as fh:
-            fh.write(json.dumps({"at": time.time(), "obs": p.observation, "skipped_asr": skipped,
-                                 "asr_s_saved": round(seconds, 1) if skipped else 0.0}) + "\n")
+            fh.write(json.dumps({"at": time.time(), "route": route, "obs": p.observation, "skipped_asr": skipped,
+                                 "cached": cached, "asr_s_saved": round(seconds, 1) if skipped else 0.0}) + "\n")
     except OSError:
         pass
 
 
-def probe_audio(audio_path: str, file_t0: float, win_start: float, win_end: float,
-                peak_s: float, model_name: str = "small", transcript: dict | None = None,
-                login: str | None = None) -> Probe:
-    """Measure + transcribe [win_start, win_end] (VOD seconds) of an audio
-    file whose first sample is VOD second file_t0. Pass `transcript` to
-    reuse an earlier one (re-scoring without re-running Whisper)."""
+# Probe cache: a window already found unhearable is never fetched, decoded or transcribed again (sweeps,
+# catch-up retries, pre-render and publish revisit the same moments). Keyed by the media's identity — a VOD id
+# and window, or the decoded audio's own hash — in runs/heavy/probe_cache.jsonl (append-only, last line wins).
+def _cache_file() -> str:
+    from .admission import _dir
+    return os.path.join(_dir(), "probe_cache.jsonl")
+
+
+def media_key(x: np.ndarray, region: tuple[float, float]) -> str:
+    """Fingerprint of decoded audio + the region judged (the same sound judged the same way)."""
+    h = hashlib.sha1(np.ascontiguousarray(x, dtype=np.float32).tobytes())
+    h.update(f"{region[0]:.1f}:{region[1]:.1f}".encode())
+    return "pcm:" + h.hexdigest()
+
+
+def cache_get(key: str | None) -> dict | None:
+    if not key:
+        return None
+    hit, cutoff = None, time.time() - PROBE_CACHE_DAYS * 86400
     try:
-        x = decode_pcm(audio_path, win_start - file_t0, win_end - win_start)
-    except Exception:                                    # missing / corrupt audio: an observation, not a crash
-        x = np.zeros(0, dtype=np.float32)
+        with open(_cache_file()) as fh:
+            for line in fh:
+                if key in line:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("k") == key and r.get("at", 0) >= cutoff:
+                        hit = r
+    except OSError:
+        return None
+    return hit
+
+
+def cache_put(key: str | None, p: "Probe") -> None:
+    if not key or p.observation not in SKIP_OBS:
+        return
+    try:
+        f = _cache_file()
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "a") as fh:
+            fh.write(json.dumps({"k": key, "at": time.time(), "obs": p.observation, "muted_frac": p.muted_frac,
+                                 "mean_db": p.mean_db}) + "\n")
+    except OSError:
+        pass
+
+
+def from_cache(key: str | None, win_start: float, win_end: float, route: str = "vod") -> "Probe | None":
+    """A Probe straight from the cache when this window is already known to be unhearable (no fetch, no decode)."""
+    r = cache_get(key)
+    if not r or r.get("obs") not in SKIP_OBS:
+        return None
+    p = Probe(win_start, win_end, r.get("mean_db", -120.0), r.get("muted_frac", 1.0))
+    p.observation, p.cached = r["obs"], True
+    log_probe(p, win_end - win_start, skipped=True, route=route, cached=True)
+    return p
+
+
+def measure(x: np.ndarray, win_start: float, win_end: float, peak_s: float,
+            region: tuple[float, float] | None = None) -> tuple["Probe", np.ndarray]:
+    """Levels, the per-second mute map and the early observation of decoded audio — no transcription."""
     db = frame_db(x) if len(x) else np.zeros(0)
     muted = float((db < MUTE_DB).mean()) if len(db) else 1.0
     active = db[db > MUTE_DB]
@@ -360,9 +427,47 @@ def probe_audio(audio_path: str, file_t0: float, win_start: float, win_end: floa
     p = Probe(win_start, win_end, round(mean_db, 1), round(muted, 2))
     sec_db = frame_db(x, 1.0) if len(x) else np.zeros(0)
     p.mute_map = [bool(v < MUTE_DB) for v in sec_db]
-    p.observation = early_observation(p, peak_s, sec_db, len(x) == 0)
-    if p.observation in ("no audio", "muted", "payoff muted"):
+    p.observation = early_observation(p, peak_s, sec_db, len(x) == 0, region)
+    return p, sec_db
+
+
+def gate(x: np.ndarray, t0: float, payoff: float | None = None, route: str = "live",
+         region: tuple[float, float] | None = None) -> "Probe":
+    """The same early probe for routes that already hold the audio (live buffer, re-cut, pre-render, publish):
+    x starts at stream time t0. The beat region is around the known payoff (10 s before to 5 s after), else
+    the whole window. Check `.observation in SKIP_OBS` before transcribing; `skip_reason()` says why."""
+    end = t0 + len(x) / SR
+    if region is None:
+        region = (payoff - 10, payoff + 5) if payoff is not None else (t0, end)
+    key = media_key(x, region) if len(x) else None
+    hit = from_cache(key, t0, end, route)
+    if hit:
+        return hit
+    p, _ = measure(x, t0, end, region[1] - 5, region)
+    log_probe(p, end - t0, skipped=p.observation in SKIP_OBS, route=route)
+    cache_put(key, p)
+    return p
+
+
+def probe_audio(audio_path: str, file_t0: float, win_start: float, win_end: float,
+                peak_s: float, model_name: str = "small", transcript: dict | None = None,
+                login: str | None = None, key: str | None = None) -> Probe:
+    """Measure + transcribe [win_start, win_end] (VOD seconds) of an audio
+    file whose first sample is VOD second file_t0. Pass `transcript` to
+    reuse an earlier one (re-scoring without re-running Whisper). `key` names
+    the media (e.g. a VOD id + window) for the probe cache."""
+    hit = from_cache(key, win_start, win_end)
+    if hit:
+        return hit
+    try:
+        x = decode_pcm(audio_path, win_start - file_t0, win_end - win_start)
+    except Exception:                                    # missing / corrupt audio: an observation, not a crash
+        x = np.zeros(0, dtype=np.float32)
+    p, sec_db = measure(x, win_start, win_end, peak_s)
+    if p.observation in SKIP_OBS:
         log_probe(p, win_end - win_start, skipped=True)
+        if p.observation != "no audio":                  # a failed download may succeed next time: never cached
+            cache_put(key, p)
         return p
     log_probe(p, win_end - win_start, skipped=False)
     tr = transcript or transcribe(x, model_name, offset=win_start, prompt=vocab_prompt(login=login))
@@ -504,13 +609,11 @@ def assess(p: Probe, win: dict, peak_s: float | None = None) -> dict:
     if muted > 0.5 or (p.muted_frac > 0.9 and not p.words):
         hard = f"copyright-muted ({int(max(muted, p.muted_frac) * 100)}% digital silence)"
     obs = getattr(p, "observation", "ok")
-    if not hard and obs == "payoff muted":
-        hard = "copyright-muted over the payoff (rights review: the beat can't be heard; not transcribed)"
-    elif not hard and obs == "no audio":
-        hard = "no audio in the source window (missing or corrupt)"
-    elif obs == "flat audio":
+    if not hard and obs in ("payoff muted", "no audio"):
+        hard = skip_reason(obs)
+    if obs == "flat audio":
         flags.append("flat audio (a constant bed — replaced or muted sound?)")
-    elif win["words"] < 12 or win["speech_s"] < 6:
+    elif not hard and (win["words"] < 12 or win["speech_s"] < 6):     # never overwrites a mute / no-audio reason
         hard = f"only {win['words']} words / {win['speech_s']}s of speech — nothing to caption"
     if not hard and win["speech_s"] < 15:
         flags.append(f"thin speech ({win['speech_s']}s)")

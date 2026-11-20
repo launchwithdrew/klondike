@@ -30,5 +30,5 @@ running accuracy is printed each time (the latest verdict per draft counts).
   (no reaction, no viewer clips, a dull picture). It stays in `queue --all` with the reason.
 
 To keep an old moment on purpose: `clipengine triage --keep ID --why "the reason it's still worth posting"`.
-A saved-stream window whose payoff is copyright-muted is refused before transcription, with a rights-review reason.
+Every route checks the audio before transcription: saved streams, the live recording, a re-cut, a pre-render and `publish-live`. A window with no audio, full silence, or a muted payoff is refused with a rights-review reason. A known-muted saved-stream window is remembered for 14 days and never downloaded again. `clipengine jobs` counts what this saved.
 Tune the windows in `config/grading.json` under `"triage"`: `breaking_h`, `evergreen_h`, `max_repairs`.
