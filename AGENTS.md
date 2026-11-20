@@ -49,7 +49,7 @@ the **queue** — the only part that needs you.
 .venv/bin/python -m clipengine supervisor install        # cycle every 5 min; restarted after crashes and reboots
 .venv/bin/python -m clipengine attention                  # ONE line of what needs you, or nothing
 ```
-No service manager on the host? `autopilot start` (degraded). `supervisor status`: every outage with its cause. `--sessions`: only the streamers' usual hours; `autopilot stop` stays stopped.
+No service manager? The engine's keeper runs it. `supervisor status`: every outage with its cause. `--sessions`: only the streamers' usual hours; `autopilot stop` stays stopped.
 `attention`: urgent drafts, overdue posts, clips due, failures, new drafts, the daily report (`--seen` marks it
 read). To get it on the user's phone, add to `config/ops.json`:
 `"notify_cmd": "curl -s -d \"$CLIPENGINE_ATTENTION\" ntfy.sh/<a-long-random-topic>"` (they subscribe to that

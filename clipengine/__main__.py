@@ -147,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     tr_.add_argument("--why", help="the editorial reason it is still worth posting")
     sub.add_parser("jobs", help="heavy jobs (transcription, encodes): who runs, who waits and why, 24 h timings")
     sv_ = sub.add_parser("supervisor", help="the native service that keeps the autopilot alive (install/status/stop/resume/uninstall)")
-    sv_.add_argument("action", choices=["install", "status", "stop", "resume", "uninstall"])
+    sv_.add_argument("action", choices=["install", "status", "stop", "resume", "uninstall", "boot", "keep"])
     sv_.add_argument("--every", type=float, help="minutes between cycles (default config/ops.json autopilot_every_min, 5)")
     sv_.add_argument("--sessions", action="store_true", help="only inside the roster's usual stream hours")
     at_ = sub.add_parser("attention", help="ONE line of what needs you now (nothing when nothing does)")
@@ -353,7 +353,14 @@ def main(argv: list[str] | None = None) -> int:
             print(AP.autopilot_stop())
         elif a.action == "resume":
             print(AP.autopilot_start(a.every, a.sessions))
+        elif a.action == "boot":
+            print(SV.boot(AP._root()))
+        elif a.action == "keep":
+            print(SV.keep(a.every or O.config().get("autopilot_every_min", 5), a.sessions, AP._root()), flush=True)
         else:
+            msg = AP.revive_supervised("supervisor status")
+            if msg:
+                print(msg)
             if AP.autopilot_died():
                 SV.reconcile(None, root=AP._root())
             print("\n".join(SV.status_lines(AP._root())))
@@ -373,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "attention":
             from . import attention as AT
             items = AT.pending()
+            AP.revive_supervised("attention")
             if AP.autopilot_died():
                 from . import supervise as SV
                 SV.reconcile(None, root=AP._root())         # records the outage once (and alerts once)

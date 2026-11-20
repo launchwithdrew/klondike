@@ -4345,3 +4345,138 @@ def test_the_probe_cache_never_downloads_or_decodes_a_known_muted_vod_window_twi
     with open(tmp_path / "heavy" / "probe_cache.jsonl", "a") as fh:
         fh.write(_json.dumps({"k": "vod:9:0:60", "at": _time.time() - 30 * 86400, "obs": "muted"}) + "\n")
     assert A.cache_get("vod:9:0:60") is None
+
+
+# ---- after a reboot: the engine's keeper and the boot hook (hosts with no linger / no system bus) -----------
+
+def test_the_keeper_restarts_after_any_exit_that_was_not_a_stop(tmp_path):
+    import threading as _th
+    from clipengine import supervise as SV
+    root = str(tmp_path)
+    codes, slept = [75, -9, 0], []
+    assert SV.keep(5, root=root, run=lambda cmd: codes.pop(0), sleep=slept.append) .startswith("keeper: the autopilot was stopped")
+    assert codes == [] and slept == [SV.KEEPER_RESTART_S] * 2                       # two restarts, then a clean stop
+    SV.mark_stopped("operator", root)
+    assert SV.keep(5, root=root, run=lambda cmd: 1 / 0) .startswith("keeper: stopped on purpose")   # never runs
+    SV.clear_stopped(root)
+    gate, out = _th.Event(), []
+    t = _th.Thread(target=lambda: out.append(SV.keep(5, root=root, run=lambda cmd: gate.wait(10) and 0)))
+    t.start()
+    for _ in range(50):
+        if SV.keeper_alive(root):
+            break
+        time.sleep(0.05)
+    assert SV.keeper_alive(root) == os.getpid()
+    assert SV.keep(5, root=root, run=lambda cmd: 1 / 0).startswith("keeper: another keeper is running")
+    gate.set(); t.join(10)
+    assert SV.keeper_alive(root) is None                                             # the lock died with it
+
+
+def test_after_a_reboot_without_linger_the_next_command_brings_the_supervisor_back(tmp_path, monkeypatch):
+    from clipengine import autopilot as AP, attention as AT, supervise as SV
+    monkeypatch.setattr(AP, "RUNS", str(tmp_path)); monkeypatch.setattr(AT, "RUNS", str(tmp_path))
+    monkeypatch.setattr(AP, "PID", str(tmp_path / "autopilot.pid"))
+    monkeypatch.setattr(AP, "APSTATE", str(tmp_path / "autopilot.json"))
+    monkeypatch.setattr(SV, "manager", lambda: "none")                 # user systemd didn't come back
+    started = []
+    monkeypatch.setattr(SV, "start_keeper", lambda root=None: started.append(root) or 4242)
+    assert AP.revive_supervised("attention") is None                   # never installed: nothing to do
+    SV.save_settings(str(tmp_path), every=5, sessions=True, kind="systemd")
+    msg = AP.revive_supervised("attention")
+    assert "keeper took over (pid 4242)" in msg and "isn't reachable" in msg and started == [str(tmp_path)]
+    assert "brought back by `attention`" in AT.line()
+    monkeypatch.setattr(SV, "keeper_alive", lambda root=None: 4242)
+    assert AP.revive_supervised("doctor") is None and AP.revive_if_dead("streamera") is None   # it is kept alive
+    monkeypatch.setattr(SV, "keeper_alive", lambda root=None: None)
+    SV.mark_stopped("operator", str(tmp_path))
+    assert AP.revive_supervised("attention") is None                   # a stop survives the reboot
+    assert "stopped on purpose" in SV.boot(str(tmp_path))
+    SV.clear_stopped(str(tmp_path))
+    assert "keeper took over" in AP.autopilot_start(10, True)          # start, too, goes through the keeper
+    assert SV.settings(str(tmp_path))["every"] == 10.0
+
+
+def test_the_boot_line_goes_in_this_users_crontab_once_and_comes_out_cleanly(tmp_path, monkeypatch):
+    from clipengine import supervise as SV
+    bindir = tmp_path / "bin"; bindir.mkdir()
+    tab = tmp_path / "tab"; tab.write_text("0 3 * * * echo backup\n")
+    (bindir / "crontab").write_text(f"#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then cat {tab}; else cat > {tab}; fi\n")
+    (bindir / "crontab").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    assert SV.set_cron(True) and SV.set_cron(True)
+    lines = tab.read_text().splitlines()
+    assert lines[0] == "0 3 * * * echo backup" and len(lines) == 2                   # theirs kept, ours once
+    assert lines[1].startswith("@reboot cd ") and "-m clipengine supervisor boot" in lines[1] and REPO in lines[1]
+    monkeypatch.setattr(SV, "manager", lambda: "none")
+    monkeypatch.setattr(SV, "cron_daemon", lambda: True)
+    assert SV.boot_mode("systemd") == "at boot (cron @reboot)"
+    monkeypatch.setattr(SV, "cron_daemon", lambda: False)
+    assert "no cron daemon is running" in SV.boot_mode("systemd")
+    assert SV.boot_mode("launchd") == "at login (LaunchAgent)"
+    assert SV.set_cron(False) and tab.read_text().splitlines() == ["0 3 * * * echo backup"]
+    assert SV.boot_mode("systemd").startswith("on the next engine command")
+
+
+def test_the_reboot_drill_one_reboot_incident_then_the_keeper_holds_the_loop(tmp_path, monkeypatch):
+    """The R1 reboot drill on a host whose user systemd doesn't come back: the previous leader's lease is from
+    another boot; the next command starts the keeper; the loop is back with ONE incident (reboot); a later kill
+    is restarted by the keeper; a stop ends both."""
+    import subprocess as _sp, signal as _sig, threading as _th
+    from clipengine import autopilot as AP, attention as AT, supervise as SV
+    root = tmp_path / "runs"; root.mkdir()
+    monkeypatch.setattr(AP, "RUNS", str(root)); monkeypatch.setattr(AT, "RUNS", str(root))
+    monkeypatch.setattr(AP, "PID", str(root / "autopilot.pid"))
+    monkeypatch.setattr(AP, "APSTATE", str(root / "autopilot.json"))
+    monkeypatch.setattr(SV, "manager", lambda: "none")
+    old = time.time() - 2 * 3600
+    (root / "autopilot.lease.json").write_text(json.dumps({"generation": 3, "pid": 999999, "boot_id": "an-earlier-boot",
+                                                           "started_at": old - 600, "heartbeat_at": old,
+                                                           "progress_at": old, "phase": "sleep", "started_by": "service"}))
+    SV.save_settings(str(root), every=5, sessions=False, kind="systemd")
+    code = (f"import sys; sys.path.insert(0, {REPO!r}); from clipengine import autopilot as AP; "
+            f"AP.APSTATE={str(root / 'autopilot.json')!r}; AP.RUNS={str(root)!r}; "
+            "AP.autopilot_run(5, cycle_cmd=[sys.executable, '-c', 'print(1)'])")
+    kids, done = [], []
+    def run(cmd):
+        p = _sp.Popen([sys.executable, "-c", code], env={**os.environ, "CLIPENGINE_STARTED_BY": "keeper"})
+        kids.append(p)
+        return p.wait()
+    def start(root_=None):
+        t = _th.Thread(target=lambda: done.append(SV.keep(5, root=root_, run=run, sleep=lambda s: time.sleep(0.2))))
+        t.start(); kids.append(t)
+        return 1
+    monkeypatch.setattr(SV, "start_keeper", start)
+    def leader(gen):
+        for _ in range(200):
+            st = json.loads((root / "autopilot.lease.json").read_text())
+            if st.get("generation") == gen and st.get("phase") == "sleep":
+                return st
+            time.sleep(0.1)
+        raise AssertionError(f"no leader generation {gen}")
+    assert AP.autopilot_died()
+    assert "keeper took over" in AP.revive_supervised("attention")
+    st = leader(4)
+    assert st["started_by"] == "keeper"
+    inc = [i for i in SV.incidents(str(root)) if i.get("status") == "recovered"]
+    assert len(inc) == 1 and inc[0]["cause"] == "reboot" and inc[0]["recovered_by"] == "keeper"
+    assert inc[0]["dark_min"] >= 119
+    kids[-1].send_signal(_sig.SIGKILL)                                   # the out-of-memory killer, say
+    leader(5)                                                            # back by itself, no command needed
+    SV.mark_stopped("operator", str(root))
+    [k for k in kids if hasattr(k, "send_signal")][-1].send_signal(_sig.SIGTERM)
+    [k for k in kids if isinstance(k, _th.Thread)][0].join(30)
+    assert done and "stopped" in done[0] and SV.keeper_alive(str(root)) is None
+    assert all(k.poll() is not None for k in kids if hasattr(k, "poll"))
+
+
+def test_an_install_from_before_the_keeper_is_read_back_from_its_service_file(tmp_path, monkeypatch):
+    from clipengine import supervise as SV
+    monkeypatch.setattr(SV, "RUNS", str(tmp_path))
+    monkeypatch.setattr(SV.sys, "platform", "linux")
+    unit = tmp_path / "klondike.service"
+    monkeypatch.setattr(SV, "_service_path", lambda kind: str(unit))
+    assert SV.settings() == {}
+    unit.write_text(SV.render_service("systemd", 5, True))
+    assert SV.settings() == {"kind": "systemd", "every": 5.0, "sessions": True}
+    SV.save_settings(every=10, sessions=False, kind="systemd")
+    assert SV.settings()["every"] == 10                                   # a saved choice wins

@@ -785,6 +785,10 @@ def autopilot_start(every_min: float | None = None, sessions: bool = False, by: 
     if SV.installed() and SV.service_start():
         return "autopilot started by its service (`clipengine supervisor status`)"
     every = float(every_min or config().get("autopilot_every_min", 5))
+    if SV.settings(_root()):                               # installed, but no reachable service: the keeper runs it
+        if every_min or sessions:
+            SV.save_settings(_root(), every=every, sessions=bool(sessions))
+        return SV.boot(_root())
     cmd = [sys.executable, "-m", "clipengine", "autopilot", "run", "--every", str(every)] + (["--sessions"] if sessions else [])
     pid = _detach(cmd, LOG, env={"CLIPENGINE_STARTED_BY": by})
     os.makedirs(RUNS, exist_ok=True)
@@ -821,6 +825,17 @@ def uptime(now: float | None = None, hours: float = 24.0, root: str | None = Non
             "causes": [d.get("cause") or "unknown" for d in recent]}
 
 
+def revive_supervised(by: str) -> str | None:
+    """The next command after a reboot (no linger, no cron): an installed supervisor that nothing keeps alive is
+    started again — the operator chose keep-alive at install, so no manual restart is needed."""
+    if not SV.settings(_root()) or SV.stopped(_root()) or SV.keeping(_root()):
+        return None
+    msg = SV.boot(_root())
+    AT.event("failure", f"supervisor was not running (host restarted?) — brought back by `{by}`: {msg[12:120]}",
+             key=f"sv-boot:{int(time.time()) // 900}")
+    return msg
+
+
 def autopilot_died() -> bool:
     """Started and never stopped on purpose, but nobody holds the leader lease now."""
     if SV.stopped(_root()):
@@ -831,8 +846,8 @@ def autopilot_died() -> bool:
 def revive_if_dead(by: str, now: float | None = None, min_gap_s: float = 900) -> str | None:
     """Called by the always-running sentinels: if the autopilot died (not stopped), start it again with its
     last settings — at most once per 15 min, and only one sentinel does it (a lock file)."""
-    if not autopilot_died() or SV.installed():
-        return None                                        # alive, or its service restarts it
+    if not autopilot_died() or SV.keeping(_root()):
+        return None                                        # alive, or its service / keeper restarts it
     now = now or time.time()
     lock = os.path.join(RUNS, ".ap-revive.lock")
     try:
@@ -950,13 +965,13 @@ def autopilot_run(every_min: float, sessions: bool = False, rounds: int | None =
     stop = {"now": False, "sig": None}
     root = _root()
     by = os.environ.get("CLIPENGINE_STARTED_BY", "manual")
-    if SV.stopped(root) and by == "service":
+    if SV.stopped(root) and by in ("service", "keeper"):
         print("[autopilot] stopped on purpose (`clipengine autopilot start` resumes) — not starting", flush=True)
         return
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda n, _f: stop.update(now=True, sig=signal.Signals(n).name))
     lease = SV.Lease(root)
-    if not lease.acquire(wait_s=1e12 if by == "service" else 0.0, poll_s=30.0,
+    if not lease.acquire(wait_s=1e12 if by in ("service", "keeper") else 0.0, poll_s=30.0,
                          should_stop=lambda: stop["now"] or bool(SV.stopped(root))):
         lead = SV.holder(root) or {}
         print(f"[autopilot] another leader holds the lease (pid {lead.get('pid')}) — not starting a second one",

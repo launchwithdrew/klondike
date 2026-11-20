@@ -67,3 +67,21 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.6
+
+- The supervisor now comes back after a reboot on hosts where the user systemd doesn't start by itself (no linger, no system bus) and in containers with no service manager.
+  - The engine's keeper (`supervisor keep`) restarts the autopilot within 30 seconds of any exit that wasn't a stop, the same as launchd or systemd would.
+  - `supervisor install` adds a `@reboot` line to your crontab where linger isn't available. The line is added once, and your other lines are kept.
+  - With no cron either, the next engine command (`attention`, `doctor`, `supervisor status`) brings the supervisor back, with one attention line. A stop is still honoured across reboots.
+  - `supervisor status` and `doctor` show an "after a reboot:" line saying which of these applies on your host.
+- Installs from before this version are read back from their service file, so nothing needs reinstalling. Run `supervisor install` again only to add the boot line.
+- New commands: `supervisor boot` (idempotent) and `supervisor keep`. `uninstall` also removes the keeper and the boot line.
+- Containers are no longer DEGRADED: the keeper runs the autopilot there.
+
+Export diff
+- Added (0)
+- Changed (9): `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/autopilot.py`, `clipengine/ops.py`, `clipengine/supervise.py`, `docs/reliability.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

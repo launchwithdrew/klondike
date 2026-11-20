@@ -984,15 +984,25 @@ def doctor(accounts: bool = False) -> bool:
         print("  \u00b7 recording logged out: ad breaks become gaps (optional: set TWITCH_AUTH_TOKEN in the environment "
               "\u2014 docs/troubleshooting.md)")
     from . import supervise as _SV
+    from . import autopilot as _AP
+    _back = _AP.revive_supervised("doctor")
+    if _back:
+        print(f"  \u00b7 {_back}")
     _kind = _SV.manager()
+    _boot = _SV.boot_mode() if _SV.settings() else ""
+    _cold = _boot.startswith(("on the next", "cron @reboot is set"))
     if _SV.installed(_kind):
         print(f"  \u2713 supervisor: {_kind} service restarts the autopilot after any exit that wasn't a stop")
+        print("  " + ("\u00b7" if _cold else "\u2713") + f" after a reboot: {_boot}")
+    elif _SV.keeper_alive():
+        print("  \u2713 supervisor: the engine's keeper restarts the autopilot after any exit that wasn't a stop")
+        print("  " + ("\u00b7" if _cold else "\u2713") + f" after a reboot: {_boot}")
     elif _kind != "none":
         print(f"  \u00b7 supervisor: not installed \u2014 `clipengine supervisor install` so the autopilot survives "
               "crashes, the agent session ending and reboots")
     else:
-        print("  \u00b7 supervisor: DEGRADED here (no launchd / user systemd) \u2014 the autopilot runs detached; "
-              "a death is noticed late")
+        print("  \u00b7 supervisor: no launchd / user systemd here \u2014 `clipengine supervisor install` and the "
+              "engine's keeper restarts the autopilot instead")
     if config().get("heartbeat_url"):
         print("  \u2713 off-host heartbeat: pinged every minute (your monitor alerts when pings stop)")
     else:

@@ -16,9 +16,13 @@
               open incident once and its recovery once. Three deaths inside an hour is a crash loop.
   service     `clipengine supervisor install|status|stop|resume|uninstall`: a native service that starts the
               loop at login (macOS launchd LaunchAgent) or with the user's systemd, and restarts it whenever it
-              exits without being stopped on purpose. Where neither exists (a container, an ephemeral host) the
-              loop runs detached and status says so: deaths are then only noticed by a sentinel or the next
-              command, and reconciled when it is back.
+              exits without being stopped on purpose.
+  keeper      where neither can run — a container, or a host whose user systemd doesn't come back after a reboot
+              (no linger, no system bus) — the engine keeps the loop alive itself: `supervisor keep` restarts the
+              autopilot within 30 s of any exit that wasn't a stop, exactly like the service would.
+  after boot  how it comes back after a reboot: launchd at login, systemd with linger, else a `@reboot` line in
+              this user's crontab (`supervisor boot`), else the next engine command (attention, doctor,
+              supervisor status) revives it. `supervisor status` says which applies here.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -451,9 +456,15 @@ def installed(kind: str | None = None) -> bool:
 def install(every: float, sessions: bool = False) -> str:
     kind = manager()
     if kind == "none":
-        return ("supervisor: no service manager here (no launchd, no user systemd) — DEGRADED: the autopilot runs "
-                "detached; a death is noticed by a sentinel or the next command and reconciled when it's back. "
-                "Use a supported always-on host, and set config/ops.json \"heartbeat_url\" so you hear about outages.")
+        save_settings(every=every, sessions=sessions, kind="keeper", at=time.time())
+        clear_stopped()
+        cron = set_cron(True)
+        pid = keeper_alive() or start_keeper()
+        return (f"supervisor: no launchd or user systemd here — the engine's keeper runs it (pid {pid}) and restarts "
+                f"the autopilot within {KEEPER_RESTART_S:g} s of any exit that wasn't a stop. After a reboot: "
+                + boot_mode("keeper") + (". " if cron else " (no crontab here). ")
+                + "Set config/ops.json \"heartbeat_url\" so you hear about outages.")
+    save_settings(every=every, sessions=sessions, kind=kind, at=time.time())
     path = _service_path(kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").write(render_service(kind, every, sessions))
@@ -466,9 +477,19 @@ def install(every: float, sessions: bool = False) -> str:
     else:
         _run(["systemctl", "--user", "daemon-reload"])
         rc, out = _run(["systemctl", "--user", "enable", "--now", _unit()])
-        linger = _run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger"])[1]
-        when = ("now and at boot" if "Linger=yes" in linger else
-                "now and at login — run `loginctl enable-linger` once to start it at boot without a login")
+        if not _linger():
+            _run(["loginctl", "enable-linger", os.environ.get("USER", "")])
+        if _linger():
+            set_cron(False)
+            when = "now and at boot (linger)"
+        elif set_cron(True):
+            when = ("now; at boot through cron @reboot (linger isn't available here: without it the user systemd "
+                    "doesn't start at boot, so the engine's keeper takes over)" if cron_daemon() else
+                    "now; linger and a cron daemon aren't available here, so after a reboot the next engine command "
+                    "(attention, doctor) brings it back")
+        else:
+            when = ("now; linger and cron aren't available here, so after a reboot the next engine command "
+                    "(attention, doctor) brings it back")
     if rc != 0:
         return f"supervisor: wrote {path} but {kind} refused it: {out[:160]}"
     return f"supervisor: installed ({kind}) — the autopilot starts {when}, and restarts within 30 s of any exit that wasn't a stop"
@@ -477,8 +498,22 @@ def install(every: float, sessions: bool = False) -> str:
 def uninstall() -> str:
     kind = manager()
     path = _service_path(kind) if kind != "none" else ""
+    had = bool(settings())
+    try:
+        os.remove(_p("supervisor.json"))
+    except OSError:
+        pass
+    if cron_installed():
+        set_cron(False)
+    pid = keeper_alive()
+    if pid and pid > 0:
+        try:
+            os.kill(pid, signal.SIGTERM)                   # the keeper only; its autopilot keeps running detached
+        except OSError:
+            pass
     if not path or not os.path.exists(path):
-        return "supervisor: not installed"
+        return ("supervisor: uninstalled (the keeper and the boot line are gone; the autopilot is no longer restarted)"
+                if had or pid else "supervisor: not installed")
     if kind == "launchd":
         _run(["launchctl", "bootout", f"gui/{os.getuid()}/{_label()}"])
     else:
@@ -508,6 +543,181 @@ def service_start() -> bool:
     return rc == 0
 
 
+# ---- keeper and boot: for hosts where the native service can't run or won't come back after a reboot -------
+KEEPER_RESTART_S = 30.0          # same as the services' restart delay
+CRON_TAG = "# klondike-boot"
+
+
+def settings(root: str | None = None) -> dict:
+    """What `supervisor install` chose here (outlives the service manager going away after a reboot). An install
+    from before v0.4.6 has only its service file: the settings are read back from it."""
+    s = _read(_p("supervisor.json", root))
+    if s or root not in (None, RUNS):
+        return s
+    kind = "launchd" if sys.platform == "darwin" else "systemd"
+    try:
+        text = open(_service_path(kind)).read()
+    except OSError:
+        return {}
+    m = re.search(r"--every\W+([0-9.]+)", text)
+    return {"kind": kind, "every": float(m.group(1)) if m else 5.0, "sessions": "--sessions" in text}
+
+
+def save_settings(root: str | None = None, **kw) -> dict:
+    s = {**settings(root), **{k: v for k, v in kw.items() if v is not None}}
+    _write(_p("supervisor.json", root), s)
+    return s
+
+
+def keeper_alive(root: str | None = None) -> int | None:
+    """The running keeper's pid (it holds runs/keeper.lock for its whole life), else None."""
+    path = _p("keeper.lock", root)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    except OSError:
+        for _ in range(25):                                  # it writes its pid just after taking the lock
+            try:
+                pid = int(os.pread(fd, 32, 0).decode().strip() or 0)
+            except (OSError, ValueError):
+                pid = 0
+            if pid:
+                return pid
+            time.sleep(0.02)
+        return -1                                           # alive, pid not readable
+    finally:
+        os.close(fd)
+
+
+def keep(every: float, sessions: bool = False, root: str | None = None, run=None, sleep=time.sleep,
+         max_runs: int | None = None) -> str:
+    """The engine's own restarter: run the autopilot, and start it again KEEPER_RESTART_S after any exit that
+    wasn't a stop. One keeper per install (an OS lock)."""
+    os.makedirs(root or RUNS, exist_ok=True)
+    fd = os.open(_p("keeper.lock", root), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return f"keeper: another keeper is running (pid {keeper_alive(root)})"
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, str(os.getpid()).encode(), 0)
+    env = {**os.environ, "CLIPENGINE_STARTED_BY": "keeper", "PYTHONUNBUFFERED": "1"}
+    run = run or (lambda cmd: subprocess.call(cmd, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                                              start_new_session=True))
+    n = 0
+    try:
+        while not stopped(root):
+            rc = run(_loop_cmd(every, sessions))
+            n += 1
+            if rc == EXIT_STOPPED or stopped(root):
+                return "keeper: the autopilot was stopped on purpose — keeper exits"
+            print(f"[keeper] autopilot exited ({rc}) — restarting in {KEEPER_RESTART_S:g} s", flush=True)
+            if max_runs is not None and n >= max_runs:
+                return f"keeper: {n} runs"
+            sleep(KEEPER_RESTART_S)
+        return "keeper: stopped on purpose — keeper exits"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def start_keeper(root: str | None = None) -> int:
+    s = settings(root)
+    cmd = [sys.executable, "-m", "clipengine", "supervisor", "keep", "--every", f"{float(s.get('every') or 5):g}"] + \
+          (["--sessions"] if s.get("sessions") else [])
+    os.makedirs(root or RUNS, exist_ok=True)
+    with open(_p("autopilot.log", root), "a") as fh:
+        p = subprocess.Popen(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True)
+    return p.pid
+
+
+def keeping(root: str | None = None) -> bool:
+    """Something restarts the autopilot by itself right now: a reachable native service, or a live keeper."""
+    return installed() or bool(keeper_alive(root))
+
+
+def boot(root: str | None = None) -> str:
+    """Bring the supervisor back (a `@reboot` line, or the next command after a reboot). Idempotent."""
+    s = settings(root)
+    if not s:
+        return "supervisor: not installed here — nothing to start"
+    if stopped(root):
+        return "supervisor: stopped on purpose — not starting (`clipengine autopilot start` resumes)"
+    kind = manager()
+    if installed(kind) and service_start():
+        return f"supervisor: {kind} service started"
+    pid = keeper_alive(root)
+    if pid:
+        return f"supervisor: keeper already running (pid {pid})"
+    pid = start_keeper(root)
+    why = ("the native service isn't reachable here (after a reboot without linger the user systemd isn't running)"
+           if s.get("kind") in ("systemd", "launchd") else "no native service manager here")
+    return (f"supervisor: {why} — the engine's keeper took over (pid {pid}): it restarts the autopilot within "
+            f"{KEEPER_RESTART_S:g} s of any exit that wasn't a stop")
+
+
+def _crontab() -> tuple[bool, list[str]]:
+    if not shutil.which("crontab"):
+        return False, []
+    rc, out = _run(["crontab", "-l"], timeout=10)
+    return True, (out.splitlines() if rc == 0 else [])
+
+
+def cron_daemon() -> bool:
+    for name in ("cron", "crond", "cronie"):
+        if shutil.which("pgrep") and _run(["pgrep", "-x", name], timeout=5)[0] == 0:
+            return True
+    return False
+
+
+def boot_line() -> str:
+    q = shlex.quote
+    return (f"@reboot cd {q(REPO)} && {q(sys.executable)} -m clipengine supervisor boot >> {q(_p('autopilot.log'))} "
+            f"2>&1 {CRON_TAG} {_label()}")
+
+
+def cron_installed() -> bool:
+    ok, lines = _crontab()
+    return ok and any(f"{CRON_TAG} {_label()}" in l for l in lines)
+
+
+def set_cron(on: bool) -> bool:
+    ok, lines = _crontab()
+    if not ok:
+        return False
+    keep_ = [l for l in lines if f"{CRON_TAG} {_label()}" not in l] + ([boot_line()] if on else [])
+    try:
+        p = subprocess.run(["crontab", "-"], input="\n".join(keep_) + "\n", text=True, capture_output=True,
+                           timeout=10)
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _linger() -> bool:
+    return "Linger=yes" in _run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger"])[1]
+
+
+def boot_mode(kind: str | None = None) -> str:
+    """How the supervisor comes back after a reboot of this host."""
+    kind = kind or settings().get("kind") or manager()
+    if kind == "launchd":
+        return "at login (LaunchAgent)"
+    if kind == "systemd" and manager() == "systemd" and _linger():
+        return "at boot (systemd linger)"
+    if cron_installed():
+        return "at boot (cron @reboot)" if cron_daemon() else \
+            "cron @reboot is set, but no cron daemon is running — the next engine command revives it"
+    return "on the next engine command after a reboot (no linger, no cron) — attention, doctor or supervisor status"
+
+
 def status(root: str | None = None, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     kind = manager()
@@ -522,10 +732,22 @@ def status(root: str | None = None, now: float | None = None) -> dict:
 def status_lines(root: str | None = None, now: float | None = None) -> list[str]:
     st = status(root, now)
     kind = st["manager"]
-    svc = ({"launchd": "launchd LaunchAgent (starts at login)", "systemd": "systemd user service"}.get(kind, kind)
-           if st["installed"] else ("not installed — `clipengine supervisor install`" if kind != "none"
-                                    else "DEGRADED: no service manager here — deaths are noticed late"))
+    keeper = keeper_alive(root)
+    want = settings(root)
+    if st["installed"]:
+        svc = {"launchd": "launchd LaunchAgent (starts at login)", "systemd": "systemd user service"}.get(kind, kind)
+    elif keeper:
+        svc = (f"engine keeper (pid {keeper}) — restarts the autopilot within {KEEPER_RESTART_S:g} s"
+               + (f"; the {want.get('kind')} service isn't reachable here now" if want.get("kind") in ("systemd", "launchd") else ""))
+    elif want:
+        svc = ("installed, but NOTHING is keeping it alive right now (the service manager isn't running — e.g. after "
+               "a reboot without linger) — `clipengine supervisor boot`")
+    else:
+        svc = ("not installed — `clipengine supervisor install`" if kind != "none"
+               else "not installed — `clipengine supervisor install` (the engine's keeper runs it here)")
     lines = [f"supervisor: {svc}"]
+    if want:
+        lines.append(f"after a reboot: {boot_mode(want.get('kind'))}")
     lead = st["leader"]
     if st["stopped"]:
         lines.append(f"leader: stopped on purpose by {st['stopped'].get('by')} — `clipengine autopilot start` resumes")

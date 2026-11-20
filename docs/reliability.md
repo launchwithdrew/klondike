@@ -2,11 +2,15 @@
 
 ## The supervisor
 `clipengine supervisor install` (once per machine) runs the autopilot as a native service: a launchd LaunchAgent
-on macOS (starts at login) or a systemd user service on Linux (starts at login; run `loginctl enable-linger`
-once to start at boot). The system restarts it within 30 seconds of any exit that wasn't `clipengine autopilot
-stop`. A stop stays in force across reboots until `clipengine autopilot start`. On a host with neither (a
-container, an ephemeral machine), `supervisor status` says DEGRADED: the autopilot runs detached and a death is
-only noticed by a sentinel or the next command.
+on macOS (starts at login) or a systemd user service on Linux. The system restarts it within 30 seconds of any
+exit that wasn't `clipengine autopilot stop`. A stop stays in force across reboots until `autopilot start`.
+
+Where neither can run (a container), the engine's own keeper does the same job. After a reboot it comes back:
+- at login (macOS), or at boot with systemd linger;
+- else through a `@reboot` line the install adds to your crontab (`supervisor boot`);
+- else at the next engine command (`attention`, `doctor`, `supervisor status`).
+
+`supervisor status` and `doctor` say which applies on your host.
 
 There is one capture leader per installation: an OS lock that a killed process releases at once. A service, a
 manual start and a sentinel's revival can't run two loops. A heartbeat every 30 seconds runs beside the cycle, so
