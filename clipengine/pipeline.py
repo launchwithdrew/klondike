@@ -156,6 +156,9 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
         sf = SF.screen(c["transcript_text"], (c.get("crowd") or {}).get("titles"),
                        [t for t, n in c["chat_context"]])
         c["safety"] = sf
+        dh = SF.death_hint(c["transcript_text"], (c.get("crowd") or {}).get("titles"), [t for t, n in c["chat_context"]])
+        if dh:
+            c["flags"] = c["flags"] + [f"death screen? ({dh})"]
         if sf["flagged"]:
             c["flags"] = ["SEXUAL CONTENT — " + sf["why"]] + c["flags"]
             c["score"] = round(c["score"] * 0.15, 2)

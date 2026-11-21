@@ -5476,3 +5476,21 @@ def test_a_verdict_is_tied_to_the_viewed_artifact_and_a_retry_records_it_once(tm
     Image.new("RGB", (40, 60), "red").save(sheet)                  # a re-render: a new artifact
     JG.record(draft, "ship", "changed my mind")
     assert [r["verdict"] for r in rows()] == ["drop", "ship", "ship"] and rows()[1]["artifact"] != rows()[2]["artifact"]
+
+
+def test_death_screens_are_flagged_never_urgent_and_penalised_only_where_the_channel_says(monkeypatch):
+    """A channel rule: no death screens. The engine can't see the screen, so it flags death
+    wording for a look at the frames; chat's 'dead' / 💀 (laughing) never counts."""
+    from clipengine import safety as SF, sentinel as SN, grade as G
+    assert SF.death_hint("oh no he died on the bridge") == "said: he died"
+    assert SF.death_hint("", ["Streamer A got WASTED"]) == "titled: wasted"
+    assert "chat: 8 F / RIP / wasted" in SF.death_hint("", [], ["F"] * 8 + ["lol"] * 20)
+    assert SF.death_hint("im dead 💀 lmao that was so funny", ["funniest moment"], ["dead", "💀💀", "LMAO"] * 5) is None
+    assert SF.death_hint("", [], ["F"] * 2 + ["lol"] * 200) is None                 # two F's in a busy chat: noise
+    r = {"best": 88, "status": "new", "parts": "sp 9s ch .9 au .9 re .80 cr 2", "flags": ["death screen? (said: he died)"]}
+    assert not SN.is_urgent(r)                                    # not even viewers clipping it makes it urgent
+    assert "possible death screen — check the frames" in SN.confidence_markers(r)
+    sig = {"chat_score": 30, "audio_factor": 1.3, "age_h": 0, "flags": ["death screen? (titled: wasted)"]}
+    engine_default = G.engine_score(sig, G.DEFAULTS)["score"]
+    house = G.engine_score(sig, {**G.DEFAULTS, "penalties": {**G.DEFAULTS["penalties"], "death": 0.5}})
+    assert engine_default > 0 and house["score"] == round(engine_default * 0.5, 1) and "death ×0.5" in house["why"]

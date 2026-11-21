@@ -820,6 +820,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     vis = VI.check(src, s - first, e - s)
     sig = G.signals_from_live(out, login, s, e, in_win)
     sf = SF.screen(said, titles=sig.get("titles"), chat_lines=chat_lines)
+    death = SF.death_hint(said, sig.get("titles"), chat_lines)
     sig["chat_score"] = chat_score_from_p(moment["p"])
     if moment.get("crowd_new"):                     # viewers already clipping it: strong early crowd signal
         sig["crowd_vpm"] = (sig.get("crowd_vpm") or 0) + 5 * moment["crowd_new"]
@@ -829,7 +830,8 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     sig["flags"] = (sig.get("flags") or []) + vis["flags"] + \
         ([f"recording from {game}, not {target_game()}"] if bad_game else []) + \
         ([f"names? {', '.join(f'{h}→{r}' for h, r in misheard)}"] if misheard else []) + \
-        ([] if win["clean"] else ["cut mid-sentence (no pause near the payoff)"])
+        ([] if win["clean"] else ["cut mid-sentence (no pause near the payoff)"]) + \
+        ([f"death screen? ({death})"] if death else [])
     sig["unsafe"] = sf["why"] if sf["flagged"] else ""
     sig["wrong_game"] = bad_game
     eng = G.engine_score(sig)
@@ -975,6 +977,8 @@ def is_urgent(r: dict) -> bool:
     built on chat + loudness alone is NOT urgent: it waits in the queue as unconfirmed until the frames are looked at."""
     if r.get("unsafe") or r.get("status") not in (None, "new"):
         return False
+    if any("death screen?" in str(f) for f in r.get("flags") or []):
+        return False                                   # look at the frames first, however hot it is
     corr = corroboration(r)
     if "viewers clipped it" in corr:
         return True
@@ -996,6 +1000,8 @@ def confidence_markers(r: dict) -> list[str]:
         out.append("speaker tags uncertain")
     if unconfirmed(r):
         out.append("unconfirmed: chat + loudness only")
+    if any("death screen?" in str(f) for f in r.get("flags") or []):
+        out.append("possible death screen — check the frames")
     return out
 
 

@@ -11,6 +11,10 @@ cutscenes, menus and loading screens.
 **Only you catch these — look at the frames:** nudity, body close-ups, zoomed shots, strip clubs,
 gambling, a song playing as the clip (copyright claim).
 
+**Deaths:** the engine flags `death screen?` when the words around a moment point at a death ("he died", a viewer
+clip titled "wasted", an F wall in chat). Such a draft is never urgent and says `possible death screen — check the
+frames`. If your channel doesn't post deaths, set `"penalties": {"death": 0.5}` in `config/grading.json`.
+
 **Headlines:** true to what's on screen; never invent a number, name or event.
 
 `--frames-checked` means you looked at the frames and read the captions. Never pass it otherwise.

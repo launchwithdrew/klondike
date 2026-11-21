@@ -82,7 +82,7 @@ def _penalty(flags: list[str], cfg: dict) -> tuple[float, list[str]]:
         for key, needle in (("poll", "chat was asked"), ("music", "music"), ("lyrics", "lyrics"),
                             ("dead_open", "dead open"), ("silent", "silent stretch"), ("thin", "thin speech"),
                             ("cutscene", "cutscene"), ("static", "static ("), ("dark", "dark ("),
-                            ("menu", "menu/map screens")):
+                            ("menu", "menu/map screens"), ("death", "death screen?")):
             if key not in pen:
                 continue
             if needle in fl:

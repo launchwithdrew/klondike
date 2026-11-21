@@ -310,3 +310,17 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.19
+
+- Possible death screens are flagged. The engine can't see the screen, so it reads the words around a moment: "he died", a viewer clip titled "wasted", "F in chat", RIPs, blood, a corpse.
+  - Chat's "dead" and 💀, which mean laughing, never count.
+  - A flagged draft is never URGENT and shows `possible death screen — check the frames`.
+  - The score is unchanged unless your channel opts in: `"penalties": {"death": 0.5}` in `config/grading.json` halves it.
+
+Export diff
+- Added (0)
+- Changed (8): `VERSION`, `clipengine/__init__.py`, `clipengine/grade.py`, `clipengine/pipeline.py`, `clipengine/safety.py`, `clipengine/sentinel.py`, `rules/safety.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

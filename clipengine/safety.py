@@ -38,6 +38,33 @@ def scan_text(*texts: str) -> list[str]:
     return hits
 
 
+# Death screens: a death as the payoff (a body, gore, GTA's WASTED screen). Specific wording only — in stream chat
+# "dead" and 💀 mean laughing, so they never count.
+_DEATH = re.compile(r"\bwasted\b|\b(?:he|she|they|i|we|you|bro)\s+(?:just\s+)?died\b|\bdied\b|\bkilled\s+(?:him|her|me)\b"
+                    r"|\b(?:he|she)(?:'s| is)\s+gone\b|\brip\b|\bf\s+in\s+(?:the\s+)?chat\b|\bcorpse\b|\bdead\s+body\b"
+                    r"|\bblood(?:y)?\b", re.I)
+_DEATH_CHAT = re.compile(r"^\s*(?:f|o7|rip|wasted|bigsad)\s*$|\brip\b|\bwasted\b", re.I)
+
+
+def death_hint(transcript: str = "", titles: list[str] | None = None, chat_lines: list[str] | None = None) -> str | None:
+    """Wording that says the moment is a death (a possible death screen). Any match in what was said or in a viewer-
+    clip title counts; chat needs many people on it (an F wall, RIPs). None when nothing points at a death. It flags
+    for a look at the frames — the engine can't see the screen."""
+    said = sorted({m.group(0).lower() for m in _DEATH.finditer(transcript or "")})
+    titled = sorted({m.group(0).lower() for t in titles or [] for m in _DEATH.finditer(t or "")})
+    lines = chat_lines or []
+    chat_n = sum(1 for c in lines if _DEATH_CHAT.search(c or ""))
+    chat_hot = chat_n >= max(5, 0.05 * len(lines))
+    why = []
+    if said:
+        why.append("said: " + ", ".join(said[:3]))
+    if titled:
+        why.append("titled: " + ", ".join(titled[:3]))
+    if chat_hot:
+        why.append(f"chat: {chat_n} F / RIP / wasted")
+    return "; ".join(why) or None
+
+
 def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: list[str] | None = None,
            headline: str = "") -> dict:
     """{'flagged': bool, 'why': str, 'hits': [...]}. Two or more distinct sexual
