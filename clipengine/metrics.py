@@ -134,7 +134,7 @@ def coverage(root: str, since: float, now: float) -> dict:
                    "either nobody streamed or no cycle ran")
     recs = _rec_dirs(root)
     cov = _json(os.path.join(root, "runs", "coverage.json"))
-    vod_mark = float(cov.get("catchup_until") or 0)
+    vod_mark = max(float(cov.get("catchup_until") or 0), float(cov.get("sweep_until") or 0))   # completed scans
     roster = _json(os.path.join(root, "config", "creators.json")).get("creators", {})
     live_s = rec_s = vod_s = 0.0
     holes, explained, ads, per = 0, 0, 0, {}
@@ -167,6 +167,7 @@ def coverage(root: str, since: float, now: float) -> dict:
     return {"live_min": round(live_s / 60), "recorded_min": round(rec_s / 60),
             "observed_share": round(rec_s / live_s, 3) if live_s else None,
             "catchup_covered_min": round(vod_s / 60), "unknown_min": round(max(0.0, live_s - rec_s - vod_s) / 60),
+            "covered_share": round((rec_s + vod_s) / live_s, 3) if live_s else None,
             "streams": len(live), "incidents": len(inc), "dark_min": round(sum(dark) / 60, 1),
             "longest_dark_min": round(max(dark) / 60, 1) if dark else 0.0,
             "uptime_share": round(1 - sum(dark) / (now - since), 4),
@@ -280,13 +281,15 @@ def speed(root: str, since: float, now: float) -> dict:
         t = _ts(r.get("at"))
         if r.get("slug") and t:
             first_live[r["slug"]] = min(t, first_live.get(r["slug"], t))
-    stages = {"moment→draft": [], "draft→review": [], "draft→pre-render": [], "moment→live": []}
+    stages = {"moment→draft": [], "moment→draft (live)": [], "moment→draft (catch-up)": [], "draft→review": [],
+              "draft→pre-render": [], "moment→live": []}
     for d in drafts:
         m, made = _moment(d), _ts(d.get("drafted_at"))
         if made is None or not since <= made <= now:
             continue
         if m and made >= m:
             stages["moment→draft"].append((made - m) / 60)
+            stages["moment→draft (catch-up)" if d.get("scan") else "moment→draft (live)"].append((made - m) / 60)
         seen = _ts(d.get("seen_at")) or _ts(d.get("judged_at"))
         if seen and seen >= made:
             stages["draft→review"].append((seen - made) / 60)
@@ -468,7 +471,8 @@ def lines(rep: dict) -> list[str]:
     c = rep["coverage"]
     out.append("coverage   " + (_f(c) if "unavailable" in c else
                f"{c['recorded_min']}/{c['live_min']} live min recorded ({c['observed_share']:.0%}) over {c['streams']} "
-               f"stream(s) · catch-up covered {c['catchup_covered_min']} · unknown {c['unknown_min']} · uptime "
+               f"stream(s) · scanned from saved streams (catch-up / sweep: chat + viewer clips) "
+               f"{c['catchup_covered_min']} · covered in all {c['covered_share']:.0%} · unknown {c['unknown_min']} · uptime "
                f"{c['uptime_share']:.1%} ({c['incidents']} incident(s), longest dark {c['longest_dark_min']} min) · "
                f"holes>10s {c['holes_over_10s']} ({c['holes_explained']} explained, {c['holes_ads']} ads) · "
                f"{c['heartbeat_monitor']}"))

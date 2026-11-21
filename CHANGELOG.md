@@ -237,3 +237,17 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.15
+
+- The engine's own Chrome poster never posts from a copy that can't update. If `git pull` fails on the machine running it (lost git access, an expired key), it stops posting and says why once an hour. It used to keep trying to post from its out-of-date outbox and post ledger, which risked re-uploading clips already posted elsewhere.
+- A poster error that repeats now alerts once an hour instead of every minute.
+- `metrics` coverage counts minutes scanned from saved streams by the 30-minute sweep (chat and viewer clips), not only recorded minutes. It shows recorded, scanned, total covered and truly unknown minutes. moment→draft is also split into live drafts and catch-up drafts, so slow saved-stream drafts don't hide the live speed.
+- A timing-sensitive keeper test now waits long enough on a busy machine.
+
+Export diff
+- Added (0)
+- Changed (6): `VERSION`, `clipengine/__init__.py`, `clipengine/metrics.py`, `engine/lib.mjs`, `engine/post.mjs`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

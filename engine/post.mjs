@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { ROOT, SYNC, OUTBOX, agentPosts, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, acquireLock, probe } from './lib.mjs';
+import { ROOT, SYNC, OUTBOX, agentPosts, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, notifyOnce, acquireLock, probe } from './lib.mjs';
 import { postYouTube, checkYouTube } from './youtube.mjs';
 import { postInstagram, checkInstagram } from './instagram.mjs';
 import { postTikTok, checkTikTok } from './tiktok.mjs';
@@ -110,9 +110,17 @@ async function processItem(ctx, dir) {
 // Repo sync: pull new drops from the cloud clipping session; push ledger + moves back.
 const GIT_ENV = { ...process.env, GIT_SSH_COMMAND: 'ssh -o StrictHostKeyChecking=accept-new' };
 function git(...a) { return execFileSync('git', ['-C', ROOT, ...a], { env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim(); }
+// true when this checkout is current. A poster that can't pull never posts: its ledger and outbox may be days old, and
+// posting from them re-uploads clips another machine (or the agent) already posted.
+let pullError = '';
 function pull() {
-  if (!SYNC) return;               // a public copy gets engine releases only through `clipengine update`
-  try { git('pull', '--rebase', '--autostash', '-q'); } catch (e) { log('git pull failed:', String(e.stderr || e.message).split('\n')[0]); }
+  if (!SYNC) return true;          // a public copy gets engine releases only through `clipengine update`
+  try { git('pull', '--rebase', '--autostash', '-q'); pullError = ''; return true; }
+  catch (e) { pullError = String(e.stderr || e.message).split('\n')[0]; log('git pull failed:', pullError); return false; }
+}
+function staleStop() {
+  notifyOnce('pull-failed', 'clipengine: poster paused',
+    `git pull fails here (${pullError.slice(0, 80)}) — not posting from an out-of-date copy. Fix git access or stop this service.`);
 }
 function pushResults(msg) {
   if (DRY || !SYNC) return;
@@ -135,7 +143,7 @@ function standDown() {
 }
 
 async function runOnce(ctx) {
-  pull();
+  if (!pull()) { staleStop(); return; }
   const items = readyItems();
   for (const dir of items) await processItem(ctx, dir);
   if (items.length) pushResults(`engine: processed ${items.map(d => path.basename(d)).join(', ')}`);
@@ -172,7 +180,7 @@ async function main() {
       try {
         do {
           again = false;
-          pull();
+          if (!pull()) { staleStop(); break; }
           if (standDown()) break;
           const items = readyItems();
           if (!items.length) break;
@@ -180,7 +188,10 @@ async function main() {
           try { for (const dir of items) await processItem(ctx, dir); } finally { await ctx.close().catch(() => {}); }
           pushResults(`engine: processed ${items.map(d => path.basename(d)).join(', ')}`);
         } while (again);
-      } catch (e) { log('watch error:', e.message); notify('clipengine: engine error', e.message.slice(0, 120)); }
+      } catch (e) {
+        log('watch error:', e.message);
+        notifyOnce('err:' + e.message.split('\n')[0].slice(0, 60), 'clipengine: engine error', e.message.slice(0, 120));
+      }
       busy = false;
     };
     fs.watch(OUTBOX, { recursive: true }, (_e, f) => { if (f && f.endsWith('post.json')) setTimeout(tick, 1500); });

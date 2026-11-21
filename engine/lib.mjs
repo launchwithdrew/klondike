@@ -61,6 +61,19 @@ export function alreadyLive(platform, slug, hash) {
   return readLedger().find(r => r.platform === platform && r.status === 'live' && (r.slug === slug || (hash && r.sha256 === hash)));
 }
 
+// The same error again within the hour is not a new pop-up (a failing poster used to alert every minute).
+export function notifyOnce(key, title, msg, everyMs = 3600_000) {
+  const p = path.join(LOGS, 'notified.json');
+  let seen = {};
+  try { seen = JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
+  const now = Date.now();
+  if (seen[key] && now - seen[key] < everyMs) return false;
+  seen[key] = now;
+  try { fs.mkdirSync(LOGS, { recursive: true }); fs.writeFileSync(p, JSON.stringify(seen)); } catch {}
+  notify(title, msg);
+  return true;
+}
+
 export function notify(title, msg) {
   if (process.platform !== 'darwin') return;   // Mac pop-ups only; everywhere else the log line is the record
   try {

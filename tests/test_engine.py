@@ -774,7 +774,7 @@ def test_public_copy_never_commits_or_pushes(tmp_path, monkeypatch):
     post = open(os.path.join(ROOT, "engine", "post.mjs")).read()
     stats = open(os.path.join(ROOT, "engine", "stats.mjs")).read()
     assert ".public-build" in drop and ".public-build" in lib
-    assert "if (!SYNC) return;" in post and "if (DRY || !SYNC) return;" in post and "|| !SYNC) return;" in stats
+    assert "if (!SYNC) return true;" in post and "if (DRY || !SYNC) return;" in post and "|| !SYNC) return;" in stats
 
 
 def test_public_init_needs_the_users_yes_to_the_risks(tmp_path, monkeypatch, capsys):
@@ -4362,7 +4362,7 @@ def test_the_keeper_restarts_after_any_exit_that_was_not_a_stop(tmp_path):
     gate, out = _th.Event(), []
     t = _th.Thread(target=lambda: out.append(SV.keep(5, root=root, run=lambda cmd: gate.wait(10) and 0)))
     t.start()
-    for _ in range(50):
+    for _ in range(200):                                     # up to 10 s: a loaded test machine is slow to start it
         if SV.keeper_alive(root):
             break
         time.sleep(0.05)
@@ -5246,6 +5246,8 @@ def test_weekly_metrics_cover_all_six_sections_with_samples_and_reasons(tmp_path
     assert k["late_rejects"] == 1 and "unavailable" in k["false_rejects"] and k["filter_gate"].startswith("advisory")
     s = rep["speed"]
     assert s["stages"]["moment→draft"]["n"] == 2 and s["stages"]["draft→review"]["p50_min"] == 10.0
+    assert s["stages"]["moment→draft (live)"]["n"] == 2 and s["stages"]["moment→draft (catch-up)"]["n"] == 0
+    assert c["covered_share"] == round(60 / 90, 3)
     assert "unavailable" in s["stock"] and s["claim_to_live"]["p50_min"] == round(400 / 60, 1)
     p = rep["publishing"]
     assert p["verified_by_platform"] == {"tiktok": {"links": 1, "verified": 1}} and p["overrides_excluded"] == 1
@@ -5285,3 +5287,21 @@ def test_metrics_cli_prints_and_saves(tmp_path, monkeypatch, capsys):
     assert M.main(["metrics", "--save"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("metrics ") and "saved runs/metrics/week-" in out
+
+
+def test_the_spare_poster_never_posts_from_a_copy_that_cannot_pull(tmp_path):
+    """Regression (Nov 21): a Mac's spare poster whose `git pull` failed kept trying to post from a days-old outbox
+    and ledger (it never learned post_with "agent"), alerting every minute."""
+    post = open(os.path.join(ROOT, "engine", "post.mjs")).read()
+    lib = open(os.path.join(ROOT, "engine", "lib.mjs")).read()
+    assert post.count("if (!pull()) { staleStop();") == 2                 # the watch loop and a single run
+    i = post.index("if (!pull()) { staleStop(); break; }")
+    assert i < post.index("const items = readyItems();", i)                 # before anything is read or posted
+    assert "notifyOnce('err:'" in post and "export function notifyOnce" in lib
+    js = (f"process.chdir({json.dumps(str(tmp_path))});"
+          "import('" + os.path.join(ROOT, "engine", "lib.mjs") + "').then(L => {"
+          "const a = L.notifyOnce('k-test-" + str(os.getpid()) + "', 't', 'm', 60000);"
+          "const b = L.notifyOnce('k-test-" + str(os.getpid()) + "', 't', 'm', 60000);"
+          "console.log(JSON.stringify([a, b])); })")
+    out = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=60, cwd=os.path.join(ROOT, "engine"))
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == [True, False], out.stderr
