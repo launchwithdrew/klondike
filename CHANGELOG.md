@@ -251,3 +251,16 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.16
+
+- A draft with a high score built only on chat and loudness is no longer marked 🔥URGENT. Both signals max out on any busy stretch: a walk through the woods and a car tipping over scored 90 and 88 with nothing else behind them, and an editor skipped both on the frames.
+  - URGENT now means viewers are clipping it, or a high score where the streamer's own reaction backs it up.
+  - Other high scorers stay in the queue, marked "unconfirmed: chat + loudness only", for a look at the frames. The score itself is unchanged, so a real winner still posts once its frames are checked.
+
+Export diff
+- Added (0)
+- Changed (5): `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/sentinel.py`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

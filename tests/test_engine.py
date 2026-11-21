@@ -1618,7 +1618,7 @@ def test_attention_items_mark_overdue_posts(tmp_path, monkeypatch):
     monkeypatch.setattr(HP, "due", lambda now=None: [{"slug": "clip-a", "file": str(d / "clip.mp4"),
                                                       "now": ["tiktok", "youtube"], "later": {}}])
     monkeypatch.setattr(HP, "to_measure", lambda *a, **kw: [])
-    items = O._attention_items([{"id": "streamera-1", "best": 80}], {}, {"report_day": "d", "report_text": "REPORT"}, now)
+    items = O._attention_items([{"id": "streamera-1", "best": 80, "parts": "sp 4s ch .9 au .9 re .70 cr –"}], {}, {"report_day": "d", "report_text": "REPORT"}, now)
     kinds = {i["key"]: i["kind"] for i in items}
     assert kinds == {"draft:streamera-1": "urgent", "overdue:clip-a:tiktok": "overdue", "overdue:clip-a:youtube": "overdue",
                      "report:d": "report"}
@@ -2891,7 +2891,13 @@ def test_full_scout_cap_grows_with_room_and_shrinks_under_strain():
 
 def test_urgent_drafts_go_first_and_say_so():
     from clipengine import sentinel as SN, attention as AT
-    assert SN.is_urgent({"best": 80, "status": "new"})                              # can clear TikTok/Instagram
+    assert SN.is_urgent({"best": 80, "status": "new", "parts": "sp 4s ch .9 au .9 re .70 cr –"})  # clears TT/IG, streamer reacts
+    # Nov 20 regression: a woods walk scored best 90 on chat .98 + audio 1.0 alone — not urgent, marked unconfirmed
+    woods = {"best": 90.5, "status": "new", "judgment": {"parts": {"crowd": None, "chat": 0.98, "audio": 1.0}, "reaction": None}}
+    assert not SN.is_urgent(woods) and SN.unconfirmed(woods) and SN.corroboration(woods) == []
+    car = {"best": 88, "status": "new", "parts": "sp 4s ch .95 au .80 re .30 cr –"}         # thin speech, weak reaction
+    assert not SN.is_urgent(car) and SN.unconfirmed(car)
+    assert SN.corroboration({"titles": ["he flipped it"]}) == ["viewers clipped it"]
     assert SN.is_urgent({"best": 62, "status": "new", "parts": "sp 4s ch .5 au .9 re .3 cr 2"})   # viewers clipping
     assert SN.is_urgent({"best": 62, "status": "new", "via": "catch-up (crowd)"})
     assert not SN.is_urgent({"best": 62, "status": "new", "parts": "sp 4s ch .5 au .9 re .3 cr –"})
@@ -3798,7 +3804,8 @@ def test_house_queue_uses_best_angle_without_hiding_other_moments():
     from clipengine import scouts
 
     rows = [{"id": "a-1", "login": "streamera", "start": 900, "stop": 940, "payoff": 920, "best": 74},
-            {"id": "b-1", "login": "streamerb", "start": 925, "stop": 965, "payoff": 945, "best": 83},
+            {"id": "b-1", "login": "streamerb", "start": 925, "stop": 965, "payoff": 945, "best": 83,
+             "parts": "sp 9s ch .8 au .7 re .65 cr –"},
             {"id": "a-2", "login": "streamera", "start": 1100, "stop": 1140, "payoff": 1120, "best": 79}]
     roster = {login: {"house": "studio"} for login in ("streamera", "streamerb")}
     grouped = scouts.group_angles(rows, roster, [])

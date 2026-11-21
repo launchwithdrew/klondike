@@ -943,13 +943,47 @@ def set_status(entry: dict, status: str, **extra) -> None:
 URGENT_BEST = 75.0          # a draft that can clear TikTok/Instagram's bar…
 
 
+CARRY_REACTION = 0.6        # the streamer's own reaction (laugh / volume burst) at least this strong
+
+
+def _part(r: dict, key: str, line_key: str) -> float | None:
+    m = re.search(rf"\b{line_key} ([0-9.]+)", str(r.get("parts") or ""))
+    if m:
+        return float(m.group(1))
+    v = ((r.get("judgment") or {}).get("parts") or {}).get(key)
+    return None if v is None else float(v)
+
+
+def corroboration(r: dict) -> list[str]:
+    """What, besides chat and loudness, says something happened: viewers clipping it, or the streamer's own
+    reaction. Chat and loudness both saturate on any busy stretch (Nov 20: a woods walk and a car tipping over scored
+    best 90 / 88 on chat .98 + audio 1.0 alone and were skipped on frames)."""
+    out = []
+    crowd = _part(r, "crowd", "cr") or float((r.get("features") or {}).get("crowd_new") or 0)
+    if crowd > 0 or "crowd" in str(r.get("via") or "") or "viewer clip" in str(r.get("via") or "") or r.get("titles"):
+        out.append("viewers clipped it")
+    react = _part(r, "reaction", "re")
+    if react is None:
+        react = (r.get("judgment") or {}).get("reaction")
+    if react is not None and float(react) >= CARRY_REACTION:
+        out.append("streamer reacts")
+    return out
+
+
 def is_urgent(r: dict) -> bool:
-    """…or one viewers are already clipping: a race to be first — it goes to the top and pings the phone."""
+    """…or one viewers are already clipping: a race to be first — it goes to the top and pings the phone. A high score
+    built on chat + loudness alone is NOT urgent: it waits in the queue as unconfirmed until the frames are looked at."""
     if r.get("unsafe") or r.get("status") not in (None, "new"):
         return False
-    m = re.search(r"\bcr ([0-9.]+)", str(r.get("parts") or ""))
-    crowd = float(m.group(1)) if m else float((r.get("features") or {}).get("crowd_new") or 0)
-    return float(r.get("best") or 0) >= URGENT_BEST or crowd > 0 or "crowd" in str(r.get("via") or "")
+    corr = corroboration(r)
+    if "viewers clipped it" in corr:
+        return True
+    return float(r.get("best") or 0) >= URGENT_BEST and bool(corr)
+
+
+def unconfirmed(r: dict) -> bool:
+    """A banger-level score with nothing but chat and loudness behind it."""
+    return float(r.get("best") or 0) >= URGENT_BEST and not corroboration(r)
 
 
 def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_age_h: float = 6.0, seen: bool = True) -> list[dict]:
@@ -988,6 +1022,8 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
             confidence.append("thin speech")
         if speakers.get("backend") in {"stats", "hints"}:
             confidence.append("speaker tags uncertain")
+        if unconfirmed(r):
+            confidence.append("unconfirmed: chat + loudness only")
         if confidence:
             mark += " · " + " · ".join(confidence)
         if r.get("triage") in ("preview", "review") and r.get("status") == "new":

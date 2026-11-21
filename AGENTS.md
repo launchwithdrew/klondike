@@ -61,7 +61,7 @@ Streamers with subscriber-only saved streams are noticed by themselves and get a
 A streamer who doesn't allow clipping: `"policy": "never"` in `config/creators.json`.
 Backups: `backup` / `restore FILE`; new machine: `migrate` (docs/moving.md).
 
-**Be first:** 🔥URGENT drafts (can clear TikTok/Instagram, or viewers are clipping it) lead `queue` and
+**Be first:** 🔥URGENT drafts (viewers clipping it, or a high score the streamer reacts to) lead `queue` and
 `attention` — open them first; check `attention` every 5 min while streams are live.
 **Safe to run without asking:** `doctor`, `cycle`, `attention`, `queue`, `sentinels`, `radar`, `scouts`,
 `report`, `to-post`, `to-measure`, `facecam`, `publish(-queued)` without `--post`. Ask first: `--post`, `posted`,
