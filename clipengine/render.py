@@ -232,6 +232,12 @@ def render(*a, **k) -> dict:
     from . import finish as FN
     with slot("render"):
         info = _render(*a, **k)
+    try:
+        from .admission import note_media
+        s, e = (a[2], a[3]) if len(a) > 3 else (k.get("start_s"), k.get("end_s"))
+        note_media("render", float(e) - float(s))
+    except (TypeError, ValueError):
+        pass
     out = a[5] if len(a) > 5 else k.get("out")
     if out:
         FN.write_receipt(out, "render")                 # which finish this clip has (finish.py)

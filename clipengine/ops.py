@@ -854,6 +854,12 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
         lines.append("stats: " + (tail[-90:] if r.returncode == 0 else f"failed — {(r.stderr or tail)[-90:]}"))
     today = dt.datetime.now(dt.timezone.utc)
     test_run = os.environ.get("CLIPENGINE_NO_SYNC") == "1"      # a test run never rewrites tracked data
+    if not test_run:
+        try:
+            from . import metrics as MX
+            MX.note_stock()                                   # one reserve-stock sample for the weekly metrics
+        except Exception:
+            pass
     if not test_run and today.hour >= cfg["learn_daily_after_utc"] and state.get("learn_day") != today.strftime("%Y-%m-%d"):
         from . import learn as LN
         import contextlib, io

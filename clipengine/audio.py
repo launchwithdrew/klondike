@@ -250,9 +250,11 @@ def better_pass(first: dict, second: dict) -> bool:
 def transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:
     """Transcription is heavy work: it waits its turn for a heavy-job slot (admission.py) so recording keeps
     the machine first."""
-    from .admission import slot
+    from .admission import slot, note_media
     with slot("transcribe"):
-        return _transcribe(x, model_name, offset, prompt)
+        out = _transcribe(x, model_name, offset, prompt)
+    note_media("transcribe", len(x) / SR)
+    return out
 
 
 def _transcribe(x: np.ndarray, model_name: str = "small", offset: float = 0.0, prompt: str | None = "") -> dict:

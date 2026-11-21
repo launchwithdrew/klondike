@@ -218,3 +218,22 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.14
+
+- `clipengine metrics`: the weekly numbers that show what changed. Each number comes with its time window, host profile and sample count, or the reason it isn't available (never a silent zero).
+  - Coverage: recorded vs live minutes, minutes covered by catch-up, unknown minutes, uptime, longest outage, holes over 10 s (explained and ad breaks), and whether an off-host heartbeat monitor is set.
+  - Overnight (local 00–08): live minutes, live vs saved-stream drafts, approved winners, muted payoffs per probed window by route, or "no stream".
+  - Cost per 100 drafts: transcriptions and their audio minutes, final encodes, heavy-job time, early and late rejects. The early filter stays advisory until held-out evidence meets the rollout gate.
+  - Speed: p50/p90 for moment→draft, draft→review, draft→pre-render and moment→live, reserve stock (hours under two ready clips), daily yield, claim→live.
+  - Publishing: approved moments per day, verified links per platform, missed slots by reason, 1 h/24 h/72 h reads, missing reads kept apart from zero views, overrides left out.
+  - Recommendations: posting hours from measured performance (timezone, observations, date range), else the configured prime hours, plus the score of last week's predictions.
+- `--save` keeps a week. `--compare A B` puts two saved weeks side by side, with absolute numbers and ratios.
+- New records behind it: the audio minutes of each transcription and the video seconds of each encode (`runs/heavy/work.jsonl`), and one reserve-stock sample per cycle (`runs/metrics/stock.jsonl`).
+
+Export diff
+- Added (1): `clipengine/metrics.py`
+- Changed (10): `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/admission.py`, `clipengine/audio.py`, `clipengine/ops.py`, `clipengine/render.py`, `docs/earning.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

@@ -175,6 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     bk_.add_argument("--to", help="folder for the zip (default runs/backups)")
     rs_ = sub.add_parser("restore", help="put a backup zip back (backs up what's there first)")
     rs_.add_argument("file")
+    mx_ = sub.add_parser("metrics", help="the weekly numbers: coverage, overnight yield, cost, speed, publishing, recommendations")
+    mx_.add_argument("--days", type=float, default=7.0)
+    mx_.add_argument("--save", action="store_true", help="also write runs/metrics/week-<date>.json")
+    mx_.add_argument("--json", action="store_true")
+    mx_.add_argument("--compare", nargs=2, metavar=("A", "B"), help="two saved weeks side by side")
     mg_ = sub.add_parser("migrate", help="move to another machine: snapshot, verify, shadow, release, takeover, status")
     mg_.add_argument("action", choices=["snapshot", "verify", "shadow", "release", "takeover", "status"])
     mg_.add_argument("file", nargs="?", help="verify: the snapshot zip")
@@ -425,6 +430,16 @@ def main(argv: list[str] | None = None) -> int:
             if AP.autopilot_died():
                 SV.reconcile(None, root=AP._root())
             print("\n".join(SV.status_lines(AP._root())))
+        return 0
+    if a.cmd == "metrics":
+        from . import metrics as MX
+        if a.compare:
+            print("\n".join(MX.compare(*a.compare)))
+            return 0
+        rep = MX.weekly(days=a.days)
+        print(json.dumps(rep, indent=1, default=str) if a.json else "\n".join(MX.lines(rep)))
+        if a.save:
+            print(f"saved {os.path.relpath(MX.save(rep), MX.REPO)}")
         return 0
     if a.cmd == "migrate":
         from . import migrate as MG

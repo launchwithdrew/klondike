@@ -5180,3 +5180,108 @@ def test_an_interrupted_restore_is_reported_then_finished(tmp_path):
     assert AP._finish_restore(str(root)) == len(names)
     assert AP.restore_pending(str(root)) is None and (root / "ledger.jsonl").read_text() == '{"slug": "a"}\n' * 2
     assert AP.restore(snap, root=str(root)) and AP.restore_pending(str(root)) is None
+
+
+# ---- §6: weekly metrics -------------------------------------------------------------------------------------
+
+def _week(root, now):
+    import datetime as _dt
+    iso = lambda t: _dt.datetime.fromtimestamp(t, _dt.timezone.utc).isoformat()
+    w = lambda rel, rows: ((root / rel).parent.mkdir(parents=True, exist_ok=True),
+                           (root / rel).write_text("".join(json.dumps(r) + "\n" for r in rows)))
+    (root / "config").mkdir(parents=True, exist_ok=True)
+    (root / "config" / "distribution.json").write_text(json.dumps({"timezone": "UTC", "prime_hours": [17, 21]}))
+    (root / "config" / "creators.json").write_text(json.dumps({"creators": {"streamera": {}, "streamerb": {"vods": False}}}))
+    (root / "config" / "ops.json").write_text(json.dumps({"profile": "lite"}))
+    night = now - (now % 86400) - 86400 + 2 * 3600                      # yesterday 02:00 UTC
+    (root / "runs").mkdir(parents=True, exist_ok=True)
+    (root / "runs" / ".cycle.json").write_text(json.dumps({"seen_live": {
+        "streamera": [[night, night + 3600]], "streamerb": [[night, night + 1800]]}}))
+    (root / "runs" / "coverage.json").write_text(json.dumps({"catchup_until": night + 3600}))
+    segs = [{"t": night + i * 2.0, "d": 2.0, "f": f"{i}.ts"} for i in range(900)]          # 30 of 60 min recorded
+    w("runs/sentinel-streamera/index.jsonl", segs + [{"t": night + 1900, "d": 40, "gap": "reconnect"},
+                                                      {"t": night + 2000, "d": 30, "gap": "Twitch ad break"}])
+    w("runs/incidents.jsonl", [{"id": "ap-1", "dark_from": now - 3 * 86400, "detected_at": now - 3 * 86400 + 120},
+                               {"id": "ap-1", "status": "recovered", "recovered_at": now - 3 * 86400 + 600}])
+    w("runs/heavy/log.jsonl", [{"at": now - 3600, "stage": "transcribe", "ran_s": 60, "kind": "live"},
+                               {"at": now - 3500, "stage": "render", "ran_s": 120, "kind": "publish"}])
+    w("runs/heavy/work.jsonl", [{"at": now - 3600, "stage": "transcribe", "media_s": 45}])
+    w("runs/heavy/probes.jsonl", [{"at": night + 600, "route": "vod", "skipped": True, "seconds": 60},
+                                  {"at": night + 700, "route": "live", "skipped": False, "seconds": 45}])
+    w("runs/sentinel-streamera/queue.jsonl", [
+        {"id": "d1", "login": "streamera", "rec": str(root / "runs" / "sentinel-streamera"), "start": night + 500,
+         "stop": night + 530, "payoff": night + 520, "drafted_at": iso(night + 700), "seen_at": iso(night + 1300),
+         "status": "new"},
+        {"id": "d2", "login": "streamera", "rec": str(root / "runs" / "sentinel-streamera"), "start": night + 900,
+         "stop": night + 930, "payoff": night + 920, "drafted_at": iso(night + 1000), "status": "skipped"}])
+    (root / "outbox" / "s1").mkdir(parents=True)
+    (root / "outbox" / "s1" / "post.json").write_text(json.dumps({"slug": "s1", "moment_at": iso(night + 520),
+                                                                   "dropped_at": iso(night + 1500), "platforms": ["tiktok"]}))
+    w("ledger.jsonl", [{"slug": "s1", "platform": "tiktok", "url": "https://t/1", "verified_by": "oembed", "at": iso(night + 2400)},
+                       {"slug": "o1", "platform": "youtube", "url": "https://y/1", "override": "owner's call", "at": iso(night + 2500)}])
+    w("data/performance.jsonl", [{"slug": "s1", "platform": "tiktok", "views": 0, "age_h": 2}])
+    w("data/attempts.jsonl", [{"ev": "claim", "id": "a1", "ts": night + 2000}, {"ev": "live", "id": "a1", "ts": night + 2400},
+                              {"ev": "claim", "id": "a2", "ts": night + 2600},
+                              {"ev": "failed", "id": "a2", "ts": night + 2700, "why": "wrong account signed in"}])
+    return night
+
+
+def test_weekly_metrics_cover_all_six_sections_with_samples_and_reasons(tmp_path):
+    from clipengine import metrics as MX
+    now = 1_800_000_000.0
+    root = tmp_path / "inst"
+    night = _week(root, now)
+    rep = MX.weekly(str(root), now)
+    c = rep["coverage"]
+    assert c["live_min"] == 90 and c["recorded_min"] == 30 and c["streams"] == 2
+    assert c["catchup_covered_min"] == 30 and c["unknown_min"] == 30          # streamerb: no VODs, unrecorded → unknown
+    assert c["incidents"] == 1 and c["longest_dark_min"] == 10.0 and c["holes_over_10s"] == 2 and c["holes_ads"] == 1
+    assert c["heartbeat_monitor"].startswith("local only")
+    o = rep["overnight"]
+    n = next(x for x in o["nights"] if x["live_min"] > 0)
+    assert n["winners"] == 1 and n["drafts_live"] == 2 and n["muted_by_route"] == {"vod": "1/1", "live": "0/1"}
+    assert sum(x["outcome"] == "no stream" for x in o["nights"]) >= 5
+    k = rep["cost"]
+    assert k["candidates"] == 2 and k["asr_calls_per_100"] == 50.0 and k["asr_audio_min_per_100"] == 37.5
+    assert k["late_rejects"] == 1 and "unavailable" in k["false_rejects"] and k["filter_gate"].startswith("advisory")
+    s = rep["speed"]
+    assert s["stages"]["moment→draft"]["n"] == 2 and s["stages"]["draft→review"]["p50_min"] == 10.0
+    assert "unavailable" in s["stock"] and s["claim_to_live"]["p50_min"] == round(400 / 60, 1)
+    p = rep["publishing"]
+    assert p["verified_by_platform"] == {"tiktok": {"links": 1, "verified": 1}} and p["overrides_excluded"] == 1
+    assert p["missed_by_reason"]["account"] == 1 and p["zero_view_reads"] == 1 and p["reads"]["1h"] == 1
+    assert p["missing_reads_over_24h"] == 0
+    r = rep["recommend"]
+    assert "evidence thin" in r["tiktok"]["use"] and r["timezone"] == "UTC"
+    assert rep["profile"]["profile"] == "lite"
+    text = "\n".join(MX.lines(rep))
+    for head in ("coverage", "overnight", "cost", "speed", "publishing", "recommend"):
+        assert f"\n{head}" in "\n" + text
+    assert "unavailable —" in text
+
+
+def test_metrics_stock_samples_compare_and_an_empty_install(tmp_path, monkeypatch):
+    from clipengine import metrics as MX, bank as BK
+    now = 1_800_000_000.0
+    empty = MX.weekly(str(tmp_path / "nothing"), now)
+    assert "unavailable" in empty["coverage"] and "unavailable" in empty["cost"]       # no silent zeros
+    root = tmp_path / "inst"; _week(root, now)
+    seq = iter([[], [{"slug": "s1", "state": "ready"}], [{"slug": "s1", "state": "ready"}, {"slug": "s2", "state": "ready"}]])
+    monkeypatch.setattr(BK, "inventory", lambda now=None: next(seq))
+    for i, t in enumerate((now - 7200, now - 3600, now - 1800)):
+        MX.note_stock(str(root), t)
+    sk = MX.weekly(str(root), now)["speed"]["stock"]
+    assert sk["samples"] == 3 and sk["hours_below_two"] == 1.5 and sk["ready_now"] == 2
+    a = MX.save(MX.weekly(str(root), now - 86400), str(root))
+    b = MX.save(MX.weekly(str(root), now), str(root))
+    cmp = "\n".join(MX.compare(a, b))
+    assert "coverage observed_share" in cmp and "B/A" in cmp and "moment→live" in cmp
+
+
+def test_metrics_cli_prints_and_saves(tmp_path, monkeypatch, capsys):
+    from clipengine import __main__ as M, metrics as MX
+    root = tmp_path / "inst"; _week(root, 1_800_000_000.0)
+    monkeypatch.setattr(MX, "REPO", str(root))
+    assert M.main(["metrics", "--save"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("metrics ") and "saved runs/metrics/week-" in out

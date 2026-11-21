@@ -126,6 +126,18 @@ def _log(rec: dict, root: str | None = None) -> None:
         pass
 
 
+def note_media(stage: str, media_s: float, route: str | None = None, root: str | None = None) -> None:
+    """How much media a heavy job processed (audio seconds transcribed, video seconds encoded) — the weekly cost
+    metrics divide by it (metrics.py)."""
+    try:
+        os.makedirs(_dir(root), exist_ok=True)
+        with open(os.path.join(_dir(root), "work.jsonl"), "a") as fh:
+            fh.write(json.dumps({"at": time.time(), "stage": stage, "media_s": round(float(media_s), 1),
+                                 "route": route}) + "\n")
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def slot(stage: str, kind: str | None = None, root: str | None = None, slots: int | None = None,
          min_free_gb: float | None = None, poll_s: float = POLL_S, free=free_gb, say=print):

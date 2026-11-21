@@ -59,7 +59,7 @@ saved streams.
 `kick-check` says `READY (audio mode)`); `yt:@handle` uses live chat when YouTube serves it, else audio.
 Streamers with subscriber-only saved streams are noticed by themselves and get a full sentinel when live.
 A streamer who doesn't allow clipping: `"policy": "never"` in `config/creators.json`.
-Backups: `clipengine backup` / `restore FILE`; new machine: `migrate` (docs/moving.md).
+Backups: `backup` / `restore FILE`; new machine: `migrate` (docs/moving.md).
 
 **Be first:** 🔥URGENT drafts (can clear TikTok/Instagram, or viewers are clipping it) lead `queue` and
 `attention` — open them first; check `attention` every 5 min while streams are live.
@@ -101,7 +101,7 @@ checks the machine. If neither solves it: `docs/troubleshooting.md`, then `docs/
 | Something broken | `docs/troubleshooting.md` |
 | Fixing a bug in the engine yourself | `docs/fixing-bugs.md` |
 | Changing the look, streamers or category | `docs/customizing.md` |
-| Telling the user how it's going | `clipengine report` |
+| Telling the user how it's going | `report`; weekly: `metrics` |
 | Reading analytics, clipping pools, events, payout thresholds | `docs/earning.md` (`to-measure`, `to-submit`) |
 | Getting the newest version | automatic: `cycle` installs each new release (tested here first) |
 | Sharing anonymous results to improve the detector | `docs/insights.md` (opt-in) |

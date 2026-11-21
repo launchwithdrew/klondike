@@ -50,3 +50,15 @@ Partner (1,000 subscribers + 10M Shorts views in 90 days — views summed from o
 TikTok creator program (about 10k followers).
 
 The daily `clipengine report` tracks measured follower and view totals alongside monetization targets and flags analytics reads that are more than 24 hours overdue. Confirm qualified totals and other eligibility requirements in the platforms' own Studio pages. TikTok Creator Rewards also has original-content and duration requirements. [YouTube Partner Program](https://support.google.com/youtube/answer/72851) · [TikTok Creator Rewards](https://support.tiktok.com/en/business-and-creator/creator-rewards-program/creator-rewards-program)
+
+## Weekly numbers
+`clipengine metrics` covers the last 7 days (`--days N`). For each number it shows the window, the host profile
+and the sample count, or why the number is unavailable:
+- coverage: recorded vs live minutes, unknown minutes, uptime, longest outage, holes;
+- overnight winners and muted losses;
+- cost per 100 drafts;
+- p50/p90 speed and reserve stock;
+- links and reads per platform;
+- measured posting hours, once there's enough evidence.
+
+`--save` keeps the week; `--compare A B` puts two saved weeks side by side.
