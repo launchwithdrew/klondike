@@ -2,7 +2,7 @@
 
 # One engine version: doctor, report, the cycle's update line and the public export (Klondike) all show
 # this number, so internal and public copies of the same engine code report the same version.
-__version__ = "0.4.17"
+__version__ = "0.4.18"
 
 
 def version_on_disk(root: str | None = None) -> str:

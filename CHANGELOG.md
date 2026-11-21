@@ -288,3 +288,25 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.18
+
+- Running the test suite no longer writes into your real judging records. Some tests used to append fixture verdicts to `data/judged.jsonl` and `data/censor_caught.jsonl` on every run, including the run `update` does before installing a release, and `eval-judge` then counted them. Every test now gets its own temporary judging folder.
+  - To clean an install that already ran the suite, remove the fixture rows ("StreamerA@1000", "streamera-1"):
+
+    ```
+    python - <<'PY'
+    import json, os
+    p = "data/judged.jsonl"
+    if os.path.exists(p):
+        rows = [l for l in open(p) if l.strip() and json.loads(l).get("id") not in ("StreamerA@1000", "streamera-1")]
+        open(p, "w").writelines(rows)
+    PY
+    ```
+
+Export diff
+- Added (1): `tests/conftest.py`
+- Changed (2): `VERSION`, `clipengine/__init__.py`
+- Removed (0)
+
+Leak scan: clean.
