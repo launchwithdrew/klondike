@@ -14,6 +14,7 @@ import glob
 import io
 import json
 import os
+from pathlib import Path
 import re
 import statistics as st
 import subprocess
@@ -81,6 +82,8 @@ def report_text(days: float = 1.0, now: float | None = None) -> str:
             latest[key] = (at, r)
     snapshots = [r for _, r in latest.values()]
     first = "Nothing went live in this period"
+    if not recent:
+        first += " — " + pipeline_stop(root, since, now)
     if recent:
         count = len({row["slug"] for row in recent})
         platforms = len(recent_keys)
@@ -162,6 +165,37 @@ def report_text(days: float = 1.0, now: float | None = None) -> str:
     elif extras:
         lines[-1] += " · " + " · ".join(extras)
     return "\n".join(lines)
+
+
+def pipeline_stop(root, since: float, now: float) -> str:
+    """Zero posts: where the pipeline stopped — streams watched → drafts → over a bar → judged → dropped → posted."""
+    import glob
+    from . import brief, sentinel
+    runs = os.path.join(str(root), "runs")
+    seen = brief.read(Path(runs) / ".cycle.json", {}).get("seen_live") or {}
+    live = sum(1 for ivs in seen.values() for s, e in ivs if e > since and s < now)
+    rows = [r for r in sentinel.load_queue(runs) if since <= (_ts(r.get("drafted_at")) or _ts(r.get("at")) or 0) <= now]
+    over = [r for r in rows if r.get("status") != "dropped"]
+    judged = [r for r in rows if r.get("status") in ("published", "skipped") or r.get("judged_at")]
+    drops = 0
+    for p in glob.glob(os.path.join(str(root), "outbox", "*", "post.json")):
+        t = _ts(brief.read(Path(p), {}).get("dropped_at"))
+        drops += bool(t and since <= t <= now)
+    funnel = (f"{live} stream session(s) watched → {len(rows)} draft(s) → {len(over)} over a bar → "
+              f"{len(judged)} judged → {drops} dropped → 0 posted")
+    if not live and not rows:
+        where = "no roster creator was live (or no cycle ran)"
+    elif not rows:
+        where = "streams were watched but nothing was drafted"
+    elif not over:
+        where = "every draft fell under every platform's bar"
+    elif not judged:
+        where = f"{len(over)} draft(s) are waiting for a look"
+    elif not drops:
+        where = "the judged drafts were all skipped"
+    else:
+        where = f"{drops} clip(s) are dropped and waiting to be posted"
+    return f"it stopped at: {where} ({funnel})"
 
 
 def report(days: float = 1.0, now: float | None = None) -> str:

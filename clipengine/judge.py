@@ -150,8 +150,39 @@ def engine_call(draft: dict) -> str | None:
     return "ship" if score is not None and score >= floor else "hold"
 
 
+def artifact_id(draft: dict, path: str | None = None) -> str | None:
+    """What the verdict was given on: the rendered clip when there is one, else the draft's contact sheet (the
+    review page embeds it). sha1, short. None when nothing viewable exists."""
+    import hashlib
+    for p in (path, draft.get("sheet")):
+        if p and os.path.isfile(p):
+            h = hashlib.sha1()
+            with open(p, "rb") as fh:
+                for b in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(b)
+            return h.hexdigest()[:12]
+    return None
+
+
 def record(draft: dict, verdict: str, reason: str, *, frames=(), override: str | None = None,
-           slug: str | None = None) -> dict:
+           slug: str | None = None, artifact: str | None = None) -> dict:
+    """One verdict per decision (wishlist 8): the verdict is tied to the artifact that was viewed, and repeating the
+    same verdict on the same artifact (a retried click, a re-run command) records nothing new — it returns the
+    verdict already on file. A different verdict, or the same one on a new artifact, is a real decision and is kept."""
+    import fcntl
+    art = artifact or artifact_id(draft)
+    path = _path("judged.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        last = next((r for r in reversed(_rows(path)) if r.get("kind") == "judgment" and r.get("id") == draft["id"]), None)
+        if last and last.get("verdict") == verdict and last.get("artifact") == art:
+            return {**last, "repeat": True}
+        return _record(draft, verdict, reason, frames=frames, override=override, slug=slug, artifact=art)
+
+
+def _record(draft: dict, verdict: str, reason: str, *, frames=(), override: str | None = None,
+            slug: str | None = None, artifact: str | None = None) -> dict:
     snapshot = draft.get("judgment") or draft
     speakers = draft.get("speakers") or {}
     row = {"kind": "judgment", "id": draft["id"], "login": draft.get("login"),
@@ -166,6 +197,8 @@ def record(draft: dict, verdict: str, reason: str, *, frames=(), override: str |
         row["truth_override"] = override
     if slug:
         row["slug"] = slug
+    if artifact:
+        row["artifact"] = artifact
     paths = label_frames(draft, verdict, frames) if verdict in ("ship", "drop") else []
     if paths:
         row["frames"] = paths

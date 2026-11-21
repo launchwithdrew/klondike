@@ -182,11 +182,13 @@ def draft_page(entry: dict, title: str | None = None, quote: str | None = None) 
         headline_result = '; '.join(issues) or 'Supported by the draft evidence'
         check = (f"<p>{text(title)}</p><p>{text(headline_result)}</p>"
                  f"<p>First CAPS run: {text(preview['first_caps_run'] or 'none')}</p>")
-    assessed = entry.get("frames_assessed", entry.get("liveliness") is not None)
+    marks = sentinel.confidence_markers(entry)
     safety = evidence(entry["unsafe"]) if entry.get("unsafe") else "No text flag recorded"
-    if not assessed:
+    if "frames unassessed" in marks:
         safety += " · frames unassessed"
-    confidence = evidence("; ".join(entry.get("flags") or []))
+    flags = "; ".join(entry.get("flags") or [])
+    confidence = ("Confidence: " + text("; ".join(marks)) if marks else "Confidence: every check ran") + \
+        (" · flags: " + evidence(flags) if flags else "")
     title_html = text(entry["id"])
     ident = re.sub(r"[^a-zA-Z0-9_.-]", "_", entry["id"]).strip(".") or "draft"
     target = Path(entry["rec"]) / "drafts" / f"{ident}.review.html"
@@ -198,7 +200,7 @@ def draft_page(entry: dict, title: str | None = None, quote: str | None = None) 
 section{{background:white;border:1px solid #d9dde5;border-radius:.6rem;padding:.8rem;margin:1rem 0}}
 h1,h2,p{{margin:.4rem 0}}img,meter{{width:100%;height:auto}}img{{margin:.25rem 0}}meter{{height:1rem}}</style>
 <h1>{title_html}</h1><section><h2>Frames</h2>{''.join(tags)}{timeline}</section>
-<section><h2>Score and safety</h2><p>Engine {text(entry.get('engine', 'unknown'))} · best {text(entry.get('best', 'unknown'))}</p>
+<section><h2>Score and safety</h2><p>Reviewing artifact {text(judge.artifact_id(entry) or 'unavailable')} — a verdict is recorded once per artifact</p><p>Engine {text(entry.get('engine', 'unknown'))} · best {text(entry.get('best', 'unknown'))}</p>
 <p>{text(entry.get('parts') or (entry.get('judgment') or {}).get('parts') or 'Score parts unavailable')}</p>
 <p>{safety}</p><p>{confidence}</p></section>
 <section><h2>Transcript</h2>{transcript}</section><section><h2>Headline check</h2>{check}</section>

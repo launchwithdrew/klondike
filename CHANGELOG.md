@@ -264,3 +264,27 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.17
+
+- Confidence markers look the same everywhere. A draft's markers appear identically in `queue`, on its review page and in the drop's grade record:
+  - frames unassessed;
+  - thin speech;
+  - speaker tags uncertain;
+  - unconfirmed: chat + loudness only.
+
+  A clean draft says "every check ran", so a qualified 75 never reads like a clean one.
+- One verdict per viewed artifact. A verdict records which artifact it was given on: the rendered clip, or the contact sheet the review page shows (with its id). Repeating the same verdict on the same artifact records it once. A changed mind or a new render counts as a new decision.
+- Series memory: `clipengine series`.
+  - It suggests a creator's recurring bit when two or more of your live winners share a headline punch word (their first CAPS word), with receipts: the slugs, dates and live links. Owner overrides never count.
+  - `series --confirm LOGIN:WORD --name "…"` confirms it. After that, a new draft from that creator whose own evidence carries the word is labelled `series: …` in `queue`. Other creators and other bits aren't.
+- The daily brief on a day with no posts says where the pipeline stopped, with the counts: streams watched → drafts → over a bar → judged → dropped → posted.
+- The category-shapes line names its source (last 24 h, the number of viewer clips and creators). With fewer than 5 clips or 2 creators it says "sparse" instead of claiming a pattern. It reports aggregated words only, never a copied title.
+- A triage reason in `queue` is no longer cut off at 50 characters: a failed re-cut now shows why it failed. A test traces one refusal per path (the gate bar, a muted payoff, safety, stale, no payoff, a failed repair, never-clip policy) back to its reason after a restart.
+
+Export diff
+- Added (1): `clipengine/series.py`
+- Changed (11): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/judge.py`, `clipengine/publish.py`, `clipengine/review.py`, `clipengine/scouts.py`, `clipengine/sentinel.py`, `clipengine/support.py`, `docs/judging.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

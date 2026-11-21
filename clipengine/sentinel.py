@@ -981,6 +981,24 @@ def is_urgent(r: dict) -> bool:
     return float(r.get("best") or 0) >= URGENT_BEST and bool(corr)
 
 
+def confidence_markers(r: dict) -> list[str]:
+    """What this draft's score could NOT check or is unsure of (wishlist 11). The same list shows in `queue`, the
+    review page and the drop's grade, so a qualified 75 never reads like a clean one. Empty = every check ran."""
+    out = []
+    if not r.get("frames_assessed", r.get("liveliness") is not None):
+        out.append("frames unassessed")
+    speakers = r.get("speakers") or {}
+    speech = (r.get("judgment") or {}).get("speech_s", speakers.get("streamer_s"))
+    span = (r.get("stop") or 0) - (r.get("start") or 0)
+    if "thin speech" in (r.get("flags") or []) or (speech is not None and span > 0 and speech < 0.2 * span):
+        out.append("thin speech")
+    if speakers.get("backend") in {"stats", "hints"}:
+        out.append("speaker tags uncertain")
+    if unconfirmed(r):
+        out.append("unconfirmed: chat + loudness only")
+    return out
+
+
 def unconfirmed(r: dict) -> bool:
     """A banger-level score with nothing but chat and loudness behind it."""
     return float(r.get("best") or 0) >= URGENT_BEST and not corroboration(r)
@@ -1003,6 +1021,11 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
         from . import events, publish, scouts
         rows = scouts.group_angles(rows, publish.creators(), events.load())
     rows.sort(key=lambda r: (not (is_urgent(r) or r.get("angle_urgent")), -r.get("best", 0)))
+    from . import series as SR
+    try:
+        known = SR.suggestions(os.path.dirname(root) if os.path.basename(root) == "runs" else None)
+    except Exception:
+        known = []
     for r in rows:
         if seen and r.get("status") == "new":
             mark_seen(r, now)
@@ -1013,25 +1036,18 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
         if r.get("status") not in (None, "new"):
             reason = r.get("reason") or ("no reason saved" if r.get("status") in ("dropped", "skipped") else "")
             mark += f" [{r['status']}{': ' + UT.quote(reason, 50) if reason else ''}]"
-        confidence = []
-        if not r.get("frames_assessed", r.get("liveliness") is not None):
-            confidence.append("frames unassessed")
-        speakers = r.get("speakers") or {}
-        speech = (r.get("judgment") or {}).get("speech_s", speakers.get("streamer_s"))
-        if "thin speech" in (r.get("flags") or []) or (speech is not None and speech < 0.2 * (r["stop"] - r["start"])):
-            confidence.append("thin speech")
-        if speakers.get("backend") in {"stats", "hints"}:
-            confidence.append("speaker tags uncertain")
-        if unconfirmed(r):
-            confidence.append("unconfirmed: chat + loudness only")
+        confidence = confidence_markers(r)
         if confidence:
             mark += " · " + " · ".join(confidence)
         if r.get("triage") in ("preview", "review") and r.get("status") == "new":
             exp = r.get("expires_at")
-            mark += (f" · {r['triage']}: {UT.quote(r.get('triage_reason') or '', 50)}"
+            mark += (f" · {r['triage']}: {UT.quote(r.get('triage_reason') or '', 110)}"
                      + (f" · expires {time.strftime('%H:%M', time.localtime(exp))}" if exp else ""))
         if r.get("repaired_from"):
             mark += " · re-cut on speech boundaries"
+        sr = SR.match(r, sugg=known) if known else None
+        if sr:
+            mark += f" · series: {UT.quote(sr['name'], 40)} ({'confirmed' if sr['confirmed'] else 'suggested'}, {sr['wins']} wins)"
         if r.get("angles"):
             mark += f" · same moment, {len(r['angles'])} angles"
         if r.get("seen_at"):

@@ -32,3 +32,19 @@ running accuracy is printed each time (the latest verdict per draft counts).
 To keep an old moment on purpose: `clipengine triage --keep ID --why "the reason it's still worth posting"`.
 Every route checks the audio before transcription: saved streams, the live recording, a re-cut, a pre-render and `publish-live`. A window with no audio, full silence, or a muted payoff is refused with a rights-review reason. A known-muted saved-stream window is remembered for 14 days and never downloaded again. `clipengine jobs` counts what this saved.
 Tune the windows in `config/grading.json` under `"triage"`: `breaking_h`, `evergreen_h`, `max_repairs`.
+
+## Confidence and one verdict per artifact
+Every draft carries the same confidence markers in `queue`, its review page and the drop:
+- frames unassessed;
+- thin speech;
+- speaker tags uncertain;
+- unconfirmed: chat + loudness only.
+
+A qualified 75 never reads like a clean one; a clean draft says "every check ran". A verdict is tied to the artifact
+that was viewed (the review page shows its id). Repeating the same verdict on the same artifact records it once.
+
+## Series
+`clipengine series` lists a creator's recurring bit: two or more of your live winners whose headlines share a punch
+word (their first CAPS word), with receipts. `series --confirm LOGIN:WORD --name "…"` confirms one. After that,
+new drafts that continue it are labelled `series: …` in `queue`. Owner overrides never count.
+

@@ -175,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
     bk_.add_argument("--to", help="folder for the zip (default runs/backups)")
     rs_ = sub.add_parser("restore", help="put a backup zip back (backs up what's there first)")
     rs_.add_argument("file")
+    se_ = sub.add_parser("series", help="a creator's recurring bit: suggestions from our winners (with receipts), confirm one")
+    se_.add_argument("--confirm", metavar="LOGIN:WORD", help="confirm a suggested series")
+    se_.add_argument("--name", help="its name (with --confirm)")
     mx_ = sub.add_parser("metrics", help="the weekly numbers: coverage, overnight yield, cost, speed, publishing, recommendations")
     mx_.add_argument("--days", type=float, default=7.0)
     mx_.add_argument("--save", action="store_true", help="also write runs/metrics/week-<date>.json")
@@ -430,6 +433,17 @@ def main(argv: list[str] | None = None) -> int:
             if AP.autopilot_died():
                 SV.reconcile(None, root=AP._root())
             print("\n".join(SV.status_lines(AP._root())))
+        return 0
+    if a.cmd == "series":
+        from . import series as SR
+        if a.confirm:
+            if not a.name:
+                ap.error("series --confirm needs --name")
+            got = SR.confirm(a.confirm, a.name)
+            print(f"series confirmed: {a.confirm} «{got['name']}» ({len(got['receipts'])} winners) — new drafts that "
+                  "continue it are labelled in `queue`")
+        else:
+            print("\n".join(SR.lines()))
         return 0
     if a.cmd == "metrics":
         from . import metrics as MX

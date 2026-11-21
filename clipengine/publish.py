@@ -329,6 +329,17 @@ def from_prerender(pre: dict, out: str, start_ts: float, end_ts: float, title: s
             "audit": burned.get("audit")}
 
 
+def _markers(draft: dict | None) -> list[str]:
+    """The draft's confidence markers (sentinel.confidence_markers), carried into the publish report and the drop."""
+    if not draft:
+        return []
+    from . import sentinel as SN
+    try:
+        return SN.confidence_markers(draft)
+    except Exception:
+        return []
+
+
 def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_checked, post, push, check_only,
             sig: dict | None = None, rubric: list[str] | None = None, question: str | None = None,
             taste: bool | None = None, *, truth_override: str | None = None, draft: dict | None = None,
@@ -390,6 +401,7 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
     rub = G.rubric_score(rubric)
     final = G.banger(eng["score"], rub)
     report["grade"] = {"engine": eng, "rubric": rubric, **final}
+    report["confidence"] = _markers(draft) or ["every check ran"]
     floor = min(r["min_score"] for r in GT.config()["platforms"].values())
     if not frames_checked:
         if final["best_possible"] < floor:
@@ -445,9 +457,9 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
         drop(rep["out"], slug, title, description, moment.isoformat(), post, push, check_only,
              platforms=platforms, schedule=schedule,
              grade={"score": final["score"], "tier": final["tier"], "engine": eng["score"], "rubric": rubric,
-                    "parts": eng["parts"]}, moment_window=moment_window)
+                    "parts": eng["parts"], "confidence": _markers(draft)}, moment_window=moment_window)
         if not check_only:
-            JG.record(example, "ship", "approved for posting", frames=rep.get("frames"),
+            JG.record(example, "ship", "approved for posting", frames=rep.get("frames"), artifact=JG.artifact_id(example, rep.get("out")),
                       override=accepted_override, slug=slug)
             record_clipped({"slug": slug, "source": source, "login": login, "start_s": s, "end_s": e,
                             "moment_at": moment.isoformat(), **moment_window, "title": title, "grade": final["score"],

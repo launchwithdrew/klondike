@@ -204,14 +204,22 @@ def cached_report(hours: float, now: float, root: str, roster: dict) -> dict:
             "best_miss": max((row for row in today if not row["caught"]), key=lambda row: row["views"], default=None)}
 
 
+SHAPE_MIN_CLIPS = 5          # fewer viewer clips than this (or creators below) = sparse: no pattern claimed
+SHAPE_MIN_CREATORS = 2
+
+
 def category_shape(now: float, root: str) -> str | None:
     import re
     from collections import Counter
 
-    clips = sorted(observations(now, 24, root),
-                   key=lambda r: r.get("views", 0) / max(1, (now - r["t"]) / 60), reverse=True)[:20]
+    seen = observations(now, 24, root)
+    clips = sorted(seen, key=lambda r: r.get("views", 0) / max(1, (now - r["t"]) / 60), reverse=True)[:20]
     if not clips:
         return None
+    creators = len({r.get("login") for r in clips if r.get("login")})
+    source = f"(last 24 h: {len(clips)} of {len(seen)} viewer clips, {creators} creator{'s' if creators != 1 else ''})"
+    if len(clips) < SHAPE_MIN_CLIPS or creators < SHAPE_MIN_CREATORS:
+        return f"category shapes: sparse {source} — too little to call a pattern"
     durations = [r["duration"] for r in clips if r.get("duration")]
     hooks = Counter("question" if "?" in r["title"] else "reaction" if "!" in r["title"] else "statement" for r in clips)
     ignore = set("the a and or in to of this that for you with just gets gta when from how what it his".split())
@@ -221,7 +229,7 @@ def category_shape(now: float, root: str) -> str | None:
     return (f"category shapes: {len(clips)} fastest viewer clips, "
             + (f"{st.median(durations):.0f}s median, " if durations else "")
             + f"{hooks.most_common(1)[0][0]} hooks"
-            + (f", recurring words {UT.clean(', '.join(common), 55)}" if common else ""))
+            + (f", recurring words {UT.clean(', '.join(common), 55)}" if common else "") + f" {source}")
 
 
 def group_angles(queue: list[dict], roster: dict, calendar: list[dict]) -> list[dict]:

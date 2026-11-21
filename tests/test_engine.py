@@ -3777,7 +3777,7 @@ def test_daily_brief_uses_observed_timings_holes_and_misses(tmp_path, monkeypatc
     assert "24s (Twitch ad break)" in out and "brief reconnect" not in out
     assert "oldest re-cuttable" in out and "late: live-only start" in out
     assert "20m dark" in out and "causes: restart failed" in out
-    assert "category shapes: 2 fastest viewer clips" in out and "30s median" in out
+    assert "category shapes: sparse (last 24 h: 2 of 2 viewer clips, 2 creators)" in out    # 2 clips: no pattern claimed
     assert "rights evidence: 2" in out and len(out.splitlines()) <= 12
 
 
@@ -5312,3 +5312,167 @@ def test_the_spare_poster_never_posts_from_a_copy_that_cannot_pull(tmp_path):
           "console.log(JSON.stringify([a, b])); })")
     out = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=60, cwd=os.path.join(ROOT, "engine"))
     assert json.loads(out.stdout.strip().splitlines()[-1]) == [True, False], out.stderr
+
+
+# ---- closure fixtures: wishlist 10 (empty day), 11 (qualified vs clean 75), 12 (attributable category brief) ----
+
+def test_an_empty_day_brief_says_where_the_pipeline_stopped(tmp_path, monkeypatch):
+    import json
+    from clipengine import support, moments
+    now = 1_800_000_000.0
+    monkeypatch.setattr(support, "REPO", str(tmp_path))
+    (tmp_path / "runs").mkdir()
+    out = support.report_text(1, now)
+    assert out.startswith("Nothing went live in this period — it stopped at: no roster creator was live")
+    assert "0 stream session(s) watched → 0 draft(s)" in out
+    # a day with streams and drafts, none looked at: the brief points at the waiting drafts, not at "nothing happened"
+    (tmp_path / "runs" / ".cycle.json").write_text(json.dumps({"seen_live": {"streamera": [[now - 7200, now - 600]]}}))
+    rec = tmp_path / "runs" / "sentinel-streamera"; rec.mkdir()
+    rows = [{"id": "d1", "login": "streamera", "rec": str(rec), "start": now - 3000, "stop": now - 2970, "status": "new",
+             "drafted_at": moments.iso(now - 2900), "best": 80},
+            {"id": "d2", "login": "streamera", "rec": str(rec), "start": now - 2000, "stop": now - 1970,
+             "status": "dropped", "reason": "best 40 under every platform's bar", "drafted_at": moments.iso(now - 1900)}]
+    (rec / "queue.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    out = support.report_text(1, now)
+    assert "it stopped at: 1 draft(s) are waiting for a look" in out
+    assert "1 stream session(s) watched → 2 draft(s) → 1 over a bar → 0 judged → 0 dropped → 0 posted" in out
+
+
+def test_a_qualified_75_and_a_clean_75_never_read_alike(tmp_path):
+    import json
+    from pathlib import Path
+    from clipengine import sentinel as SN, review, publish as PB
+    rec = tmp_path / "rec"; rec.mkdir()
+    clean = {"id": "clean-75", "rec": str(rec), "start": 0, "stop": 30, "best": 75, "status": "new",
+             "frames_assessed": True, "liveliness": 0.8, "speakers": {"streamer_s": 20, "backend": "voice"},
+             "parts": "sp 20s ch .80 au .70 re .70 cr –"}
+    qualified = {"id": "qual-75", "rec": str(rec), "start": 0, "stop": 30, "best": 75, "status": "new",
+                 "speakers": {"streamer_s": 3, "backend": "stats"}, "parts": "sp 3s ch .95 au 1.0 re .20 cr –"}
+    assert SN.confidence_markers(clean) == []
+    assert SN.confidence_markers(qualified) == ["frames unassessed", "thin speech", "speaker tags uncertain",
+                                                "unconfirmed: chat + loudness only"]
+    pages = {r["id"]: Path(review.draft_page(r)).read_text() for r in (clean, qualified)}
+    assert "Confidence: every check ran" in pages["clean-75"]
+    assert "speaker tags uncertain" in pages["qual-75"] and "Confidence: every check ran" not in pages["qual-75"]
+    assert PB._markers(clean) == [] and "thin speech" in PB._markers(qualified)     # the handoff carries them too
+    assert PB._markers(None) == []
+
+
+def test_the_category_brief_is_attributable_and_sparse_data_says_so(tmp_path):
+    from clipengine import scouts
+    now = 1_800_000_000.0
+    trend = [{"slug": f"c{i}", "login": f"streamer{'abc'[i % 3]}", "title": f"He got WASTED again {i}!", "t": now - 600 * i,
+              "views": 500 - 10 * i, "duration": 20 + i} for i in range(1, 9)]
+    scouts.remember(trend, now, str(tmp_path))
+    line = scouts.category_shape(now, str(tmp_path))
+    assert line.startswith("category shapes: 8 fastest viewer clips") and "reaction hooks" in line
+    assert "recurring words" in line and "wasted" in line and "(last 24 h: 8 of 8 viewer clips, 3 creators)" in line
+    assert "He got WASTED again" not in line                     # aggregated words only, never a copied title
+    sparse = tmp_path / "sparse"; sparse.mkdir()
+    scouts.remember(trend[:3], now, str(sparse))
+    assert "sparse" in scouts.category_shape(now, str(sparse)) and "pattern" in scouts.category_shape(now, str(sparse))
+
+
+def test_every_refusal_path_explains_itself_after_a_restart(tmp_path, capsys):
+    """Wishlist 9: one case per refusal path — gate bar, muted payoff (rights), safety, stale (expiry), no payoff,
+    failed repair, never-clip policy — each findable as a one-line reason in `queue --all` after a restart, naming
+    the decision that made it."""
+    import json, time as _t
+    from clipengine import sentinel as SN, triage as TR, audio as A, autopilot as AP
+    now = 1_800_000_000.0
+    rec = tmp_path / "sentinel-streamera"; rec.mkdir()
+    out = str(rec)
+    mo = lambda t: {"start": now - t, "stop": now - t + 30, "fire": now - t + 20}
+    SN.log_dropped(out, "streamera", mo(900), "best 41 under every platform's bar (60): nothing happening ×0.55")
+    SN.log_dropped(out, "streamera", mo(800), A.skip_reason("payoff muted"))
+    words = rec / "words.json"
+    words.write_text(json.dumps({"start": now - 640, "stop": now - 560,
+                                 "words": [{"w": " and", "start": now - 571, "end": now - 569.5},
+                                           {"w": " then", "start": now - 569.4, "end": now - 568}]}))
+    base = {"login": "streamera", "rec": out, "status": "new", "best": 80, "parts": "sp 9s ch .8 au .7 re .7 cr –",
+            "liveliness": 0.8, "frames_assessed": True, "said": "no way"}
+    rows = [{**base, "id": "unsafe-1", "start": now - 700, "stop": now - 670, "unsafe": "nudity in frame"},
+            {**base, "id": "stale-1", "start": now - 9 * 3600, "stop": now - 9 * 3600 + 30, "payoff": now - 9 * 3600 + 20},
+            {**base, "id": "nopayoff-1", "start": now - 650, "stop": now - 620, "payoff": now - 630, "liveliness": 0.2,
+             "parts": "sp 2s ch .9 au .9 re .1 cr –", "flags": ["nothing happening"]},
+            {**base, "id": "repair-1", "start": now - 600, "stop": now - 570, "payoff": now - 585, "repairs": 9,
+             "words": str(words), "repair_failed": "no clean boundary within the recorded 80 s around the payoff"}]
+    with open(rec / "queue.jsonl", "a") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    TR.apply(str(tmp_path), now=now, floor=60)
+    # restart: nothing in memory — the reasons come back from disk through the normal CLI view
+    SN.show_queue(str(tmp_path), all_=True, seen=False)
+    text = capsys.readouterr().out
+    lines = {l.split()[0]: l for l in text.splitlines() if l and not l.startswith(" ")}
+    by_reason = lambda needle: [k for k, l in lines.items() if needle in l]
+    assert by_reason("under every platform's bar (60)")                               # the gate's decision
+    assert by_reason("copyright-muted over the payoff (rights review")                  # the audio probe's decision
+    assert "⛔" in lines["unsafe-1"] and "nudity" in lines["unsafe-1"]                 # the safety screen's decision
+    assert "stale: the moment is 9 h old" in lines["stale-1"]                          # freshness / expiry
+    assert "no corroborated payoff" in lines["nopayoff-1"]                             # triage's payoff check
+    assert "repair failed: no clean boundary" in lines["repair-1"]                     # the bounded re-cut
+    with pytest.raises(SystemExit, match="does not allow clipping .*policy: never"):    # rights policy at publish
+        AP.refuse_never("streamerz", {"streamerz": {"policy": "never"}})
+
+
+def test_series_memory_suggests_with_receipts_confirms_and_only_labels_the_matching_draft(tmp_path, capsys):
+    """Wishlist 14: two genuine matching wins form a suggestion with receipts; an unrelated hit and a later matching
+    candidate are replayed — only the matching candidate gets the series label."""
+    import json
+    from clipengine import series as SR, sentinel as SN
+    (tmp_path / "data").mkdir()
+    clipped = [{"slug": "jx_wasted_1", "login": "streamera", "title": "Streamer A got WASTED", "moment_at": "2026-11-19T10:00:00+00:00"},
+               {"slug": "jx_wasted_2", "login": "streamera", "title": "WASTED again by a cop", "moment_at": "2026-11-20T10:00:00+00:00"},
+               {"slug": "xq_chased", "login": "streamerb", "title": "Streamer B got CHASED", "moment_at": "2026-11-20T11:00:00+00:00"},
+               {"slug": "jx_wasted_ovr", "login": "streamera", "title": "Streamer A WASTED (owner pick)", "moment_at": "2026-11-18T10:00:00+00:00"}]
+    (tmp_path / "data" / "clipped.jsonl").write_text("".join(json.dumps(c) + "\n" for c in clipped))
+    ledger = [{"slug": "jx_wasted_1", "platform": "tiktok", "status": "live", "url": "https://t/1"},
+              {"slug": "jx_wasted_2", "platform": "youtube", "status": "live", "url": "https://y/2"},
+              {"slug": "xq_chased", "platform": "tiktok", "status": "live", "url": "https://t/3"},
+              {"slug": "jx_wasted_ovr", "platform": "tiktok", "status": "live", "url": "https://t/4", "override": "owner's call"}]
+    (tmp_path / "ledger.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ledger))
+    sug = SR.suggestions(str(tmp_path))
+    assert [s["key"] for s in sug] == ["streamera:WASTED"]                       # one CHASED win is not a series
+    assert {w["slug"] for w in sug[0]["wins"]} == {"jx_wasted_1", "jx_wasted_2"}  # the owner override never counts
+    assert sug[0]["wins"][0]["links"] and not sug[0]["confirmed"]
+    with pytest.raises(SystemExit, match="fewer than 2"):
+        SR.confirm("streamerb:CHASED", "B gets chased", str(tmp_path))
+    SR.confirm("streamera:WASTED", "A gets wasted", str(tmp_path))
+    sug = SR.suggestions(str(tmp_path))
+    assert sug[0]["confirmed"] and sug[0]["name"] == "A gets wasted"
+    matching = {"login": "streamera", "said": "bro I just got wasted again", "titles": []}
+    unrelated = {"login": "streamerb", "said": "he got wasted lol", "titles": []}             # another creator
+    off_topic = {"login": "streamera", "said": "nice drive", "titles": ["clean drift"]}       # same creator, other bit
+    assert SR.match(matching, sugg=sug)["name"] == "A gets wasted"
+    assert SR.match(unrelated, sugg=sug) is None and SR.match(off_topic, sugg=sug) is None
+    rec = tmp_path / "runs" / "sentinel-streamera"; rec.mkdir(parents=True)
+    rows = [{**matching, "id": "m-1", "rec": str(rec), "start": 0, "stop": 30, "status": "new", "best": 70},
+            {**off_topic, "id": "o-1", "rec": str(rec), "start": 100, "stop": 130, "status": "new", "best": 70}]
+    (rec / "queue.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    SN.show_queue(str(tmp_path / "runs"), all_=True, seen=False)
+    out = {l.split()[0]: l for l in capsys.readouterr().out.splitlines() if l and not l.startswith(" ")}
+    assert "series: «A gets wasted» (confirmed, 2 wins)" in out["m-1"] and "series" not in out["o-1"]
+
+
+def test_a_verdict_is_tied_to_the_viewed_artifact_and_a_retry_records_it_once(tmp_path, monkeypatch):
+    """Wishlist 8: approval is linked to the artifact that was viewed; retrying the same click can't record two
+    verdicts; a changed artifact or a changed mind is a real new decision."""
+    import json
+    from pathlib import Path
+    from PIL import Image
+    from clipengine import judge as JG, review
+    monkeypatch.setattr(JG, "DATA", str(tmp_path / "data"))
+    rec = tmp_path / "rec"; rec.mkdir()
+    sheet = rec / "sheet.jpg"; Image.new("RGB", (40, 60), "navy").save(sheet)
+    draft = {"id": "d-1", "login": "streamera", "rec": str(rec), "start": 0, "stop": 30, "sheet": str(sheet), "status": "new"}
+    art = JG.artifact_id(draft)
+    assert art and f"Reviewing artifact {art}" in Path(review.draft_page(draft)).read_text()
+    first = JG.record(draft, "drop", "dull")
+    again = JG.record(draft, "drop", "dull")                      # the retried click
+    rows = lambda: [json.loads(l) for l in open(tmp_path / "data" / "judged.jsonl") if l.strip()]
+    assert len(rows()) == 1 and again.get("repeat") and rows()[0]["artifact"] == art and not first.get("repeat")
+    JG.record(draft, "ship", "changed my mind")                   # a different verdict is a real decision
+    Image.new("RGB", (40, 60), "red").save(sheet)                  # a re-render: a new artifact
+    JG.record(draft, "ship", "changed my mind")
+    assert [r["verdict"] for r in rows()] == ["drop", "ship", "ship"] and rows()[1]["artifact"] != rows()[2]["artifact"]
