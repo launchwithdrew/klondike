@@ -230,19 +230,34 @@ def record(login: str, out_dir: str, buffer_s: float = 7200, stop_after_s: float
             since = {"fresh": False, "ads": 0, "reconnects": 0, "failed": 0}
             n_segs += 1
         # prune the buffer
-        cutoff = time.time() - buffer_s
         if time.time() - protect_at > 60:              # windows a queued draft still needs: never pruned
             protect, protect_at = AP.protected_windows(out_dir), time.time()
-        for f in glob.glob(os.path.join(seg_dir, "*.ts")):
-            t_f = int(os.path.basename(f)[:-3]) / 1000
-            if t_f < cutoff and not AP.is_protected(t_f, 2.0, protect):
-                os.remove(f)
+        prune_buffer(seg_dir, buffer_s, protect)
         if n_segs and n_segs % 150 == 0:
             print(f"[live] {login}: {n_segs} segments ({n_segs * 2 / 60:.0f} min), {n_ads} ad segments skipped"
                   f"{' (ad break now)' if ad_ranges else ''}", flush=True)
         if len(seen) > 5000:
             seen = set(list(seen)[-2000:])
         time.sleep(2.0)
+
+
+def prune_buffer(seg_dir: str, buffer_s: float, protect: list[tuple[float, float]], now: float | None = None) -> int:
+    """Drop segments older than the buffer, except any a queued draft still needs (its window + transcribed handles).
+    Returns how many were removed."""
+    from . import autopilot as AP
+    cutoff = (time.time() if now is None else now) - buffer_s
+    durs = AP.segment_durations(os.path.dirname(seg_dir)) if protect else {}
+    gone = 0
+    for f in glob.glob(os.path.join(seg_dir, "*.ts")):
+        try:
+            t_f = int(os.path.basename(f)[:-3]) / 1000
+        except ValueError:
+            continue
+        # a segment's real length: a long one starting just before a protected window still holds its first seconds
+        if t_f < cutoff and not AP.is_protected(t_f, durs.get(os.path.basename(f), 2.0), protect):
+            os.remove(f)
+            gone += 1
+    return gone
 
 
 def _yt_refresh(url: str, resolved_at: float) -> bool:

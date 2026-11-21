@@ -118,8 +118,32 @@ def protected_windows(rec_dir: str) -> list[tuple[float, float]]:
             latest[r["id"]] = {**latest.get(r["id"], {}), **r}
     except OSError:
         return []
-    return [(r["start"] - 10, r["stop"] + 10) for r in latest.values()
-            if r.get("status") == "new" and "start" in r and "stop" in r and not r.get("scan")]
+    out = []
+    for r in latest.values():
+        if r.get("status") != "new" or "start" not in r or "stop" not in r or r.get("scan"):
+            continue
+        a, b = r["start"] - 10, r["stop"] + 10
+        src = r.get("src") or []                   # the transcribed handles a re-cut may extend into (W4)
+        if len(src) == 2:
+            a, b = min(a, float(src[0]) - 2), max(b, float(src[1]) + 2)
+        out.append((a, b))
+    return out
+
+
+def segment_durations(rec_dir: str) -> dict[str, float]:
+    """{segment file: its length in seconds} from index.jsonl (Twitch writes 2 s; YouTube / Kick can be longer)."""
+    out = {}
+    try:
+        for line in open(os.path.join(rec_dir, "index.jsonl")):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("f"):
+                out[r["f"]] = float(r.get("d") or 2.0)
+    except OSError:
+        pass
+    return out
 
 
 def is_protected(t: float, d: float, windows: list[tuple[float, float]]) -> bool:

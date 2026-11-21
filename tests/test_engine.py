@@ -5244,6 +5244,7 @@ def test_weekly_metrics_cover_all_six_sections_with_samples_and_reasons(tmp_path
     assert c["catchup_covered_min"] == 30 and c["unknown_min"] == 30          # streamerb: no VODs, unrecorded → unknown
     assert c["incidents"] == 1 and c["longest_dark_min"] == 10.0 and c["holes_over_10s"] == 2 and c["holes_ads"] == 1
     assert c["heartbeat_monitor"].startswith("local only")
+    assert c["oldest_recuttable_h"] is None                    # the fixture's segment files aren't on disk
     o = rep["overnight"]
     n = next(x for x in o["nights"] if x["live_min"] > 0)
     assert n["winners"] == 1 and n["drafts_live"] == 2 and n["muted_by_route"] == {"vod": "1/1", "live": "0/1"}
@@ -5516,3 +5517,81 @@ def test_engine_call_drops_low_scores_ships_from_70_and_eval_shows_the_base_rate
     out = capsys.readouterr().out
     assert "engine \\ editor" in out and "always-the-commonest-call baseline: 8/9" in out
     assert st["ship_precision"] == (1, 1) and st["keepers_caught"] == (1, 1) and st["today_rule"] == (9, 9)
+
+
+def test_pruning_keeps_a_queued_drafts_window_and_handles_for_a_full_quality_recut_three_hours_later(tmp_path):
+    """W4 drill (it found pruning assumed 2-s segments: a longer one overlapping a window's start was deleted).
+    4 h recorded, a 1 h buffer, a draft queued 3 h ago. Pruning frees everything else, but the draft's
+    window AND its transcribed handles survive byte-for-byte, so a re-cut on speech boundaries 3 h later is a
+    stream copy of the original segments (no re-encode). A skipped draft releases its window."""
+    import hashlib
+    from clipengine import live as L, autopilot as AP
+    now = 1_800_000_000.0
+    rec = tmp_path / "sentinel-streamera"; seg = rec / "segments"; seg.mkdir(parents=True)
+    idx = []
+    for i in range(int(4 * 3600 / 10)):                                   # 10-s segments over the last 4 h
+        t = now - 4 * 3600 + i * 10
+        name = f"{int(t * 1000)}.ts"
+        (seg / name).write_bytes(hashlib.sha1(name.encode()).digest() * 8)
+        idx.append({"t": t, "d": 10.0, "f": name})
+    (rec / "index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in idx))
+    m = now - 3 * 3600                                                    # the moment, 3 h ago
+    draft = {"id": "streamera-1", "login": "streamera", "rec": str(rec), "start": m, "stop": m + 30, "payoff": m + 20,
+             "src": [m - 25, m + 45], "status": "new"}
+    (rec / "queue.jsonl").write_text(json.dumps(draft) + "\n")
+    before = {p.name: p.read_bytes() for p in seg.iterdir()}
+    w = AP.protected_windows(str(rec))
+    assert w == [(m - 27, m + 47)]                                        # the handles, not just ±10 s
+    gone = L.prune_buffer(str(seg), 3600, w, now=now)
+    left = {p.name for p in seg.iterdir()}
+    need = [r for r in idx if r["t"] + r["d"] > m - 25 and r["t"] < m + 45]
+    assert need and all(r["f"] in left and (seg / r["f"]).read_bytes() == before[r["f"]] for r in need)
+    old = [r for r in idx if r["t"] < now - 3600 and not AP.is_protected(r["t"], r["d"], w)]
+    assert gone == len(old) and not any(r["f"] in left for r in old)      # everything else old is freed
+    assert all(r["f"] in left for r in idx if r["t"] >= now - 3600)       # the live hour stays
+    out = tmp_path / "recut.ts"
+    t0 = L.cut_source(str(rec), m - 25, m + 45, str(out))                 # the re-cut out to the handles
+    expected = b"".join(before[r["f"]] for r in idx if r["t"] + r["d"] > m - 27 and r["t"] < m + 47)
+    assert t0 <= m - 25 and out.read_bytes() == expected                  # full quality: the original bytes
+    with open(rec / "queue.jsonl", "a") as fh:                            # skipped: its window is released
+        fh.write(json.dumps({"id": "streamera-1", "status": "skipped"}) + "\n")
+    L.prune_buffer(str(seg), 3600, AP.protected_windows(str(rec)), now=now)
+    assert not any(r["f"] in {p.name for p in seg.iterdir()} for r in need)
+
+
+def test_two_installs_one_moment_the_second_refuses_after_importing_the_firsts_ledger(tmp_path, monkeypatch):
+    """P4 drill: install A posts a moment; install B (its own repo) imports A's ledger.jsonl with A's
+    data/clipped.jsonl beside it, then tries the same moment from a different source and title — refused, with both
+    receipts on record (A's ledger row, B's refusal)."""
+    import datetime as dt
+    from clipengine import handpost, moments, publish
+    moment = 1_800_000_000.0
+    a, b = tmp_path / "install-a", tmp_path / "install-b"
+    (a / "data").mkdir(parents=True); (b / "data").mkdir(parents=True)
+    # install A: its posted clip, as `posted` + the drop record leave it
+    (a / "data" / "clipped.jsonl").write_text(json.dumps({
+        "slug": "a_made_it", "login": "streamera", "moment_at": moments.iso(moment + 20),
+        "moment_start_at": moments.iso(moment + 5), "moment_end_at": moments.iso(moment + 35)}) + "\n")
+    receipt_a = {"slug": "a_made_it", "platform": "youtube", "url": "https://youtu.be/amadeit", "status": "live",
+                 "at": moments.iso(moment + 600)}
+    (a / "ledger.jsonl").write_text(json.dumps(receipt_a) + "\n")
+    # install B: a separate repo that has never seen it
+    monkeypatch.setattr(handpost, "REPO", str(b))
+    monkeypatch.setattr(handpost, "_sync", lambda *x: None)
+    monkeypatch.setattr(publish, "REPO", str(b))
+    monkeypatch.setattr(publish, "CLIPPED", str(b / "data" / "clipped.jsonl"))
+    assert not moments.match("streamera", moment + 10, moment + 30, handpost._ledger())   # B alone would post it
+    assert moments.import_posts(str(a / "ledger.jsonl")) == 1
+    assert moments.import_posts(str(a / "ledger.jsonl")) == 0                               # idempotent retry
+    monkeypatch.setenv("CLIPENGINE_NO_AUDIT", "1")
+    monkeypatch.setattr(publish.GT, "decide", lambda *x, **k: {"youtube": {"action": "now", "at": None}})
+    monkeypatch.setattr(publish, "drop", lambda *x, **k: pytest.fail("install B dropped a moment install A posted"))
+    (b / "clip.transcript.json").write_text('{"segments":[{"start":1,"text":"made it"}]}')
+    rep = {"out": str(b / "clip.mp4"), "pre_vision": {"cuts_per_min": 0, "static": 0, "dark": 0, "flags": []}}
+    with pytest.raises(SystemExit, match="already posted as a_made_it") as refusal:
+        publish._finish(rep, "streamera", "another_vod", 12, 40, dt.datetime.fromtimestamp(moment + 22, dt.timezone.utc),
+                        "streamera MADE IT", "line", None, "b_made_it_again", True, True, False, False,
+                        {}, ["hook"], taste=True, clock_window=(moment + 8, moment + 36))
+    imported = [r for r in handpost._ledger() if r.get("imported")]
+    assert imported and imported[0]["url"] == receipt_a["url"]                               # receipt 1: A's post in B
+    assert "PUBLISH REFUSED" in str(refusal.value)                                           # receipt 2: B's refusal

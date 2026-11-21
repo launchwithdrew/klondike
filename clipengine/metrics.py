@@ -163,6 +163,9 @@ def coverage(root: str, since: float, now: float) -> dict:
            (r.get("recovered_at") or now) > since]
     dark = [min(now, r.get("recovered_at") or now) - max(since, r["dark_from"]) for r in inc if r.get("dark_from")]
     hb = _json(os.path.join(root, "config", "ops.json")).get("heartbeat_url")
+    held = [r["t"] for ds in recs.values() for d in ds for r in _rows(os.path.join(d, "index.jsonl"))
+            if r.get("f") and os.path.isfile(os.path.join(d, "segments", r["f"]))]
+    oldest = round((now - min(held)) / 3600, 1) if held else None
     worst = sorted(per.items(), key=lambda kv: kv[1] if kv[1] is not None else 9)[:3]
     return {"live_min": round(live_s / 60), "recorded_min": round(rec_s / 60),
             "observed_share": round(rec_s / live_s, 3) if live_s else None,
@@ -173,6 +176,7 @@ def coverage(root: str, since: float, now: float) -> dict:
             "uptime_share": round(1 - sum(dark) / (now - since), 4),
             "holes_over_10s": holes, "holes_explained": explained, "holes_ads": ads,
             "heartbeat_monitor": "off-host monitor configured" if hb else "local only (no heartbeat_url)",
+            "oldest_recuttable_h": oldest,
             "lowest_coverage": [{"login": k, "share": v} for k, v in worst]}
 
 
@@ -475,6 +479,7 @@ def lines(rep: dict) -> list[str]:
                f"{c['catchup_covered_min']} · covered in all {c['covered_share']:.0%} · unknown {c['unknown_min']} · uptime "
                f"{c['uptime_share']:.1%} ({c['incidents']} incident(s), longest dark {c['longest_dark_min']} min) · "
                f"holes>10s {c['holes_over_10s']} ({c['holes_explained']} explained, {c['holes_ads']} ads) · "
+               f"oldest re-cuttable {_f(c['oldest_recuttable_h'])} h · "
                f"{c['heartbeat_monitor']}"))
     o = rep["overnight"]
     out.append("overnight  " + (_f(o) if "unavailable" in o else

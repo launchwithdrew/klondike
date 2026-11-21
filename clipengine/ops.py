@@ -463,12 +463,13 @@ def _prune(cfg: dict) -> list[str]:
                 keep = AP.protected_windows(st["dir"])
                 if keep:                                   # only the stretches no queued draft needs
                     gone = 0
+                    durs = AP.segment_durations(st["dir"])
                     for f in glob.glob(os.path.join(seg, "*.ts")):
                         try:
                             t = int(os.path.basename(f)[:-3]) / 1000
                         except ValueError:
                             continue
-                        if not AP.is_protected(t, 2.0, keep):
+                        if not AP.is_protected(t, durs.get(os.path.basename(f), 2.0), keep):
                             os.remove(f); gone += 1
                     if gone:
                         out.append(f"cleared most of {st['login']}'s old recording (kept what {len(keep)} queued draft(s) need)")

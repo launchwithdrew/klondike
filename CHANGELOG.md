@@ -344,3 +344,19 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.21
+
+- Recording pruning keeps what a queued draft needs for a re-cut. Fixes in this area:
+  - Each queued draft's window was already protected, plus 10 s either side. Its transcribed handles, the audio a re-cut on speech boundaries can extend into, now stay too.
+  - Pruning no longer assumes every segment is 2 s long. A longer segment (YouTube, Kick) that started just before a protected window, and held its first seconds, used to be deleted.
+  - A 4-hour drill shows a moment queued 3 hours earlier re-cuts as a straight copy of the original segments.
+- Weekly `metrics` reports the oldest recording still re-cuttable.
+- A two-install drill shows a second engine importing the first one's `ledger.jsonl` (with its `data/clipped.jsonl` beside it) and refusing the same moment, with both receipts on record.
+
+Export diff
+- Added (0)
+- Changed (7): `VERSION`, `clipengine/__init__.py`, `clipengine/autopilot.py`, `clipengine/live.py`, `clipengine/metrics.py`, `clipengine/ops.py`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.
