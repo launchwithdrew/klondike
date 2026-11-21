@@ -48,3 +48,4 @@ that was viewed (the review page shows its id). Repeating the same verdict on th
 word (their first CAPS word), with receipts. `series --confirm LOGIN:WORD --name "…"` confirms one. After that,
 new drafts that continue it are labelled `series: …` in `queue`. Owner overrides never count.
 
+`eval-judge` also prints a confusion table, how many ship calls were right, how many of your keepers the engine shipped, and the always-the-commonest-call baseline. When editors drop most drafts, a high agreement figure alone can just mean "drop everything". Thresholds: `config/grading.json` "judge_call" (drop below 50, ship from 70).

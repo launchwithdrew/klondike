@@ -324,3 +324,23 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.20
+
+- The engine's own ship / hold / drop call (the one `eval-judge` compares with yours) is recalibrated. It used to assume a perfect editor rubric, so it held nearly everything and never dropped.
+  - It now drops a draft under engine 50, ships from 70 and holds in between. Both thresholds are in `config/grading.json` under `"judge_call"`.
+  - It drops a possible death screen when your channel penalises them.
+- `eval-judge` no longer lets a single agreement number hide what the calls do. It also prints:
+  - a confusion table of engine call against editor call;
+  - how many ship calls were right;
+  - how many of your keepers the engine shipped;
+  - the always-the-commonest-call baseline;
+  - today's rule replayed on the same drafts.
+- Verdicts now keep the draft's flags, so later replays see them.
+
+Export diff
+- Added (0)
+- Changed (5): `VERSION`, `clipengine/__init__.py`, `clipengine/judge.py`, `docs/judging.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

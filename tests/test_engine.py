@@ -5494,3 +5494,25 @@ def test_death_screens_are_flagged_never_urgent_and_penalised_only_where_the_cha
     engine_default = G.engine_score(sig, G.DEFAULTS)["score"]
     house = G.engine_score(sig, {**G.DEFAULTS, "penalties": {**G.DEFAULTS["penalties"], "death": 0.5}})
     assert engine_default > 0 and house["score"] == round(engine_default * 0.5, 1) and "death ×0.5" in house["why"]
+
+
+def test_engine_call_drops_low_scores_ships_from_70_and_eval_shows_the_base_rate(monkeypatch, capsys):
+    """J2 (Nov 21): the old call assumed a perfect rubric, so it held everything from engine 33 — the editor dropped
+    14 of 15 held drafts between 35 and 55. Agreement alone rewards dropping everything, so eval-judge also prints
+    the confusion table, ship precision, keepers caught and the commonest-call baseline."""
+    from clipengine import judge as JG, grade as G
+    cfg = {**G.DEFAULTS, "judge_call": {"drop_below": 56, "ship_from": 70}, "penalties": {**G.DEFAULTS["penalties"], "death": 0.5}}
+    monkeypatch.setattr(G, "config", lambda: cfg)
+    assert JG.engine_call({"engine": 40.0}) == "drop" and JG.engine_call({"engine": 60.0}) == "hold"
+    assert JG.engine_call({"engine": 82.0}) == "ship"
+    assert JG.engine_call({"engine": 82.0, "flags": ["death screen? (said: he died)"]}) == "drop"
+    assert JG.engine_call({"engine": 82.0, "unsafe": "x"}) == "drop" and JG.engine_call({}) is None
+    monkeypatch.setattr(G, "config", lambda: {**cfg, "penalties": G.DEFAULTS["penalties"]})     # no death rule
+    assert JG.engine_call({"engine": 82.0, "flags": ["death screen? (said: he died)"]}) == "ship"
+    monkeypatch.setattr(G, "config", lambda: cfg)
+    rows = [{"kind": "judgment", "id": f"d{i}", "verdict": "drop", "engine_call": "hold", "engine": 40.0} for i in range(8)]
+    rows += [{"kind": "judgment", "id": "k1", "verdict": "ship", "engine_call": "ship", "engine": 75.0}]
+    st = JG.eval_judge(rows)
+    out = capsys.readouterr().out
+    assert "engine \\ editor" in out and "always-the-commonest-call baseline: 8/9" in out
+    assert st["ship_precision"] == (1, 1) and st["keepers_caught"] == (1, 1) and st["today_rule"] == (9, 9)

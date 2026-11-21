@@ -131,23 +131,33 @@ def score_snapshot(engine: dict, signals: dict) -> dict:
             "duration_s": speech.get("dur"), "reaction": signals.get("reaction"), "why": engine["why"]}
 
 
+CALL_DEFAULTS = {"drop_below": 50.0, "ship_from": 70.0}
+
+
 def engine_call(draft: dict) -> str | None:
-    """Compare the pre-judgment prediction against the configured distribution bars."""
-    from . import gate
+    """The engine's own ship / hold / drop before an editor looks (J2 compares it with the editor's call).
+
+    drop  unsafe, already dropped, a possible death screen the channel penalises, or an engine score under
+          `drop_below` (the old rule assumed a PERFECT rubric, so it held everything from 33 up — Nov 21: the editor
+          dropped 14 of 15 held drafts between 35 and 55)
+    ship  an engine score from `ship_from`, not flagged
+    hold  in between: look at the frames
+    Thresholds: config/grading.json "judge_call" (defaults 50 / 70)."""
     from . import grade
 
     if draft.get("unsafe") or draft.get("status") == "dropped":
         return "drop"
     score = draft.get("engine")
-    best = draft.get("best")
-    floor = min(platform["min_score"] for platform in gate.config()["platforms"].values())
-    if best is None and score is not None:
-        best = grade.banger(score, None)["best_possible"]
-    if best is None:
+    if score is None:
         return None
-    if best < floor:
+    cfg = grade.config()
+    calls = {**CALL_DEFAULTS, **(cfg.get("judge_call") or {})}
+    flags = " ".join(str(f) for f in draft.get("flags") or []).lower()
+    if "death screen?" in flags and float((cfg.get("penalties") or {}).get("death", 1.0)) < 1.0:
         return "drop"
-    return "ship" if score is not None and score >= floor else "hold"
+    if score < calls["drop_below"]:
+        return "drop"
+    return "ship" if score >= calls["ship_from"] else "hold"
 
 
 def artifact_id(draft: dict, path: str | None = None) -> str | None:
@@ -192,7 +202,7 @@ def _record(draft: dict, verdict: str, reason: str, *, frames=(), override: str 
            "duration_s": snapshot.get("duration_s") or (
                draft["stop"] - draft["start"] if draft.get("start") is not None and draft.get("stop") is not None else None),
            "reaction": snapshot.get("reaction"), "why": snapshot.get("why") or [],
-           "at": _now_iso()}
+           "flags": list(draft.get("flags") or []), "at": _now_iso()}
     if override:
         row["truth_override"] = override
     if slug:
@@ -266,6 +276,28 @@ def eval_judge(rows: list[dict] | None = None) -> dict:
         result = f"{100 * correct / len(group):.0f}%" if group else "no scored examples"
         print(f"{name}: {correct}/{len(group)} agree ({result})")
     print(f"low-speech keepers: {sum(r['verdict'] == 'ship' for r in low)} · unscored judgments: {len(latest) - len(judged)}")
+    # agreement alone rewards "drop everything" when editors drop most drafts: show what the calls actually do
+    from collections import Counter
+    cm = Counter((r["engine_call"], r["verdict"]) for r in judged)
+    order = ("ship", "hold", "drop")
+    print("engine \\ editor   " + "  ".join(f"{v:>5}" for v in order))
+    for e in order:
+        print(f"  {e:<15} " + "  ".join(f"{cm[(e, v)]:>5}" for v in order))
+    ships = [r for r in judged if r["engine_call"] == "ship"]
+    kept = [r for r in judged if r["verdict"] == "ship"]
+    base = max((sum(r["verdict"] == v for r in judged) for v in order), default=0)
+    stats["ship_precision"] = (sum(r["verdict"] == "ship" for r in ships), len(ships))
+    stats["keepers_caught"] = (sum(r["engine_call"] == "ship" for r in kept), len(kept))
+    print(f"ship calls right: {stats['ship_precision'][0]}/{stats['ship_precision'][1]} · editor's keepers the engine "
+          f"shipped: {stats['keepers_caught'][0]}/{stats['keepers_caught'][1]} · always-the-commonest-call baseline: "
+          f"{base}/{len(judged)}")
+    today = [(engine_call({"engine": r.get("engine"), "flags": r.get("flags") or []}), r["verdict"]) for r in judged
+             if r.get("engine") is not None]
+    if today:
+        ok = sum(c == v for c, v in today)
+        stats["today_rule"] = (ok, len(today))
+        print(f"today's rule on the same drafts: {ok}/{len(today)} agree ({100 * ok / len(today):.0f}%) "
+              f"(calls above are as made at the time)")
     for r in judged:
         if r["engine_call"] == r["verdict"]:
             continue
