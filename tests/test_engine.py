@@ -2116,6 +2116,32 @@ def _tiny_rec(tmp_path, n=12, login="streamera"):
     return rec, t0
 
 
+def test_publish_queued_without_prerender_audits_the_payoff_after_trim(tmp_path, monkeypatch):
+    from clipengine import __main__ as CLI, publish as PB, sentinel as SN
+
+    rec, t0 = _tiny_rec(tmp_path, n=7)
+    start, stop, payoff = t0 + 3, t0 + 10, t0 + 7
+    words = rec / "drafts" / "queued.words.json"
+    words.write_text(json.dumps({"start": t0, "stop": t0 + 14, "words": [
+        {"w": "Look!", "start": payoff, "end": payoff + 0.5, "spk": "streamer"},
+    ]}))
+    entry = {"id": "queued", "login": "streamera", "rec": str(rec), "start": start, "stop": stop,
+             "payoff": payoff, "words": str(words), "status": "new"}
+    monkeypatch.setattr(SN, "load_queue", lambda: [entry])
+    monkeypatch.setattr(PB, "already_clipped", lambda *args: None)
+    audits = []
+
+    def finish(report, *args, **kwargs):
+        audits.append(report["audit"])
+        return {}
+
+    monkeypatch.setattr(PB, "_finish", finish)
+    assert CLI.main(["publish-queued", "--id", "queued", "--title", "Look at THAT", "--line", "Look",
+                     "--start", "1", "--check", "--no-push"]) == 0
+    assert len(audits) == 1 and audits[0]["ok"]
+    assert "payoff at 3.0 s inside" in audits[0]["line"] and audits[0]["want"] == 6
+
+
 def test_prerendered_draft_publishes_by_burning_only_the_card(tmp_path, monkeypatch):
     import json as _json
     import time as _time
@@ -4128,6 +4154,57 @@ def test_admission_serves_the_live_moment_before_catchup_and_respects_memory(tmp
     assert ADM.kind_of(["x", "publish-queued"]) == "publish"
 
 
+def test_publish_ages_past_a_continuous_live_backlog(tmp_path, monkeypatch):
+    import threading
+    import time
+    from types import SimpleNamespace
+    from clipengine import admission as AD
+
+    root = str(tmp_path)
+    clock = [1_000.0]
+    monkeypatch.setattr(AD, "time", SimpleNamespace(time=lambda: clock[0], time_ns=time.time_ns, sleep=time.sleep))
+    ready = threading.Event()
+    first_live = threading.Event()
+    release_live = threading.Event()
+    order = []
+
+    def job(kind):
+        with AD.slot(kind, kind=kind, root=root, slots=1, min_free_gb=1, poll_s=0.01,
+                     free=lambda: 2 if ready.is_set() else 0, say=lambda _: None):
+            order.append(kind)
+            if len(order) == 1 and kind == "live":
+                first_live.set()
+                release_live.wait(3)
+
+    threads = []
+
+    def queue(kind, size):
+        t = threading.Thread(target=job, args=(kind,), daemon=True)
+        threads.append(t)
+        t.start()
+        deadline = time.monotonic() + 3
+        while len(AD.waiters(root)) < size and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(AD.waiters(root)) == size
+
+    queue("publish", 1)
+    clock[0] += 60
+    for n in range(2, 6):
+        queue("live", n)
+    clock[0] = 1_179.0
+    assert AD.waiters(root)[0]["kind"] == "live"
+    ready.set()
+    try:
+        assert first_live.wait(3)
+        clock[0] = 1_180.0
+        assert [r["kind"] for r in AD.waiters(root)] == ["publish", "live", "live", "live"]
+    finally:
+        release_live.set()
+        for t in threads:
+            t.join(timeout=3)
+    assert order == ["live", "publish", "live", "live", "live"]
+
+
 def test_admission_is_reentrant_inside_one_job(tmp_path):
     from clipengine import admission as ADM
     with ADM.slot("render", kind="publish", root=str(tmp_path), slots=1, min_free_gb=0):
@@ -4217,6 +4294,35 @@ def test_a_quiet_visual_winner_reaches_review_without_words(tmp_path):
                         judgment={"speech_s": 0.0, "parts": {"reaction": 0.0, "crowd": 0.8, "audio": 0.2}})
     a = TR.assess(quiet, now)
     assert a["route"] == "review" and "viewers clipped it" in a["reason"] and "no words" in a["reason"]
+
+
+def test_review_evidence_keeps_duds_out_of_both_automatic_prerender_paths(tmp_path, monkeypatch):
+    from clipengine import prerender as PR, sentinel as SN, triage as TR
+
+    cases = [
+        ({"flags": ["19.5s silent stretch"]}, "without speech"),
+        ({"flags": ["first word at 34.3s (dead open)"]}, "without speech"),
+        ({"judgment": {"speech_s": 2, "duration_s": 30}}, "no viewer clip"),
+        ({"visual": {"menu": 0.88}}, "menu-heavy"),
+        ({"visual": {"offgame": 0.83}}, "off-game"),
+        ({"titles": ["There is a dog"], "visual": {"viewer_title_fit": -0.05}}, "viewer clip title"),
+    ]
+    drafts = []
+    for i, (fields, reason) in enumerate(cases):
+        draft, now = _draft(tmp_path, f"review-{i}", **fields)
+        result = TR.assess(draft, now, floor=60)
+        assert result["route"] == "review" and reason in result["reason"]
+        drafts.append(draft)
+    keep, _ = _draft(tmp_path, "supported", titles=["A jump"], visual={"viewer_title_fit": 0.03},
+                     judgment={"speech_s": 2, "duration_s": 30})
+    monkeypatch.setattr(PR.time, "time", lambda: now)
+    monkeypatch.setattr(SN, "load_queue", lambda: drafts + [keep])
+    assert PR.pending() == [keep]                     # the cycle's pending worker
+    rendered = []
+    monkeypatch.setattr(PR, "prerender", lambda entry: rendered.append(entry))
+    for entry in drafts + [keep]:
+        SN._prerender_safe(entry)                     # immediate sentinel path, before cycle triage
+    assert rendered == [keep]
 
 
 def test_a_mid_sentence_cut_is_repaired_once_into_the_handles(tmp_path):
@@ -4442,6 +4548,7 @@ def test_the_reboot_drill_one_reboot_incident_then_the_keeper_holds_the_loop(tmp
                                                            "progress_at": old, "phase": "sleep", "started_by": "service"}))
     SV.save_settings(str(root), every=5, sessions=False, kind="systemd")
     code = (f"import sys; sys.path.insert(0, {REPO!r}); from clipengine import autopilot as AP; "
+            "from clipengine import supervise as SV; SV.boot_id=lambda: 'test-current-boot'; "
             f"AP.APSTATE={str(root / 'autopilot.json')!r}; AP.RUNS={str(root)!r}; "
             "AP.autopilot_run(5, cycle_cmd=[sys.executable, '-c', 'print(1)'])")
     kids, done = [], []
@@ -5810,6 +5917,23 @@ def test_the_picture_model_reads_a_contact_sheet_into_group_shares_and_flags_an_
     assert VS.assess(sheet, root=str(tmp_path))["flags"] == []                          # advisory: nothing else flags
 
 
+def test_picture_reads_keep_the_best_viewer_title_match(tmp_path, monkeypatch):
+    from clipengine import visual as VS
+
+    class TitleModel(_FakeClip):
+        def embed_texts(self, texts):
+            action = self.prompts[0]
+            matching = {"a video game scene", "a video game scene: A jump"}
+            return super().embed_texts([action if t in matching else t for t in texts])
+
+    sheet = _sheet(tmp_path / "a.png", [(255, 0, 0)] * 4)
+    monkeypatch.setattr(VS.Model, "_one", TitleModel())
+    monkeypatch.setattr(VS, "ready", lambda: True)
+    assert VS.assess(sheet, titles=["A dog"])["viewer_title_fit"] == -1.0
+    assert VS.assess(sheet, titles=["A dog", "A jump"])["viewer_title_fit"] == 0.0
+    assert VS.headline_fit("A dog", VS.tiles(sheet)) == -1.0
+
+
 def test_an_adult_scene_flag_demotes_a_draft_and_it_is_never_urgent():
     from clipengine import grade as G, sentinel as SN
     flag = "adult scene on screen? (picture 0.98) — look before posting"
@@ -5864,6 +5988,7 @@ def test_visual_setup_installs_only_files_that_match_their_checksums(tmp_path, m
     import hashlib
     from clipengine import visual as VS
     monkeypatch.setenv("CLIPENGINE_MODELS", str(tmp_path / "m"))
+    monkeypatch.setattr(VS, "runtime_ok", lambda: (True, ""))  # exercise the download and checksum paths offline
     body = {n: f"model {n}".encode() for n in VS.FILES}
     monkeypatch.setattr(VS, "FILES", {n: hashlib.sha256(b).hexdigest() for n, b in body.items()})
     urls = []
@@ -5886,13 +6011,19 @@ def test_catch_up_drafts_read_the_picture_from_the_scan_thumbnails(monkeypatch):
     from clipengine import autopilot as AP, visual as VS
     flag = "adult scene on screen? (picture 0.97) — look before posting"
     monkeypatch.setattr(VS, "thumb_images", lambda thumbs: ["img"] * len(thumbs))
-    monkeypatch.setattr(VS, "assess_images", lambda ims, root=None: {"adult_peak": 0.97, "look": 0.1, "action": 0.4,
-                                                                    "flags": [flag]})
+
+    def assess(ims, *, titles=None):
+        assert ims == ["img"] * 4 and titles == ["A dog"]
+        return {"adult_peak": 0.97, "look": 0.1, "action": 0.4, "flags": [flag], "viewer_title_fit": -0.05}
+
+    monkeypatch.setattr(VS, "assess_images", assess)
     c = {"probed": True, "rank": 1, "peak_s": 100, "window": {"start_s": 90, "end_s": 120}, "chat_score": 2.0,
-         "flags": [], "thumbs": ["data:image/jpeg;base64,AA=="] * 4, "transcript_text": "no way"}
+         "flags": [], "thumbs": ["data:image/jpeg;base64,AA=="] * 4, "transcript_text": "no way",
+         "crowd": {"views": 15, "views_per_min": 2, "titles": ["A dog"]}}
     vod = {"id": "1", "created_at": "2026-11-22T10:00:00Z", "login": "streamera"}
     q = AP.queue_entry_from_candidate(c, vod, "/tmp/x/scan", "streamera", now=1.8e9)
     assert flag in q["flags"] and q["visual"]["adult_peak"] == 0.97 and "flags" not in q["visual"]
-    monkeypatch.setattr(VS, "assess_images", lambda ims, root=None: {})
+    assert q["visual"]["viewer_title_fit"] == -0.05
+    monkeypatch.setattr(VS, "assess_images", lambda ims, *, titles=None: {})
     plain = AP.queue_entry_from_candidate(c, vod, "/tmp/x/scan", "streamera", now=1.8e9)
     assert "visual" not in plain and plain["best"] > q["best"]

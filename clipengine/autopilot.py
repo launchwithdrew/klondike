@@ -534,7 +534,8 @@ def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, no
     created = _epoch(vod["created_at"])
     w = c.get("window") or {"start_s": c["clip_start_s"], "end_s": c["clip_end_s"]}
     from . import visual as VS
-    seen = VS.assess_images(VS.thumb_images(c.get("thumbs"))) if c.get("thumbs") else {}
+    crowd = c.get("crowd") or {}
+    seen = VS.assess_images(VS.thumb_images(c["thumbs"]), titles=crowd.get("titles")) if c.get("thumbs") else {}
     if seen.get("flags"):
         c = {**c, "flags": (c.get("flags") or []) + seen["flags"]}
     seen.pop("flags", None)
@@ -542,7 +543,6 @@ def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, no
     eng = G.engine_score(sig)
     best = G.banger(eng["score"], None)["best_possible"]
     s, e = created + w["start_s"], created + w["end_s"]
-    crowd = c.get("crowd") or {}
     return {"id": f"{login}-v{dt.datetime.fromtimestamp(s, dt.timezone.utc):%H%M%S}", "login": login,
             "rec": os.path.dirname(scan_dir), "start": round(s, 1), "stop": round(e, 1),
             "at": dt.datetime.fromtimestamp(created + c["peak_s"], dt.timezone.utc).isoformat(),

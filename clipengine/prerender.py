@@ -59,14 +59,17 @@ def paths(entry: dict) -> tuple[str, str]:
 
 
 def eligible(entry: dict, floor: float | None = None, max_age_h: float = 6.0) -> bool:
-    """A recording draft worth a look: new, safe, fresh, able to clear some platform's bar."""
+    """Only automatically pre-render drafts routed to preview."""
+    from . import triage as TR
+
     if entry.get("scan") or not entry.get("rec") or entry.get("payoff") is None:
         return False                                   # catch-up (VOD) drafts render through the scan path
     if entry.get("status") != "new" or entry.get("unsafe"):
         return False
     if time.time() - entry.get("stop", 0) > max_age_h * 3600:
         return False
-    return entry.get("best", 0) >= (_floor() if floor is None else floor)
+    floor = _floor() if floor is None else floor
+    return entry.get("best", 0) >= floor and TR.assess(entry, floor=floor)["route"] == "preview"
 
 
 def load(entry: dict) -> dict | None:

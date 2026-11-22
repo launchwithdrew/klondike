@@ -3,8 +3,8 @@
 Recording never goes through here — it is light and must never wait. Heavy work does: speech transcription
 and video encodes, whichever route asked for them (a sentinel's draft, catch-up, the sweep, pre-renders,
 publish, a manual scan). At most `heavy_slots` run at once (config/ops.json; the lite profile is 1, the full
-profile 2). Waiters take turns by priority — a fresh live moment first, then the operator's publish, then
-catch-up, then the sweep and pre-renders, then historical scans — and while free memory is below
+profile 2). A live moment normally gets the next slot. A publish waiting three minutes goes ahead of live
+work when a slot opens. Catch-up, sweep, pre-renders and historical scans follow. While free memory is below
 `heavy_min_free_gb` nothing heavy starts, so a big job can't push the recorders into the out-of-memory killer.
 
 Every wait and run is logged in runs/heavy/log.jsonl (kind, stage, seconds waiting, seconds running), so
@@ -25,6 +25,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(REPO, "runs")
 PRIORITY = {"live": 0, "publish": 1, "catchup": 2, "sweep": 3, "prerender": 3, "scan": 4}
+PUBLISH_WAIT_S = 180
 POLL_S = 2.0
 _local = threading.local()
 
@@ -89,7 +90,12 @@ def _alive(pid) -> bool:
         return False
 
 
-def waiters(root: str | None = None) -> list[dict]:
+def _order(waiter: dict, now: float) -> tuple:
+    aged = waiter["kind"] == "publish" and now - waiter["since"] >= PUBLISH_WAIT_S
+    return (-1 if aged else waiter["prio"], waiter["since"], waiter["file"])
+
+
+def waiters(root: str | None = None, *, now: float | None = None) -> list[dict]:
     out = []
     for f in glob.glob(os.path.join(_dir(root), "wait", "*.json")):
         try:
@@ -103,7 +109,8 @@ def waiters(root: str | None = None) -> list[dict]:
                 pass
             continue
         out.append({**w, "file": f})
-    return sorted(out, key=lambda w: (w["prio"], w["since"]))
+    now = time.time() if now is None else now
+    return sorted(out, key=lambda w: _order(w, now))
 
 
 def running(root: str | None = None) -> list[dict]:
@@ -157,13 +164,15 @@ def slot(stage: str, kind: str | None = None, root: str | None = None, slots: in
     os.makedirs(os.path.join(d, "wait"), exist_ok=True)
     since = time.time()
     me = os.path.join(d, "wait", f"{PRIORITY.get(kind, 4)}-{time.time_ns()}-{os.getpid()}.json")
+    waiter = {"kind": kind, "stage": stage, "prio": PRIORITY.get(kind, 4), "pid": os.getpid(),
+              "since": since, "file": me}
     told = None
     fd, idx = None, None
     try:
         while True:
             reason = None
-            ahead = [w for w in waiters(root) if (w["prio"], w["since"]) < (PRIORITY.get(kind, 4), since)
-                     and w["pid"] != os.getpid()]
+            now = time.time()
+            ahead = [w for w in waiters(root, now=now) if _order(w, now) < _order(waiter, now)]
             mem = free()
             if ahead:
                 reason = f"waiting behind {ahead[0]['kind']} ({ahead[0]['stage']})"
@@ -183,17 +192,19 @@ def slot(stage: str, kind: str | None = None, root: str | None = None, slots: in
                 busy = running(root)
                 reason = "waiting: all heavy slots busy" + (f" ({', '.join(r['kind'] + ' ' + r['stage'] for r in busy)})"
                                                             if busy else "")
-            json.dump({"kind": kind, "stage": stage, "prio": PRIORITY.get(kind, 4), "pid": os.getpid(),
-                       "since": since, "reason": reason}, open(me, "w"))
+            with open(me + ".tmp", "w") as fh:
+                json.dump({**waiter, "reason": reason}, fh)
+            os.replace(me + ".tmp", me)
             if reason != told and kind in ("publish", "scan") and time.time() - since > 1:
                 say(f"[{stage}] {reason}")
                 told = reason
             time.sleep(poll_s)
     finally:
-        try:
-            os.remove(me)
-        except OSError:
-            pass
+        for path in (me, me + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     waited = time.time() - since
     info = os.path.join(d, f"slot-{idx}.json")
     json.dump({"kind": kind, "stage": stage, "pid": os.getpid(), "since": time.time(), "held": True}, open(info, "w"))

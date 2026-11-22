@@ -228,16 +228,21 @@ def read_sheet(sheet_path: str, model: Model | None = None) -> dict:
     return read(tiles(sheet_path), model)
 
 
-def headline_fit(title: str, images: list, model: Model | None = None) -> float | None:
-    """How much better the headline describes the best frame than a plain 'a video game scene' does (cosine)."""
+def _title_fit(titles: list[str], images: list, model: Model | None = None) -> float | None:
+    """Best title/frame cosine gain over a plain 'a video game scene'."""
     import numpy as np
-    if not title or not images:
+    if not titles or not images:
         return None
     m = model or Model.get()
-    T = m.embed_texts([f"a video game scene: {title}", "a video game scene"])
+    T = m.embed_texts([*(f"a video game scene: {title}" for title in titles), "a video game scene"])
     I = m.embed_images(images)
     s = I @ T.T
-    return round(float(np.max(s[:, 0] - s[:, 1])), 3)
+    return round(float(np.max(s[:, :-1] - s[:, -1:])), 3)
+
+
+def headline_fit(title: str, images: list, model: Model | None = None) -> float | None:
+    """How much better the headline describes the best frame than a plain 'a video game scene' does (cosine)."""
+    return _title_fit([title] if title else [], images, model)
 
 
 def short(v: dict) -> str:
@@ -303,7 +308,7 @@ def adult_flag(v: dict) -> str | None:
     return f"adult scene on screen? (picture {p:.2f}) — look before posting" if p >= ADULT_PEAK else None
 
 
-def assess_images(images: list, root: str | None = None) -> dict:
+def assess_images(images: list, root: str | None = None, *, titles: list[str] | None = None) -> dict:
     """What a new draft gets: the reads + `flags` to add; {} when off / unreadable. Never raises."""
     if not images or mode(root) == "off":
         return {}
@@ -312,14 +317,22 @@ def assess_images(images: list, root: str | None = None) -> dict:
     except Exception:
         return {}
     v["flags"] = [f for f in (adult_flag(v), score_flag(v, root)) if f]
+    if titles:
+        samples = list(dict.fromkeys(t.strip() for t in titles if isinstance(t, str) and t.strip()))[:3]
+        try:
+            fit = _title_fit(samples, images)
+        except Exception:
+            fit = None
+        if fit is not None:
+            v["viewer_title_fit"] = fit
     return v
 
 
-def assess(sheet_path: str | None, root: str | None = None) -> dict:
+def assess(sheet_path: str | None, root: str | None = None, *, titles: list[str] | None = None) -> dict:
     if not sheet_path or not os.path.exists(sheet_path) or mode(root) == "off":
         return {}
     try:
-        return assess_images(tiles(sheet_path), root)
+        return assess_images(tiles(sheet_path), root, titles=titles)
     except Exception:
         return {}
 

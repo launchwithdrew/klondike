@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import time
 
 DEFAULTS = {"breaking_h": 2.0, "evergreen_h": 6.0, "max_repairs": 1}
@@ -59,10 +60,35 @@ def _flags(entry: dict) -> list[str]:
     return [f] if isinstance(f, str) else list(f)
 
 
+def _has_viewer_clip(entry: dict) -> bool:
+    return bool((entry.get("crowd") or _parts(entry).get("crowd") or 0) > 0 or entry.get("titles"))
+
+
+def render_review_reasons(entry: dict) -> list[str]:
+    """Evidence that warrants a look before encoding. Missing evidence leaves that check undecided."""
+    flags = " ".join(_flags(entry)).lower()
+    reasons = []
+    if "silent stretch" in flags or any(float(s) > 12 for s in re.findall(r"first word at (\d+(?:\.\d+)?)s", flags)):
+        reasons.append("over 12 s without speech")
+    j = entry.get("judgment") or {}
+    speech, dur = j.get("speech_s"), j.get("duration_s")
+    if speech is not None and dur and speech < 0.2 * dur and not _has_viewer_clip(entry):
+        reasons.append("under 20% streamer speech with no viewer clip")
+    picture = entry.get("visual") or {}
+    if "menu/map screens" in flags or (picture.get("menu") or 0) >= 0.65:
+        reasons.append("menu-heavy frames")
+    if "recording from " in flags or (picture.get("offgame") or 0) >= 0.65:
+        reasons.append("off-game frames")
+    fit = picture.get("viewer_title_fit")
+    if fit is not None and fit <= -0.01:
+        reasons.append("sampled frames don't support the viewer clip title")
+    return reasons
+
+
 def corroboration(entry: dict) -> list[str]:
     """Evidence that something actually happens, beyond chat noise."""
     parts, ev = _parts(entry), []
-    if (entry.get("crowd") or parts.get("crowd") or 0) > 0 or entry.get("titles"):
+    if _has_viewer_clip(entry):
         ev.append("viewers clipped it")
     if (parts.get("reaction") or 0) >= 0.3:
         ev.append("streamer reaction")
@@ -125,6 +151,9 @@ def assess(entry: dict, now: float | None = None, cfg: dict | None = None, floor
                 + ", no reaction, no viewer clips)", "expires_at": None}
     if entry.get("best", 0) < floor and "viewers clipped it" not in ev:
         return {"route": "none", "reason": "below every bar", "expires_at": expires}
+    review = render_review_reasons(entry)
+    if review:
+        return {"route": "review", "reason": "; ".join(review), "expires_at": expires}
     w = _words(entry)
     if w is not None and entry.get("payoff") is not None:
         edge = cut_mid_sentence(w[0], float(entry["start"]), float(entry["stop"]))

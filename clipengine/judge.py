@@ -203,6 +203,8 @@ def _record(draft: dict, verdict: str, reason: str, *, frames=(), override: str 
                draft["stop"] - draft["start"] if draft.get("start") is not None and draft.get("stop") is not None else None),
            "reaction": snapshot.get("reaction"), "why": snapshot.get("why") or [],
            "flags": list(draft.get("flags") or []), "at": _now_iso()}
+    if draft.get("visual"):
+        row["visual"] = draft["visual"]
     if override:
         row["truth_override"] = override
     if slug:

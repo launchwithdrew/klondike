@@ -888,6 +888,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
         sig["crowd_vpm"] = (sig.get("crowd_vpm") or 0) + 5 * moment["crowd_new"]
     sig["reaction"], sig["reaction_why"] = rx["score"], rx["why"]
     sig["liveliness"] = vis.get("liveliness")
+    speech_gap = max(A.gaps(in_win, s, e))
     misheard = A.misheard_names(in_win, login=login)
     sig["flags"] = (sig.get("flags") or []) + vis["flags"] + \
         ([f"recording from {game}, not {target_game()}"] if bad_game else []) + \
@@ -900,7 +901,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     VI.contact_sheet(src, sheet, start=s - first, dur=e - s)
     os.remove(src)
     from . import visual as VS
-    seen = VS.assess(sheet)                        # what is on screen: safety flags + advice (see visual.py)
+    seen = VS.assess(sheet, titles=sig.get("titles"))  # what is on screen: safety flags + advice
     sig["flags"] = sig["flags"] + seen.pop("flags", [])
     eng = G.engine_score(sig)
     best = G.banger(eng["score"], None)["best_possible"]
@@ -920,7 +921,8 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
              "engine": eng["score"], "best": best, "parts": G.parts_line(eng, sig), "why": eng["why"],
              "liveliness": vis.get("liveliness"), "frames_assessed": bool(vis.get("frames")),
              "judgment": JG.score_snapshot(eng, sig), "titles": sig.get("titles") or [],
-             "flags": sig["flags"], "unsafe": sig["unsafe"], "chat_unsafe": sf.get("chat_hits", []),
+             "flags": sig["flags"] + ([f"{speech_gap:.1f}s silent stretch"] if speech_gap > 12 else []),
+             "unsafe": sig["unsafe"], "chat_unsafe": sf.get("chat_hits", []),
              "chat": " ".join(f"{w}×{n}" for w, n in top), "said": said[:140], "quote_hint": quote[:60],
              "speakers": {k: spk[k] for k in ("streamer_s", "other_s", "game_s", "game_share", "backend")},
              "game": game, "sheet": sheet, "status": "dropped" if reason else "new", "reason": reason or None,

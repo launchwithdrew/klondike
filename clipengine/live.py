@@ -461,7 +461,7 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
                   quote: str | None = None, layout: str = "stack", model: str | None = None,
                   watermark: str | None = None, fixes: dict | None = None,
                   extra_censor: set[str] | None = None, drop_captions: list | None = None,
-                  words: list[dict] | None = None) -> dict:
+                  words: list[dict] | None = None, payoff_ts: float | None = None) -> dict:
     """Render any wall-clock window of a recording (moments found by reading
     the recording itself, not only viewer clips)."""
     from . import audio as A
@@ -504,7 +504,8 @@ def render_window(rec_dir: str, start_ts: float, end_ts: float, out: str, title:
     words = C.apply_fixes(words, fixes)          # e.g. {"kill me?": "kill him?"}
     info = V.render(src, first, start_ts, end_ts, words, out, crop="blur", layout=layout,
                     title=title, quote=quote, watermark=watermark, extra_censor=extra_censor,
-                    drop_captions=drop_captions)
+                    drop_captions=drop_captions,
+                    payoff_s=(payoff_ts - start_ts) if payoff_ts is not None else None)
     os.remove(src)
     got = media_duration(out)
     want = end_ts - start_ts

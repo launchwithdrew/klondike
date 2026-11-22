@@ -415,3 +415,16 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.6.1
+
+- Publishes waiting three minutes get the next available heavy-job slot ahead of live transcription. Recording stays outside the heavy-job queue.
+- Automatic pre-rendering follows triage. Long stretches without speech, thin streamer speech without viewer clips, menu-heavy or off-game frames, and weak viewer-title evidence go to review. Editors can inspect these drafts before choosing a render.
+- The queued live-publish regression renders a trimmed clip and verifies the payoff is inside the output.
+
+Export diff
+- Added (0)
+- Changed (11): `VERSION`, `clipengine/__init__.py`, `clipengine/admission.py`, `clipengine/autopilot.py`, `clipengine/judge.py`, `clipengine/live.py`, `clipengine/prerender.py`, `clipengine/sentinel.py`, `clipengine/triage.py`, `clipengine/visual.py`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.
