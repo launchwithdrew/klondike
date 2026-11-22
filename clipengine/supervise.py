@@ -281,6 +281,13 @@ def reconcile(recovered_by: str | None, root: str | None = None, now: float | No
         AT.event("resolved", "", key=f"incident:{iid}", root=root)
         AT.event("failure", f"autopilot was down {dark_min:.0f} min ({cause}: {evidence[:70]}) — back, "
                  f"recovered by {recovered_by}; incident {iid}", key=f"incident-recovered:{iid}", root=root)
+    if recovered_by:                                        # a leader is running: no other incident is still open
+        for other in list(known.values()):
+            if other.get("id") != iid and other.get("status") == "open":
+                _append_incident({"id": other["id"], "status": "closed-unknown", "closed_at": now,
+                                  "why": "its recovery wasn't recorded (a later leader took over); its length is "
+                                         "unknown, not counted as dark"}, root)
+                AT.event("resolved", "", key=f"incident:{other['id']}", root=root)
     hour = [r for r in incidents(root, since=now - 3600)]
     if len(hour) >= CRASH_LOOP_N:
         AT.event("failure", f"CRASH LOOP: the autopilot died {len(hour)} times in the last hour — last cause "

@@ -159,9 +159,9 @@ def coverage(root: str, since: float, now: float) -> dict:
         live_s += l_s; rec_s += r_s; vod_s += v_s
         per[login] = round(r_s / l_s, 3) if l_s else None
     from . import supervise as SV
-    inc = [r for r in _merged_incidents(root) if (r.get("dark_from") or 0) < now and
-           (r.get("recovered_at") or now) > since]
-    dark = [min(now, r.get("recovered_at") or now) - max(since, r["dark_from"]) for r in inc if r.get("dark_from")]
+    spans, unreconciled = incident_spans(_merged_incidents(root), now)
+    inc = [sp for sp in spans if sp[0] < now and sp[1] > since]
+    dark = [min(now, b) - max(since, a) for a, b, _ in inc]
     hb = _json(os.path.join(root, "config", "ops.json")).get("heartbeat_url")
     held = [r["t"] for ds in recs.values() for d in ds for r in _rows(os.path.join(d, "index.jsonl"))
             if r.get("f") and os.path.isfile(os.path.join(d, "segments", r["f"]))]
@@ -172,12 +172,42 @@ def coverage(root: str, since: float, now: float) -> dict:
             "catchup_covered_min": round(vod_s / 60), "unknown_min": round(max(0.0, live_s - rec_s - vod_s) / 60),
             "covered_share": round((rec_s + vod_s) / live_s, 3) if live_s else None,
             "streams": len(live), "incidents": len(inc), "dark_min": round(sum(dark) / 60, 1),
+            "unreconciled_incidents": [u for u in unreconciled if since <= u["dark_from"] < now],
             "longest_dark_min": round(max(dark) / 60, 1) if dark else 0.0,
             "uptime_share": round(1 - sum(dark) / (now - since), 4),
             "holes_over_10s": holes, "holes_explained": explained, "holes_ads": ads,
             "heartbeat_monitor": "off-host monitor configured" if hb else "local only (no heartbeat_url)",
             "oldest_recuttable_h": oldest,
             "lowest_coverage": [{"login": k, "share": v} for k, v in worst]}
+
+
+def incident_spans(incidents: list[dict], now: float) -> tuple[list[tuple[float, float, str]], list[dict]]:
+    """(start, end, id) of each dark period, never overstated. An incident's end is its recorded recovery, else its
+    own recorded downtime (dark_min), else the next incident's start (the leader was back to die again), else — when
+    it is still open — now, but only if it is the LAST incident (the leader may still be down). An older incident
+    with no end evidence is "unreconciled": listed, not counted (Nov 22: one orphaned open record read as 21.7 h)."""
+    rows = sorted([r for r in incidents if r.get("dark_from")], key=lambda r: r["dark_from"])
+    spans, orphans = [], []
+    for k, r in enumerate(rows):
+        a = float(r["dark_from"])
+        nxt = float(rows[k + 1]["dark_from"]) if k + 1 < len(rows) else None
+        if r.get("status") == "closed-unknown" and not r.get("recovered_at"):
+            orphans.append({"id": r.get("id"), "dark_from": a, "why": r.get("why") or "recovery not recorded"})
+            continue
+        if r.get("recovered_at"):
+            b = float(r["recovered_at"])
+        elif r.get("dark_min") is not None:
+            b = a + float(r["dark_min"]) * 60
+        elif nxt is not None:
+            orphans.append({"id": r.get("id"), "dark_from": a, "why": "no recovery recorded; the leader came back "
+                            "before the next incident"})
+            continue
+        else:
+            b = now                                        # the newest incident, still open: dark until now
+        if nxt is not None:
+            b = min(b, nxt)
+        spans.append((a, max(a, b), r.get("id") or ""))
+    return spans, orphans
 
 
 def _merged_incidents(root: str) -> list[dict]:
@@ -477,7 +507,9 @@ def lines(rep: dict) -> list[str]:
                f"{c['recorded_min']}/{c['live_min']} live min recorded ({c['observed_share']:.0%}) over {c['streams']} "
                f"stream(s) · scanned from saved streams (catch-up / sweep: chat + viewer clips) "
                f"{c['catchup_covered_min']} · covered in all {c['covered_share']:.0%} · unknown {c['unknown_min']} · uptime "
-               f"{c['uptime_share']:.1%} ({c['incidents']} incident(s), longest dark {c['longest_dark_min']} min) · "
+               f"{c['uptime_share']:.1%} ({c['incidents']} incident(s), longest dark {c['longest_dark_min']} min"
+               + (f", {len(c['unreconciled_incidents'])} with no recovery recorded — not counted"
+                  if c.get('unreconciled_incidents') else "") + ") · "
                f"holes>10s {c['holes_over_10s']} ({c['holes_explained']} explained, {c['holes_ads']} ads) · "
                f"oldest re-cuttable {_f(c['oldest_recuttable_h'])} h · "
                f"{c['heartbeat_monitor']}"))

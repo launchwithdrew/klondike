@@ -5595,3 +5595,31 @@ def test_two_installs_one_moment_the_second_refuses_after_importing_the_firsts_l
     imported = [r for r in handpost._ledger() if r.get("imported")]
     assert imported and imported[0]["url"] == receipt_a["url"]                               # receipt 1: A's post in B
     assert "PUBLISH REFUSED" in str(refusal.value)                                           # receipt 2: B's refusal
+
+
+def test_an_incident_whose_recovery_was_never_recorded_is_not_counted_as_dark_until_now(tmp_path, monkeypatch):
+    """Nov 22: metrics showed a 21.7 h outage from one orphaned open incident (its recovery was recorded under another
+    id). Metrics end an incident at the first evidence the leader was back; an orphan is listed, not counted; and a
+    new leader closes any other open incident as closed-unknown."""
+    from clipengine import metrics as MX, supervise as SV
+    now = 1_800_000_000.0
+    rows = [{"id": "a", "dark_from": now - 80000, "status": "open"},
+            {"id": "b", "dark_from": now - 50000, "recovered_at": now - 49000},
+            {"id": "c", "dark_from": now - 3000, "dark_min": 10},
+            {"id": "d", "dark_from": now - 600, "status": "open"}]
+    spans, orphans = MX.incident_spans(rows, now)
+    assert [s[2] for s in spans] == ["b", "c", "d"] and [o["id"] for o in orphans] == ["a"]
+    assert spans[0][1] - spans[0][0] == 1000 and spans[1][1] - spans[1][0] == 600 and spans[2][1] == now   # d: still down
+    # the supervisor side: a new leader takes over; an older open incident gets closed-unknown
+    root = str(tmp_path)
+    monkeypatch.setattr(SV, "classify", lambda *a, **k: ("unknown", "no exit record"))
+    SV._append_incident({"id": "ap-old-3", "dark_from": now - 90000, "detected_at": now - 89000, "status": "open"}, root)
+    prev = {"generation": 7, "boot_id": "bootbootx", "heartbeat_at": now - 300, "started_at": now - 4000}
+    SV.reconcile("service", root=root, now=now, prev=prev)
+    allrows = {}
+    for r in SV.incidents(root):
+        allrows[r["id"]] = {**allrows.get(r["id"], {}), **r}
+    assert allrows["ap-old-3"]["status"] == "closed-unknown"
+    assert allrows["ap-bootboot-7"]["status"] == "recovered"
+    spans, orphans = MX.incident_spans(list(allrows.values()), now)
+    assert [o["id"] for o in orphans] == ["ap-old-3"] and [s[2] for s in spans] == ["ap-bootboot-7"]

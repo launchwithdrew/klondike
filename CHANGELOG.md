@@ -360,3 +360,15 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.4.22
+
+- Weekly `metrics` no longer overstates outages. An incident whose recovery was never recorded used to count as dark from its start until the report ran, so one orphaned record read as a 21.7-hour outage. An incident now ends at the first evidence the leader was back: its recorded recovery, its own recorded downtime, or the next incident's start. One with no such evidence is listed as "no recovery recorded" and not counted. Only the newest incident, if it's still open, counts as dark until now.
+- When a new leader takes over, it closes any other incident still marked open as "closed-unknown". It's kept in the record, but no longer shown as an ongoing outage.
+
+Export diff
+- Added (0)
+- Changed (5): `VERSION`, `clipengine/__init__.py`, `clipengine/metrics.py`, `clipengine/supervise.py`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.
