@@ -84,8 +84,8 @@ Each line is a moment a sentinel caught, already cut, transcribed, safety-checke
    without `--taste` is refused.
 4. Not worth it: `.venv/bin/python -m clipengine skip --id ID`.
 
-The score already looks at the picture (`pic` on the draft's line: how much moves on screen) — menus, maps and
-plain driving with nothing said rank low — but only your look at the contact sheet catches the rest.
+The score already looks at the picture (`pic`: how much moves; `vis`: menus, off-game, adult scenes —
+`docs/visual.md`), but only your look at the contact sheet catches the rest.
 
 Only winners post: each platform has a minimum score and a daily budget, new accounts warm up slowly,
 and below every bar the engine says `NOT POSTED`. That's it working — move on.

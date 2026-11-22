@@ -178,6 +178,13 @@ def main(argv: list[str] | None = None) -> int:
     se_ = sub.add_parser("series", help="a creator's recurring bit: suggestions from our winners (with receipts), confirm one")
     se_.add_argument("--confirm", metavar="LOGIN:WORD", help="confirm a suggested series")
     se_.add_argument("--name", help="its name (with --confirm)")
+    vs_ = sub.add_parser("visual", help="what is on screen (CLIP picture model): setup, eval on judged frames, read a draft")
+    vs_.add_argument("action", choices=["setup", "eval", "read"])
+    vs_.add_argument("--save", action="store_true", help="eval: keep the best measure when it separates (data/visual.json)")
+    vs_.add_argument("--labels", help="eval: folder of judged frames (default data/labels)")
+    vs_.add_argument("--id", help="read: a draft id")
+    vs_.add_argument("--sheet", help="read: a contact sheet image")
+    vs_.add_argument("--title", help="read: also how well this headline fits the frames")
     hl_ = sub.add_parser("headlines", help="up to 3 checked headline options for a draft, from the viewers' clip titles")
     hl_.add_argument("--id", required=True)
     fu_ = sub.add_parser("funnel", help="where moments are lost: each route's drafts → drops → skips → posts, viewer clips caught/missed, holes")
@@ -268,7 +275,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("bank", help="every finished clip per platform: waiting / ready / claimed / uncertain / live")
     sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
-    pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url", required=True)
+    pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url")
+    pd.add_argument("--correct-url", metavar="URL", help="fix the link of an already-recorded live post (with --why)")
+    pd.add_argument("--why", help="with --correct-url: what you checked")
     pd.add_argument("--confirmed", action="store_true", help="you opened the post and saw it plays as our account (Instagram always; TikTok/YouTube when the platform won't confirm the author from this host)")
     pd.add_argument("--override", metavar="REASON", help="the owner had it posted outside the gate (no drop, or a "
                     "platform the drop didn't list): recorded with this reason, left out of learning")
@@ -448,6 +457,31 @@ def main(argv: list[str] | None = None) -> int:
                   "continue it are labelled in `queue`")
         else:
             print("\n".join(SR.lines()))
+        return 0
+    if a.cmd == "visual":
+        from . import visual as VS
+        if a.action == "setup":
+            return 0 if VS.setup() else 1
+        if not VS.ready():
+            print("visual: not set up — run `clipengine visual setup` (downloads the 155 MB picture model once)")
+            return 1
+        if a.action == "eval":
+            VS.evaluate(a.labels, save=a.save)
+            return 0
+        sheet = a.sheet
+        if a.id:
+            from . import sentinel as SN
+            d = next((r for r in SN.load_queue() if r["id"] == a.id), None)
+            sheet = (d or {}).get("sheet")
+            if not sheet:
+                ap.error(f"visual read: no draft {a.id} with a contact sheet")
+        if not sheet:
+            ap.error("visual read needs --id or --sheet")
+        v = VS.read_sheet(sheet)
+        print(json.dumps(v))
+        print(VS.short(v))
+        if a.title:
+            print(f"headline fit {VS.headline_fit(a.title, VS.tiles(sheet)):+.3f} (vs a plain 'a video game scene')")
         return 0
     if a.cmd == "headlines":
         from . import judge as JG, sentinel as SN
@@ -685,7 +719,12 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "to-post":
             HP.show()
         elif a.cmd == "posted":
-            print(HP.mark(a.slug, a.platform, a.url, a.confirmed, a.override, a.login, a.moment_at))
+            if a.correct_url:
+                print(HP.correct_url(a.slug, a.platform, a.correct_url, a.why or ""))
+            elif not a.url:
+                ap.error("posted needs --url (or --correct-url URL --why …)")
+            else:
+                print(HP.mark(a.slug, a.platform, a.url, a.confirmed, a.override, a.login, a.moment_at))
         elif a.cmd == "to-measure":
             HP.show_measure()
         elif a.cmd == "followers":

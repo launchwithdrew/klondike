@@ -5713,3 +5713,186 @@ def test_the_queue_puts_chat_and_loudness_only_drafts_last_as_maybe(tmp_path, ca
     SN.show_queue(str(tmp_path), seen=False)
     out = capsys.readouterr().out
     assert out.index("crowd") < out.index("— maybe") < out.index("chat-only")      # the crowd's vote first
+
+
+def test_retiming_matches_number_words_to_digits_and_never_pairs_empty_tokens():
+    """Addendum §6 (Nov 19): on the Agent jet clip captions landed up to 9.5 s early — "Six" vs "6" didn't match, and
+    tokens that normalised to nothing (digits, emoji) matched each other across the clip."""
+    from clipengine import pipeline as P
+    model = [{"w": " got", "start": 0, "end": 0}, {"w": " 6", "start": 0, "end": 0}, {"w": " stars", "start": 0, "end": 0},
+             {"w": " 💀", "start": 0, "end": 0}, {"w": " run", "start": 0, "end": 0}]
+    timing = [{"w": "100", "start": 1.0, "end": 1.3}, {"w": "🔥", "start": 1.5, "end": 1.6},
+              {"w": "got", "start": 10.0, "end": 10.2}, {"w": "Six", "start": 10.3, "end": 10.6},
+              {"w": "stars", "start": 10.7, "end": 11.0}, {"w": "run", "start": 12.0, "end": 12.3}]
+    out, matched, n = P.retime_words(model, timing)
+    by = {w["w"].strip(): w["start"] for w in out}
+    assert by["6"] == 10.3 and by["got"] == 10.0 and by["stars"] == 10.7     # the digit took "Six"'s time
+    assert 11.0 <= by["💀"] <= 12.0                                          # interpolated, not pulled to 1.5 s
+    assert matched == 4 and n == 5
+
+
+def test_a_wrong_ledger_link_is_corrected_in_place_with_the_old_one_kept(tmp_path, monkeypatch):
+    """Addendum §6: a clip's YouTube row pointed at a pre-recorded link, not the live Short."""
+    from clipengine import handpost as HP
+    monkeypatch.setattr(HP, "REPO", str(tmp_path))
+    monkeypatch.setattr(HP, "_sync", lambda *a: None)
+    rows = [{"slug": "a_clip", "platform": "youtube", "url": "https://youtube.com/shorts/aaaaaaaaaaa", "status": "live", "at": "x"},
+            {"slug": "a_clip", "platform": "tiktok", "url": "https://www.tiktok.com/@acct/video/1", "status": "live", "at": "x"}]
+    (tmp_path / "ledger.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    with pytest.raises(SystemExit, match="--why"):
+        HP.correct_url("a_clip", "youtube", "https://youtube.com/shorts/bbbbbbbbbbb", "")
+    msg = HP.correct_url("a_clip", "youtube", "https://youtube.com/shorts/bbbbbbbbbbb", "opened Studio: the live Short")
+    got = [json.loads(l) for l in open(tmp_path / "ledger.jsonl")]
+    assert got[0]["url"] == "https://youtube.com/shorts/bbbbbbbbbbb" and got[0]["url_was"].endswith("aaaaaaaaaaa")
+    assert got[0]["url_fix"]["why"].startswith("opened Studio") and got[1] == rows[1] and "→" in msg
+    assert "already points" in HP.correct_url("a_clip", "youtube", "https://youtube.com/shorts/bbbbbbbbbbb", "again")
+    with pytest.raises(SystemExit, match="no live tiktok row for other"):
+        HP.correct_url("other", "tiktok", "https://www.tiktok.com/@acct/video/2", "x")
+
+
+class _FakeClip:
+    """A stand-in picture model: each image's mean colour picks the prompt group it 'looks like'."""
+    def __init__(self):
+        from clipengine import visual as VS
+        self.prompts = [p for g in VS.GROUPS for p in VS.PROMPTS[g]]
+        self.group = {p: g for g in VS.GROUPS for p in VS.PROMPTS[g]}
+
+    def embed_texts(self, texts):
+        import numpy as np
+        from clipengine import visual as VS
+        out = []
+        for t in texts:
+            v = np.zeros(8, dtype=np.float32)
+            g = self.group.get(t)
+            v[VS.GROUPS.index(g) if g else 7] = 1.0
+            out.append(v)
+        return np.vstack(out)
+
+    def embed_images(self, images):
+        import numpy as np
+        from clipengine import visual as VS
+        out = []
+        for im in images:
+            r, g_, b = im.convert("RGB").resize((1, 1)).getpixel((0, 0))
+            name = {(255, 0, 0): "action", (0, 0, 255): "menu", (255, 0, 255): "adult"}.get((r, g_, b), "dull")
+            v = np.zeros(8, dtype=np.float32)
+            v[VS.GROUPS.index(name)] = 1.0
+            out.append(v)
+        return np.vstack(out)
+
+
+def _sheet(path, colours, per_row=4, tile=(160, 90)):
+    from PIL import Image
+    rows = (len(colours) + per_row - 1) // per_row
+    sh = Image.new("RGB", (tile[0] * per_row, tile[1] * rows))
+    for i, c in enumerate(colours):
+        sh.paste(Image.new("RGB", tile, c), ((i % per_row) * tile[0], (i // per_row) * tile[1]))
+    sh.save(path)
+    return str(path)
+
+
+def test_the_picture_model_reads_a_contact_sheet_into_group_shares_and_flags_an_adult_scene(tmp_path, monkeypatch):
+    """Wishlist 1: what is on screen — menus, action, adult scenes — read frame by frame from the draft's sheet."""
+    from clipengine import visual as VS
+    monkeypatch.setattr(VS.Model, "_one", _FakeClip())
+    red, blue, pink, grey = (255, 0, 0), (0, 0, 255), (255, 0, 255), (90, 90, 90)
+    sheet = _sheet(tmp_path / "a.png", [red, red, blue, blue, red, red, red, red])
+    assert len(VS.tiles(sheet)) == 8
+    v = VS.read_sheet(sheet)
+    assert v["frames"] == 8 and abs(sum(v[g] for g in VS.GROUPS) - 1) < 0.01
+    assert v["action"] > 0.7 and v["menu"] > 0.2 and v["look"] < v["action"]
+    assert "act 0.75" in VS.short(v) and "menu 0.25" in VS.short(v)
+    one_row = _sheet(tmp_path / "b.png", [grey, grey, pink, grey], tile=(480, 270))      # catch-up: 4 in a row
+    assert len(VS.tiles(one_row)) == 4
+    monkeypatch.setattr(VS, "ready", lambda: True)
+    seen = VS.assess(one_row, root=str(tmp_path))
+    assert seen["adult_peak"] > 0.9 and seen["flags"] == [VS.adult_flag(seen)] and "look before posting" in seen["flags"][0]
+    assert VS.assess(sheet, root=str(tmp_path))["flags"] == []                          # advisory: nothing else flags
+
+
+def test_an_adult_scene_flag_demotes_a_draft_and_it_is_never_urgent():
+    from clipengine import grade as G, sentinel as SN
+    flag = "adult scene on screen? (picture 0.98) — look before posting"
+    base = {"crowd_vpm": 40, "chat_score": 0.9, "audio_factor": 0.9, "streamer_factor": 1.0, "age_h": 0.1, "flags": []}
+    clean, flagged = G.engine_score(base)["score"], G.engine_score({**base, "flags": [flag]})
+    assert flagged["score"] < 0.5 * clean and any("adult_scene" in w for w in flagged["why"])
+    hot = {"best": 90, "status": "new", "parts": "sp 4s ch .9 au .9 re .70 cr 40/min", "titles": ["W"]}
+    assert SN.is_urgent(hot) and not SN.is_urgent({**hot, "flags": [flag]})
+
+
+def test_score_mode_waits_for_a_saved_eval_that_separates(tmp_path, monkeypatch):
+    from clipengine import visual as VS
+    monkeypatch.setattr(VS, "ready", lambda: True)
+    monkeypatch.setattr(VS, "_cfg", lambda: {"mode": "score"})
+    root = str(tmp_path)
+    assert VS.mode(root) == "advisory" and VS.score_flag({"look": -0.5}, root) is None
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "visual.json").write_text(json.dumps({"measure": "look", "auc": 0.66, "threshold": 0.0, "ships_high": True}))
+    assert VS.mode(root) == "advisory"                                                 # under 0.70: not trusted
+    (tmp_path / "data" / "visual.json").write_text(json.dumps({"measure": "look", "auc": 0.81, "threshold": 0.0, "ships_high": True}))
+    assert VS.mode(root) == "score"
+    assert "visual look -0.50" in VS.score_flag({"look": -0.5}, root) and VS.score_flag({"look": 0.2}, root) is None
+    monkeypatch.setattr(VS, "_cfg", lambda: {"mode": "off"})
+    assert VS.mode(root) == "off" and VS.assess("/nope.jpg", root) == {}
+
+
+def test_visual_eval_scores_judged_frames_and_saves_only_a_measure_that_separates(tmp_path, capsys):
+    from clipengine import visual as VS
+    labels = tmp_path / "data" / "labels"
+    for i in range(10):
+        for verdict, look in (("ship", 0.3 + i / 100), ("drop", -0.3 + i / 100)):
+            d = labels / f"{verdict}-{i}" / verdict
+            d.mkdir(parents=True)
+            (d / "frame-1.jpg").write_text(str(look))
+    reader = lambda paths: {m: float(open(paths[0]).read()) if m == "look" else 0.5 for m in VS.MEASURES}
+    res = VS.evaluate(str(labels), reader=reader, save=True, root=str(tmp_path))
+    assert res["ships"] == 10 and res["drops"] == 10 and res["best"] == "look" and res["separates"]
+    saved = json.loads((tmp_path / "data" / "visual.json").read_text())
+    assert saved["auc"] == 1.0 and saved["ships_high"] and -0.3 < saved["threshold"] <= 0.3
+    assert "SEPARATES" in capsys.readouterr().out
+    few = tmp_path / "few"
+    for verdict, look in (("ship", 0.4), ("drop", -0.4)):
+        (few / f"x-{verdict}" / verdict).mkdir(parents=True)
+        (few / f"x-{verdict}" / verdict / "frame-1.jpg").write_text(str(look))
+    (tmp_path / "data" / "visual.json").unlink()
+    res = VS.evaluate(str(few), reader=reader, save=True, root=str(tmp_path))
+    assert not res["separates"] and not (tmp_path / "data" / "visual.json").exists()
+    assert VS.auc([1, 2], [0, 2]) == 0.625 and VS.auc([], [1]) is None
+
+
+def test_visual_setup_installs_only_files_that_match_their_checksums(tmp_path, monkeypatch):
+    import hashlib
+    from clipengine import visual as VS
+    monkeypatch.setenv("CLIPENGINE_MODELS", str(tmp_path / "m"))
+    body = {n: f"model {n}".encode() for n in VS.FILES}
+    monkeypatch.setattr(VS, "FILES", {n: hashlib.sha256(b).hexdigest() for n, b in body.items()})
+    urls = []
+
+    def fetch(url, dest, bad=None):
+        urls.append(url)
+        name = next(n for n in body if url.endswith(n))
+        open(dest, "wb").write(b"tampered" if name == bad else body[name])
+    first = list(body)[0]
+    assert not VS.setup(fetch=lambda u, d: fetch(u, d, bad=first), log=lambda *a: None)
+    assert not os.path.exists(VS._local(first)) and not os.path.exists(VS._local(first) + ".part")
+    assert VS.REVISION in urls[0] and "huggingface.co/Xenova/clip-vit-base-patch32" in urls[0]
+    assert VS.setup(fetch=fetch, log=lambda *a: None)
+    assert all(os.path.exists(VS._local(n)) for n in body)
+    urls.clear()
+    assert VS.setup(fetch=fetch, log=lambda *a: None) and urls == []                   # already there: no download
+
+
+def test_catch_up_drafts_read_the_picture_from_the_scan_thumbnails(monkeypatch):
+    from clipengine import autopilot as AP, visual as VS
+    flag = "adult scene on screen? (picture 0.97) — look before posting"
+    monkeypatch.setattr(VS, "thumb_images", lambda thumbs: ["img"] * len(thumbs))
+    monkeypatch.setattr(VS, "assess_images", lambda ims, root=None: {"adult_peak": 0.97, "look": 0.1, "action": 0.4,
+                                                                    "flags": [flag]})
+    c = {"probed": True, "rank": 1, "peak_s": 100, "window": {"start_s": 90, "end_s": 120}, "chat_score": 2.0,
+         "flags": [], "thumbs": ["data:image/jpeg;base64,AA=="] * 4, "transcript_text": "no way"}
+    vod = {"id": "1", "created_at": "2026-11-22T10:00:00Z", "login": "streamera"}
+    q = AP.queue_entry_from_candidate(c, vod, "/tmp/x/scan", "streamera", now=1.8e9)
+    assert flag in q["flags"] and q["visual"]["adult_peak"] == 0.97 and "flags" not in q["visual"]
+    monkeypatch.setattr(VS, "assess_images", lambda ims, root=None: {})
+    plain = AP.queue_entry_from_candidate(c, vod, "/tmp/x/scan", "streamera", now=1.8e9)
+    assert "visual" not in plain and plain["best"] > q["best"]

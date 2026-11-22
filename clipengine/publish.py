@@ -340,6 +340,20 @@ def _markers(draft: dict | None) -> list[str]:
         return []
 
 
+
+def _headline_fit(title: str, draft: dict | None) -> float | None:
+    """Advisory (visual.py): how much better the headline describes the draft's frames than a plain game scene."""
+    sheet = (draft or {}).get("sheet")
+    if not title or not sheet or not os.path.exists(sheet):
+        return None
+    try:
+        from . import visual as VS
+        if VS.mode() == "off":
+            return None
+        return VS.headline_fit(title, VS.tiles(sheet))
+    except Exception:
+        return None
+
 def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_checked, post, push, check_only,
             sig: dict | None = None, rubric: list[str] | None = None, question: str | None = None,
             taste: bool | None = None, *, truth_override: str | None = None, draft: dict | None = None,
@@ -376,6 +390,15 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
     if missing:
         report["warnings"] = [f"headline words not in the transcript or viewer titles: {', '.join(missing[:5])} — "
                               "make sure the cut SHOWS it (rules/headlines.md)"]
+    adult = [f for f in (draft or {}).get("flags") or [] if "adult scene on screen?" in str(f)]
+    if adult:
+        report.setdefault("warnings", []).append(adult[0] + " — rules/safety.md: strip clubs, underwear and nudity "
+                                                 "don't post; answer --frames-checked only after looking")
+    fit = _headline_fit(title, draft)
+    if fit is not None:
+        report["visual_headline"] = (f"{fit:+.3f} vs a plain 'video game scene' — "
+                                     + ("the frames look like the headline" if fit > 0.01 else
+                                        "the frames don't obviously show the headline: check the payoff is ON SCREEN"))
     if not sf["flagged"] and (draft or {}).get("unsafe"):
         sf = {**sf, "flagged": True, "why": draft["unsafe"]}
         report["safety"] = sf

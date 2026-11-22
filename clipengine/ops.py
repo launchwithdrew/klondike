@@ -1066,6 +1066,11 @@ def doctor(accounts: bool = False) -> bool:
     _rp = _AP.restore_pending()
     if _rp:
         check(_rp, False, "finish it before relying on this install's data")
+    try:
+        from . import visual as _VS
+        print("  " + _VS.doctor_line())
+    except Exception as exc:
+        print(f"  · visual: not checked ({str(exc)[:80]})")
     cdp = config().get("browser_cdp_url")
     from . import handpost as _HP
     if _HP.enabled():

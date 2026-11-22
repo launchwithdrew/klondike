@@ -43,7 +43,7 @@ DEFAULTS = {
     "chat_scale": 6.0,
     "freshness_half_life_h": 3.0,
     "penalties": {"poll": 0.5, "music": 0.5, "lyrics": 0.5, "dead_open": 0.8, "silent": 0.85, "thin": 0.7,
-                  "cutscene": 0.5, "static": 0.45, "dark": 0.4, "menu": 0.4},
+                  "cutscene": 0.5, "static": 0.45, "dark": 0.4, "menu": 0.4, "visual": 0.6, "adult_scene": 0.4},
     # a dull picture (vision.liveliness under dull_below) scales the score down to dull_floor at liveliness 0
     "dull_below": 0.5, "dull_floor": 0.3,
     # nothing happening: little streamer speech, no reaction, quiet chat, no viewers clipping → × quiet
@@ -82,7 +82,8 @@ def _penalty(flags: list[str], cfg: dict) -> tuple[float, list[str]]:
         for key, needle in (("poll", "chat was asked"), ("music", "music"), ("lyrics", "lyrics"),
                             ("dead_open", "dead open"), ("silent", "silent stretch"), ("thin", "thin speech"),
                             ("cutscene", "cutscene"), ("static", "static ("), ("dark", "dark ("),
-                            ("menu", "menu/map screens"), ("death", "death screen?")):
+                            ("menu", "menu/map screens"), ("death", "death screen?"),
+                            ("adult_scene", "adult scene on screen?"), ("visual", "(visual ")):
             if key not in pen:
                 continue
             if needle in fl:

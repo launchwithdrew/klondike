@@ -392,3 +392,26 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.6.0
+
+**v0.6: the engine can see the picture.**
+
+- **A picture model reads every draft.** `clipengine visual setup` downloads CLIP ViT-B/32 once (ONNX, MIT licence, ~155 MB). The download is pinned to one revision and checked by sha256. It runs on the libraries transcription already uses: no GPU, no torch, about a second per draft. Each draft's frames are read as action, dull, menu/map, off-game (webcam only, a room, a desktop), death screen or adult scene. The queue shows a `vis …` note on the draft's second line.
+- **A safety flag text could never raise: `adult scene on screen?`** It is raised when a frame looks like a strip club, underwear or nudity. The draft is scored down, never marked urgent, and `publish` repeats the warning. It doesn't refuse: the editor still looks and decides.
+  - On 56 real GTA VI moments, the flag fired 7 times and all 7 were real. That included a creator's four most viewer-clipped moments of a day, the drafts the engine used to rank highest. It missed one dim scene.
+- **Headline vs frames at publish.** `visual_headline` says whether the frames look like the headline. Advisory.
+- **Scoring with the picture waits for your own evidence.** On those 56 moments, the ones viewers clipped looked *less* like action than random stretches: viewers clip reactions, webcams and IRL moments. So the `look` measure changes no score by default.
+  - `clipengine visual eval` measures each read against your editors' ship/drop verdicts (their stored frames).
+  - `--save` keeps the best one only if it separates (AUC ≥ 0.70 on 8+ ships and 8+ drops).
+  - Only then does `"visual": {"mode": "score"}` apply it.
+- **`posted --correct-url URL --why "…"`** fixes a wrong link on a live ledger row in place. The old link is kept, with the reason and time.
+- **Word retiming** now pairs number words with digits ("six" ↔ "6") and never pairs two empty tokens, so caption times no longer drift around numbers and emoji.
+- New page: `docs/visual.md`.
+
+Export diff
+- Added (2): `clipengine/visual.py`, `docs/visual.md`
+- Changed (13): `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/autopilot.py`, `clipengine/grade.py`, `clipengine/handpost.py`, `clipengine/ops.py`, `clipengine/pipeline.py`, `clipengine/publish.py`, `clipengine/sentinel.py`, `requirements.txt`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

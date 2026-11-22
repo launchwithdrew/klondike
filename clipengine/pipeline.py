@@ -465,10 +465,19 @@ def retime_words(words_model: list[dict], words_timing: list[dict]) -> tuple[lis
     import difflib
     import re
 
-    def norm(w):
-        return re.sub(r"[^a-z']", "", w.lower().strip())
-    a = [norm(w["w"]) for w in words_model]
-    b = [norm(w["w"]) for w in words_timing]
+    nums = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+            "seven": "7", "eight": "8", "nine": "9", "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+            "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19",
+            "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+            "eighty": "80", "ninety": "90", "hundred": "100", "thousand": "1000"}
+
+    def norm(w, side, i):
+        t = re.sub(r"[^a-z0-9']", "", w.lower().strip())
+        t = nums.get(t, t)                       # "Six" and "6" are the same word (Nov 19: captions 9.5 s early)
+        # a token with nothing left (an emoji, punctuation) must never "match" another one somewhere else
+        return t if t else f"\x00{side}{i}"
+    a = [norm(w["w"], "a", i) for i, w in enumerate(words_model)]
+    b = [norm(w["w"], "b", i) for i, w in enumerate(words_timing)]
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
     aligned = [None] * len(words_model)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():

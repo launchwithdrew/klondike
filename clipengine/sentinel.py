@@ -896,11 +896,14 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
         ([f"death screen? ({death})"] if death else [])
     sig["unsafe"] = sf["why"] if sf["flagged"] else ""
     sig["wrong_game"] = bad_game
-    eng = G.engine_score(sig)
-    best = G.banger(eng["score"], None)["best_possible"]
     sheet = os.path.join(ddir, mid + ".jpg")
     VI.contact_sheet(src, sheet, start=s - first, dur=e - s)
     os.remove(src)
+    from . import visual as VS
+    seen = VS.assess(sheet)                        # what is on screen: safety flags + advice (see visual.py)
+    sig["flags"] = sig["flags"] + seen.pop("flags", [])
+    eng = G.engine_score(sig)
+    best = G.banger(eng["score"], None)["best_possible"]
     top = collections.Counter(w for c in chat_lines for w in S.tokens(c) if len(w) > 1 or w in "💀😭").most_common(4)
     after = [w for w in human if w.get("spk", "streamer") == "streamer" and w["start"] >= payoff - 1]
     quote = " ".join(w["w"].strip() for w in after[:9])
@@ -921,6 +924,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
              "chat": " ".join(f"{w}×{n}" for w, n in top), "said": said[:140], "quote_hint": quote[:60],
              "speakers": {k: spk[k] for k in ("streamer_s", "other_s", "game_s", "game_share", "backend")},
              "game": game, "sheet": sheet, "status": "dropped" if reason else "new", "reason": reason or None,
+             **({"visual": seen} if seen else {}),
              "recut": recut, "features": moment.get("features"), "via": moment.get("source", "live spike"),
              "words": os.path.join(ddir, mid + ".words.json")}
     with open(os.path.join(out, "queue.jsonl"), "a") as fh:
@@ -1039,7 +1043,7 @@ def is_urgent(r: dict) -> bool:
     built on chat + loudness alone is NOT urgent: it waits in the queue as unconfirmed until the frames are looked at."""
     if r.get("unsafe") or r.get("status") not in (None, "new"):
         return False
-    if any("death screen?" in str(f) for f in r.get("flags") or []):
+    if any("death screen?" in str(f) or "adult scene on screen?" in str(f) for f in r.get("flags") or []):
         return False                                   # look at the frames first, however hot it is
     corr = corroboration(r)
     if "viewers clipped it" in corr:
@@ -1076,6 +1080,7 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
     """One line per draft worth a look: new, safe, fresh, and able to clear some platform's bar."""
     from . import gate as GT
     from . import untrusted as UT
+    from . import visual as VS
     floor = min(r["min_score"] for r in GT.config()["platforms"].values())
     now = time.time()
     rows = []
@@ -1132,7 +1137,9 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
         if r.get("payoff") is not None:
             work = f"{r['stop'] - r['start']:.0f}s payoff +{r['payoff'] - r['start']:.0f}s · " + work
         flags = ", ".join(r.get("flags") or [])
-        line2 = (f"{'':<22} {work}{' | ' + flags if flags else ''}")[:140]
+        if r.get("visual"):
+            work = f"{work} · {VS.short(r['visual'])}"
+        line2 = (f"{'':<22} {work}{' | ' + flags if flags else ''}")[:160]
         alternate = " · angles: " + ", ".join(r["angles"][1:]) if r.get("angles") else ""
         print(f"{line2}  sheet {os.path.relpath(r['sheet'], REPO) if r.get('sheet') else '-'}{alternate}")
     return rows

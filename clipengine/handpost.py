@@ -232,6 +232,35 @@ def mark(slug: str, platform: str, url: str, confirmed: bool = False, override: 
     return f"{slug}: live on {platform}{note}" + (f" — still to post: {', '.join(left)}" if left else "")
 
 
+def correct_url(slug: str, platform: str, url: str, why: str) -> str:
+    """Fix the link a live ledger row points at (e.g. a URL recorded before the upload finished): the row keeps its
+    place and everything else, gains `url_was` + `url_fix` (the reason, the time), and the file is committed. The new
+    link must be a well-formed link to that platform; the account check is the operator's (they opened it)."""
+    import fcntl
+    if not why or not why.strip():
+        raise SystemExit("posted --correct-url needs --why \"…\" (what you checked)")
+    if platform not in PLATFORMS:
+        raise SystemExit(f"unknown platform {platform}")
+    from . import verify
+    verify.live_url(platform, url)                         # shape: a post link on that platform
+    path = _dirs()[2]
+    with open(path, "r+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        rows = [json.loads(l) for l in fh if l.strip()]
+        hits = [r for r in rows if r.get("slug") == slug and r.get("platform") == platform and r.get("status") == "live"]
+        if not hits:
+            raise SystemExit(f"no live {platform} row for {slug} in the ledger")
+        if any(r.get("url") == url for r in hits):
+            return f"{slug} on {platform} already points at {url}"
+        row = hits[-1]
+        row["url_was"], row["url"] = row.get("url"), url
+        row["url_fix"] = {"why": why.strip()[:200], "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+        fh.seek(0); fh.truncate()
+        fh.write("".join(json.dumps(r) + "\n" for r in rows))
+    _sync([path], f"ledger: correct {slug} {platform} url")
+    return f"{slug} on {platform}: {row['url_was']} → {url} (kept as url_was)"
+
+
 def _sync(paths: list[str], msg: str) -> None:
     """In the shared operation repo, a recorded post or view is committed and pushed like the poster's own
     (one machine's record is everyone's repeat guard). A public copy never touches git."""

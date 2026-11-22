@@ -533,6 +533,11 @@ def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, no
         return None
     created = _epoch(vod["created_at"])
     w = c.get("window") or {"start_s": c["clip_start_s"], "end_s": c["clip_end_s"]}
+    from . import visual as VS
+    seen = VS.assess_images(VS.thumb_images(c.get("thumbs"))) if c.get("thumbs") else {}
+    if seen.get("flags"):
+        c = {**c, "flags": (c.get("flags") or []) + seen["flags"]}
+    seen.pop("flags", None)
     sig = G.signals_from_candidate(c, vod, dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc))
     eng = G.engine_score(sig)
     best = G.banger(eng["score"], None)["best_possible"]
@@ -549,7 +554,7 @@ def queue_entry_from_candidate(c: dict, vod: dict, scan_dir: str, login: str, no
             "scan": scan_dir, "pick": c["rank"], "vod": vod["id"],
             "vod_start": w["start_s"], "vod_stop": w["end_s"], "thumbs": c.get("thumbs") or [],
             "liveliness": c.get("liveliness"), "frames_assessed": c.get("liveliness") is not None,
-            "judgment": JG.score_snapshot(eng, sig), "titles": sig["titles"]}
+            "judgment": JG.score_snapshot(eng, sig), "titles": sig["titles"], **({"visual": seen} if seen else {})}
 
 
 def _sheet(thumbs: list[str], out: str) -> str | None:
