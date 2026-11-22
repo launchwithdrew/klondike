@@ -708,6 +708,7 @@ def test_budget_report_queue_and_diagnose(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     SN.show_queue(str(tmp_path))
     lines = capsys.readouterr().out.splitlines()
+    lines = [l for l in lines if not l.startswith("— maybe")]          # one section header at most
     assert len(lines) == 6 and max(len(l) for l in lines) <= 220      # two short lines per draft
     hits = DG.match("segment download failed\n" * 50 + "No space left on device\nHELD: x\nffmpeg failed\nGQL error\nwrong channel")
     capsys.readouterr()
@@ -5062,13 +5063,16 @@ def test_catchup_cli_exit_codes_watermark_and_journal(tmp_path, monkeypatch, cap
         M.main(["catchup", "--since", str(int(since)), "--until", str(int(until)), "--channel", "nobody"])
     assert e.value.code == 2 and scans == []
     assert M.main(["catchup", "--since", str(int(since)), "--until", str(int(until))]) == 3   # finished, not all covered
-    assert AP._json(AP._coverage()).get("catchup_until") is None            # held: streamerb's window starts at since
+    cov = AP._json(AP._coverage())
+    assert cov["catchup_until"] == until                                     # the others are covered: the shared mark moves
+    assert cov["by_creator"]["catchup"] == {"streamerb": since}              # only the failed creator is held back
+    assert AP.behind() == {"streamerb": since}
     jb = AP.batches(str(tmp_path))
     assert jb[-1]["queued"] == 1 and jb[-1]["failed"][0]["login"] == "streamerb" and jb[-1]["covered_until"] == since
     assert "NOT covered: streamerb" in "\n".join(AD.batch_lines(str(tmp_path)))
     _batch_env(tmp_path, monkeypatch, fail_vod="none")                     # the source is back
     assert M.main(["catchup", "--until", str(int(until)), "--since", str(int(since))]) == 0
-    assert AP._json(AP._coverage())["catchup_until"] == until               # now fully covered: moves to until
+    assert AP._json(AP._coverage())["catchup_until"] == until and AP.behind() == {}   # caught up: nobody held back
     assert "plan: streamera ok" in capsys.readouterr().out
 
 
@@ -5623,3 +5627,89 @@ def test_an_incident_whose_recovery_was_never_recorded_is_not_counted_as_dark_un
     assert allrows["ap-bootboot-7"]["status"] == "recovered"
     spans, orphans = MX.incident_spans(list(allrows.values()), now)
     assert [o["id"] for o in orphans] == ["ap-old-3"] and [s[2] for s in spans] == ["ap-bootboot-7"]
+
+
+def test_a_creator_behind_is_rescanned_from_its_own_mark_and_nobody_else_is(tmp_path, monkeypatch):
+    """Nov 22: one failing creator froze the single shared coverage mark ("scanned from saved streams 0"). Now the
+    shared mark moves and only that creator is re-scanned from its own mark."""
+    AP, c0, scans = _batch_env(tmp_path, monkeypatch)
+    windows = {}
+    monkeypatch.setattr(AP, "vods_overlapping", lambda l, s, u: windows.setdefault(l, (s, u)) and [])
+    since, until = c0 + 7200, c0 + 9000
+    AP.plan_batch(since, until, behind_={"streamerb": c0 + 3600})
+    assert windows["streamerb"] == (c0 + 3600, until) and windows["streamera"] == (since, until)
+    windows.clear()
+    AP.plan_batch(since, until + 20 * 3600, behind_={"streamerb": c0})          # never more than 12 h back
+    assert windows["streamerb"][0] == until + 20 * 3600 - AP.MAX_CATCHUP_H * 3600
+
+
+def test_a_moment_our_recording_missed_is_drafted_from_the_saved_stream_not_dropped(tmp_path, monkeypatch):
+    """Nov 22 (the funnel's first find): 90 of 90 viewer-clipped moments were dropped as "recording gap (ad break)"
+    — they happened inside a 13 h hole of a recording that only LOOKED continuous. The drop now says why, and a
+    moment from a creator with saved streams is handed to the saved-stream route instead of being lost."""
+    from clipengine import sentinel as SN, autopilot as AP, publish as PB, vodaccess as VA
+    now = 1_800_000_000.0
+    rec = tmp_path / "sentinel-streamera"; rec.mkdir()
+    idx = [{"t": now - 50000 + i * 2, "d": 2.0, "f": f"a{i}.ts"} for i in range(10)]
+    idx.append({"t": now - 49980, "d": 48000.0, "gap": "the stream was offline (or nothing was recording)"})
+    idx += [{"t": now - 1980 + i * 2, "d": 2.0, "f": f"b{i}.ts"} for i in range(10)]
+    idx.append({"t": now - 1900, "d": 30.0, "gap": "Twitch ad break (6 ad segments)"})
+    (rec / "index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in idx))
+    assert SN.not_recorded_why(str(rec), now - 30000).startswith("the moment is in a recording hole (the stream was offline")
+    assert SN.not_recorded_why(str(rec), now - 1890) == "recording gap (ad break) over the moment"
+    assert SN.not_recorded_why(str(rec), now - 60000) == "the moment happened before our recording started"
+    assert SN.not_recorded_why(str(rec), now + 100).startswith("the moment isn't recorded yet")
+    monkeypatch.setattr(PB, "creators", lambda: {"streamera": {}, "streamerb": {"vods": False},
+                                                 "streamerc": {"policy": "never"}})
+    monkeypatch.setattr(VA, "restricted", lambda login: login == "streamerd")
+    calls, ran = [], []
+    monkeypatch.setattr(AP, "catchup", lambda s, e, logins, keep=3, probe=6, via=None: calls.append((s, e, logins, keep, via)) or [])
+    moment = {"start": now - 30030, "stop": now - 29990, "crowd_end": now - 29995, "source": "viewer clips"}
+    msg = SN.saved_stream_fallback("streamera", moment, now=now, run=lambda f: (ran.append(1), f()))
+    assert msg == "drafting it from the saved stream instead" and ran
+    assert calls == [(now - 30090, now - 29930, ["streamera"], 1, "catch-up (viewer clips, not in our recording)")]
+    fresh = {"start": now - 40, "stop": now - 5}
+    assert SN.saved_stream_fallback("streamera", fresh, now=now, run=lambda f: None).endswith("in 6 min")   # VOD lags
+    for who in ("streamerb", "streamerc", "streamerd", "yt:@someone", "nobody"):
+        assert SN.saved_stream_fallback(who, moment, now=now, run=lambda f: pytest.fail(who)) is None
+    # the drop line records the hand-off, and a re-draft from the saved stream isn't blocked by it
+    monkeypatch.setattr(SN, "saved_stream_fallback", lambda login, m: "drafting it from the saved stream instead")
+    row = SN.draft_moment(str(rec), "streamera", {**moment, "fire": moment["crowd_end"], "game": None}, wait_s=0)
+    assert row["status"] == "dropped" and row["fallback"] == "saved stream"
+    assert "recording hole" in row["reason"] and "saved stream instead" in row["reason"]
+    assert not AP._overlaps_any("streamera", moment["start"], moment["stop"], [row])
+    assert AP._overlaps_any("streamera", moment["start"], moment["stop"], [{**row, "status": "new"}])
+
+
+def test_headline_options_come_from_viewer_titles_and_only_checked_ones_are_shown(tmp_path, monkeypatch):
+    """Wishlist 7: up to three distinct supported options from the evidence; fewer with a reason; a number or
+    claim the evidence lacks, or flagged wording, never reaches the editor."""
+    from clipengine import judge as JG, publish as PB
+    monkeypatch.setattr(PB, "creators", lambda: {"streamera": {"name": "Ava"}})
+    e = {"id": "d", "login": "streamera", "said": "no way the car flipped over the bridge and he jumped out",
+         "titles": ["Ava flipped the car off the bridge 💀", "the car flipped LMAO", "she jumped out mid air",
+                    "Ava won 500 dollars", "lol"]}
+    ho = JG.headline_options(e)
+    titles = [o["title"] for o in ho["options"]]
+    assert len(titles) == 3 and len({t.lower() for t in titles}) == 3
+    assert all(2 <= len(t.split()) <= 5 and len(t) <= 32 for t in titles)
+    assert all(any(w.isupper() and len(w) >= 3 for w in t.split()) for t in titles)     # a CAPS punch word each
+    assert not any("500" in t for t in titles)                                      # a number nobody said
+    assert ho["why_fewer"] is None
+    none = JG.headline_options({"id": "q", "login": "streamera", "said": "hm", "titles": []})
+    assert none["options"] == [] and "no viewer-clip titles" in none["why_fewer"]
+
+
+def test_the_queue_puts_chat_and_loudness_only_drafts_last_as_maybe(tmp_path, capsys):
+    from clipengine import sentinel as SN
+    import time as _t
+    rec = tmp_path / "sentinel-streamera"; rec.mkdir()
+    now = _t.time()
+    rows = [{"id": "chat-only", "login": "streamera", "rec": str(rec), "start": now - 300, "stop": now - 270, "status": "new",
+             "best": 92, "judgment": {"parts": {"chat": .99, "audio": 1.0}}},
+            {"id": "crowd", "login": "streamera", "rec": str(rec), "start": now - 200, "stop": now - 170, "status": "new",
+             "best": 70, "parts": "sp 8s ch .6 au .5 re .3 cr .40"}]
+    (rec / "queue.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    SN.show_queue(str(tmp_path), seen=False)
+    out = capsys.readouterr().out
+    assert out.index("crowd") < out.index("— maybe") < out.index("chat-only")      # the crowd's vote first

@@ -182,6 +182,9 @@ def draft_page(entry: dict, title: str | None = None, quote: str | None = None) 
         headline_result = '; '.join(issues) or 'Supported by the draft evidence'
         check = (f"<p>{text(title)}</p><p>{text(headline_result)}</p>"
                  f"<p>First CAPS run: {text(preview['first_caps_run'] or 'none')}</p>")
+    ho = judge.headline_options(entry)
+    options_html = "".join(f"<p><b>{text(o['title'])}</b> — from {evidence(o['from'], 80)}</p>" for o in ho["options"]) + \
+        (f"<p>{text(ho['why_fewer'])}</p>" if ho["why_fewer"] else "")
     marks = sentinel.confidence_markers(entry)
     safety = evidence(entry["unsafe"]) if entry.get("unsafe") else "No text flag recorded"
     if "frames unassessed" in marks:
@@ -203,7 +206,8 @@ h1,h2,p{{margin:.4rem 0}}img,meter{{width:100%;height:auto}}img{{margin:.25rem 0
 <section><h2>Score and safety</h2><p>Reviewing artifact {text(judge.artifact_id(entry) or 'unavailable')} — a verdict is recorded once per artifact</p><p>Engine {text(entry.get('engine', 'unknown'))} · best {text(entry.get('best', 'unknown'))}</p>
 <p>{text(entry.get('parts') or (entry.get('judgment') or {}).get('parts') or 'Score parts unavailable')}</p>
 <p>{safety}</p><p>{confidence}</p></section>
-<section><h2>Transcript</h2>{transcript}</section><section><h2>Headline check</h2>{check}</section>
+<section><h2>Transcript</h2>{transcript}</section><section><h2>Headline options</h2>{options_html}</section>
+<section><h2>Headline check</h2>{check}</section>
 """, encoding="utf-8")
     sentinel.mark_seen(entry)
     return str(target)

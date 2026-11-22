@@ -178,6 +178,10 @@ def main(argv: list[str] | None = None) -> int:
     se_ = sub.add_parser("series", help="a creator's recurring bit: suggestions from our winners (with receipts), confirm one")
     se_.add_argument("--confirm", metavar="LOGIN:WORD", help="confirm a suggested series")
     se_.add_argument("--name", help="its name (with --confirm)")
+    hl_ = sub.add_parser("headlines", help="up to 3 checked headline options for a draft, from the viewers' clip titles")
+    hl_.add_argument("--id", required=True)
+    fu_ = sub.add_parser("funnel", help="where moments are lost: each route's drafts → drops → skips → posts, viewer clips caught/missed, holes")
+    fu_.add_argument("--days", type=float, default=3.0)
     mx_ = sub.add_parser("metrics", help="the weekly numbers: coverage, overnight yield, cost, speed, publishing, recommendations")
     mx_.add_argument("--days", type=float, default=7.0)
     mx_.add_argument("--save", action="store_true", help="also write runs/metrics/week-<date>.json")
@@ -445,6 +449,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("\n".join(SR.lines()))
         return 0
+    if a.cmd == "headlines":
+        from . import judge as JG, sentinel as SN
+        e = next((r for r in SN.load_queue() if r["id"] == a.id), None)
+        if not e:
+            ap.error(f"no draft {a.id} (clipengine queue --all)")
+        ho = JG.headline_options(e)
+        for o in ho["options"]:
+            print(f"  {o['title']:<34} from «{o['from']}»")
+        if ho["why_fewer"]:
+            print("  " + ho["why_fewer"])
+        return 0
+    if a.cmd == "funnel":
+        from . import metrics as MX
+        print("\n".join(MX.funnel_lines(MX.funnel(days=a.days))))
+        return 0
     if a.cmd == "metrics":
         from . import metrics as MX
         if a.compare:
@@ -521,17 +540,18 @@ def main(argv: list[str] | None = None) -> int:
                         bad = AP.plan_batch(since, until, a.channel, lister=lambda *x: [])["invalid"]
                         if bad:
                             ap.error("catchup: " + "; ".join(bad))
-                    got = AP.sweep(since, until, a.channel, outcome=outcome)
+                    got = AP.sweep(since, until, a.channel, outcome=outcome, behind_=AP.behind(sweep=True))
                 else:
-                    plan = AP.plan_batch(since, until, a.channel)
+                    plan = AP.plan_batch(since, until, a.channel, behind_=AP.behind())
                     if plan["invalid"]:
                         ap.error("catchup: " + "; ".join(plan["invalid"]))   # invalid input: nothing queued
                     print("plan: " + (" · ".join(f"{k} {v}" for k, v in plan["targets"].items()) or "no targets"),
                           flush=True)
                     got = AP.catchup(since, until, a.channel, outcome=outcome, plan=plan)
                 mark = AP.covered_until(since, until, outcome)
-                if not a.channel and mark > since:
-                    AP.mark_covered(mark, sweep=a.sweep)            # only completed coverage moves the watermark
+                if not a.channel:                               # shared mark to `until`; failed creators keep their own
+                    from .publish import creators as _cr
+                    AP.mark_batch(since, until, outcome, a.channel or AP.catchup_targets(_cr()), sweep=a.sweep)
                 AP.journal({"id": f"{'sweep' if a.sweep else 'catchup'}-{int(since)}-{int(until)}", "at": _t.time(),
                             "kind": "sweep" if a.sweep else "catchup", "since": since, "until": until,
                             "channels": a.channel or "roster", "queued": len(got),

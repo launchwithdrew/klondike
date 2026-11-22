@@ -25,6 +25,7 @@ import datetime as dt
 import glob
 import json
 import os
+import re
 import statistics
 import time
 
@@ -135,6 +136,9 @@ def coverage(root: str, since: float, now: float) -> dict:
     recs = _rec_dirs(root)
     cov = _json(os.path.join(root, "runs", "coverage.json"))
     vod_mark = max(float(cov.get("catchup_until") or 0), float(cov.get("sweep_until") or 0))   # completed scans
+    by = cov.get("by_creator") or {}
+    own_mark = lambda l: max(float((by.get("catchup") or {}).get(l, cov.get("catchup_until") or 0)),
+                             float((by.get("sweep") or {}).get(l, cov.get("sweep_until") or 0)))
     roster = _json(os.path.join(root, "config", "creators.json")).get("creators", {})
     live_s = rec_s = vod_s = 0.0
     holes, explained, ads, per = 0, 0, 0, {}
@@ -154,7 +158,7 @@ def coverage(root: str, since: float, now: float) -> dict:
         r_s = sum(_overlap(a, b, s, e) for s, e in ivs for a, b in segs)
         r_s = min(r_s, l_s)
         vods = (roster.get(login) or {}).get("vods") is not False
-        v_s = sum(_overlap(s, e, since, vod_mark) for s, e in ivs) if vods else 0.0
+        v_s = sum(_overlap(s, e, since, own_mark(login)) for s, e in ivs) if vods else 0.0
         v_s = max(0.0, min(v_s, l_s - r_s))
         live_s += l_s; rec_s += r_s; vod_s += v_s
         per[login] = round(r_s / l_s, 3) if l_s else None
@@ -580,4 +584,87 @@ def compare(a_path: str, b_path: str) -> list[str]:
         x, y = stg(a, k), stg(b, k)
         out.append(f"  {'speed ' + k + ' p50 min':<34} {_f(x):>10} {_f(y):>10} "
                    f"{(f'{y / x:.2f}' if x and y is not None else '–'):>7}")
+    return out
+
+
+# ---- the funnel: where moments are lost (v0.5) -------------------------------------------------------------
+
+ROUTES = (("viewer clips", ("viewer clip", "crowd")), ("streamer reaction", ("reaction",)),
+          ("tier-1 chat spike", ("tier-1",)), ("sweep", ("sweep",)), ("catch-up", ("catch-up",)),
+          ("live spike", ("live spike", "")))
+
+
+def _route(d: dict) -> str:
+    via = str(d.get("via") or d.get("source") or "live spike").lower()
+    for name, needles in ROUTES:
+        if any(n and n in via for n in needles):
+            return name
+    return "live spike"
+
+
+def funnel(root: str | None = None, now: float | None = None, days: float = 3.0) -> dict:
+    """Every route from moment to post, with the reason at each loss: drafts → dropped by the engine → archived by
+    triage → waiting → skipped by the editor → published; the viewer-clipped moments we caught or missed (and why);
+    recording holes by cause."""
+    from collections import Counter
+    root = root or REPO
+    now = now or time.time()
+    since = now - days * DAY
+    drafts = [d for d in _drafts(root) if (t := _ts(d.get("drafted_at")) or _moment(d)) and since <= t <= now]
+    routes: dict[str, Counter] = {}
+    why: dict[str, Counter] = {"dropped": Counter(), "archived": Counter(), "skipped": Counter()}
+    for d in drafts:
+        st = d.get("status") or "new"
+        st = "published" if st in ("published", "posted") else st
+        r = routes.setdefault(_route(d), Counter())
+        r["drafts"] += 1
+        r[st] += 1
+        if st in why:
+            reason = str(d.get("reason") or d.get("triage_reason") or "no reason saved")
+            why[st][re.sub(r"\d+(\.\d+)?", "#", reason)[:70]] += 1
+    out = {"window_days": days, "routes": {k: dict(v) for k, v in routes.items()},
+           "top_reasons": {k: v.most_common(5) for k, v in why.items()}}
+    try:                                                   # the crowd's vote: what viewers clipped, did we have it?
+        from . import scouts, tier1
+        runs = os.path.join(root, "runs")
+        roster = _json(os.path.join(root, "config", "creators.json")).get("creators") or {}
+        sd = scouts._drafts(runs)
+        spikes = tier1.load_spikes(since, path=os.path.join(runs, "tier1", "spikes.jsonl"))
+        clips = [c for c in scouts.observations(now, days * 24, runs) if c.get("views", 0) >= 25
+                 and c.get("login") in roster]
+        rows = [scouts.match(c, sd, spikes, scouts._recorded(c["login"], c["t"], runs)) for c in clips]
+        caught = [r for r in rows if r["caught"]]
+        out["viewer_clipped"] = {"moments": len(rows), "caught": len(caught),
+                                 "ahead": sum(1 for r in caught if (r.get("lead_s") or 0) > 0),
+                                 "missed_why": Counter(r.get("why") or "unknown" for r in rows if not r["caught"]).most_common(5)}
+    except Exception as exc:
+        out["viewer_clipped"] = _na(f"scouts data unreadable ({type(exc).__name__})")
+    holes: Counter = Counter()
+    for idx in glob.glob(os.path.join(root, "runs", "*", "index.jsonl")):
+        for r in _rows(idx):
+            if "gap" in r and since <= r.get("t", 0) <= now and r.get("d", 0) > 10:
+                holes[re.sub(r"\d+(\.\d+)?", "#", str(r.get("gap") or "unknown"))[:60]] += 1
+    out["holes"] = {"over_10s": sum(holes.values()), "by_cause": holes.most_common(6)}
+    return out
+
+
+def funnel_lines(f: dict) -> list[str]:
+    cols = ("drafts", "dropped", "archived", "new", "skipped", "published")
+    out = [f"funnel, last {f['window_days']:g} days — {'route':<18}" + "".join(f"{c:>10}" for c in cols)]
+    for name, c in sorted(f["routes"].items(), key=lambda kv: -kv[1].get("drafts", 0)):
+        out.append(f"{'':<27}{name:<18}" + "".join(f"{c.get(k, 0):>10}" for k in cols))
+    labels = {"dropped": "engine dropped", "archived": "triage archived", "skipped": "editor skipped"}
+    for k, v in f["top_reasons"].items():
+        if v:
+            out.append(f"  {labels[k]}: " + " · ".join(f"{n}× {r}" for r, n in v))
+    vc = f["viewer_clipped"]
+    if "unavailable" in vc:
+        out.append("  viewer-clipped moments: " + _f(vc))
+    else:
+        out.append(f"  viewer-clipped moments (25+ views): {vc['moments']} — we had {vc['caught']} "
+                   f"({vc['ahead']} ready before the viewers' clip), missed {vc['moments'] - vc['caught']}"
+                   + (": " + " · ".join(f"{n}× {w}" for w, n in vc["missed_why"]) if vc["missed_why"] else ""))
+    h = f["holes"]
+    out.append(f"  recording holes >10s: {h['over_10s']}"
+               + (" — " + " · ".join(f"{n}× {c}" for c, n in h["by_cause"]) if h["by_cause"] else ""))
     return out

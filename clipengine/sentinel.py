@@ -675,6 +675,65 @@ def payoff_window(words: list[dict], payoff: float, lo: float, hi: float,
             "react": round(e - payoff, 1), "clean": clean and qs >= 0.5 and qe >= 0.5}
 
 
+def not_recorded_why(rec_dir: str, payoff: float) -> str:
+    """Why the payoff isn't in our recording, in words: an ad break, a hole with its cause, before the recording
+    started, or not recorded yet. (It used to say "ad break" for all of them.)"""
+    from . import live as L
+    for g in L.gaps_in(rec_dir, payoff - 1, payoff + 1):
+        cause = str(g.get("gap") or "unknown cause")
+        if cause.lower().startswith("twitch ad break") or "ad break" in cause.lower():
+            return "recording gap (ad break) over the moment"
+        return f"the moment is in a recording hole ({cause[:60]})"
+    rows = []
+    try:                                                   # the raw index: pruned segments still mark the span
+        for line in open(os.path.join(rec_dir, "index.jsonl")):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("f"):
+                rows.append(r)
+    except OSError:
+        pass
+    if rows and payoff < min(r["t"] for r in rows):
+        return "the moment happened before our recording started"
+    if rows and payoff > max(r["t"] + r.get("d", 2.0) for r in rows):
+        return "the moment isn't recorded yet (past the recording's end)"
+    return "the moment isn't in our recording (segments missing or pruned around it)"
+
+
+def saved_stream_fallback(login: str, moment: dict, now: float | None = None, run=None) -> str | None:
+    """A moment our recording missed is drafted from the creator's saved stream (VOD) instead of being lost —
+    in the background, once the VOD has caught up (it trails live by a few minutes). None when the creator has
+    no usable saved streams."""
+    from . import autopilot as AP
+    from . import publish as PB
+    from . import vodaccess as VA
+    try:
+        roster = PB.creators()
+    except Exception:
+        roster = {}
+    c = roster.get(login)
+    if c is None or c.get("vods") is False or AP.policy(login, roster) == "never" or login.startswith(("yt", "kick:")) \
+            or VA.restricted(login):
+        return None
+    now = time.time() if now is None else now
+    s, e = float(moment["start"]) - 60, float(moment["stop"]) + 60
+    wait = max(0.0, e + AP.SWEEP_LAG_S - now)               # the VOD's copy trails live
+    via = "catch-up (" + ("viewer clips" if moment.get("crowd_end") or moment.get("source") == "viewer clips"
+                          else "moment") + ", not in our recording)"
+
+    def go():
+        if wait:
+            time.sleep(wait)
+        try:
+            AP.catchup(s, e, [login], keep=1, probe=3, via=via)
+        except Exception as exc:
+            print(f"[sentinel] {login}: saved-stream fallback failed ({str(exc)[:80]})", flush=True)
+    (run or (lambda f: threading.Thread(target=f, daemon=True).start()))(go)
+    return "drafting it from the saved stream instead" + (f" in {wait / 60:.0f} min" if wait > 60 else "")
+
+
 def covered(rec_dir: str, a: float, b: float, payoff: float) -> tuple[float, float] | None:
     """The stretch of [a, b] around the payoff the recording really has (ad breaks / restarts leave
     holes): None when the payoff itself is in a hole."""
@@ -762,7 +821,10 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
         time.sleep(3)
     cov = covered(out, a, b, payoff)
     if cov is None or cov[1] - cov[0] < 8:
-        return log_dropped(out, login, moment, "recording gap (ad break) over the moment", payoff=round(payoff, 1))
+        why = not_recorded_why(out, payoff)
+        fb = saved_stream_fallback(login, moment)          # Nov 22: these were dropped — 90 of 90 viewer-clip moments
+        return log_dropped(out, login, moment, why + (f" — {fb}" if fb else ""), payoff=round(payoff, 1),
+                           fallback="saved stream" if fb else None)
     a, b = cov
     ddir = os.path.join(out, "drafts")
     os.makedirs(ddir, exist_ok=True)
@@ -1026,13 +1088,17 @@ def show_queue(root: str = os.path.join(REPO, "runs"), all_: bool = False, max_a
     if not all_ and len(rows) > 1:
         from . import events, publish, scouts
         rows = scouts.group_angles(rows, publish.creators(), events.load())
-    rows.sort(key=lambda r: (not (is_urgent(r) or r.get("angle_urgent")), -r.get("best", 0)))
+    rows.sort(key=lambda r: (not all_ and unconfirmed(r), not (is_urgent(r) or r.get("angle_urgent")), -r.get("best", 0)))
+    maybe_header = False
     from . import series as SR
     try:
         known = SR.suggestions(os.path.dirname(root) if os.path.basename(root) == "runs" else None)
     except Exception:
         known = []
     for r in rows:
+        if not all_ and unconfirmed(r) and not maybe_header:
+            maybe_header = True                     # crowd-first: chat + loudness only goes last, as "maybe"
+            print("— maybe (chat + loudness only — judge on the frames; viewer-clipped and reacted-to drafts are above) —")
         if seen and r.get("status") == "new":
             mark_seen(r, now)
         mark = f" ⛔{UT.quote(r['unsafe'], 30)}" if r.get("unsafe") else \

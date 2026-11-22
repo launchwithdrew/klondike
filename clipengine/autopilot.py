@@ -439,6 +439,35 @@ def catchup_window(since_arg, until: float, sweep: bool = False, path: str | Non
     return since, how
 
 
+def behind(sweep: bool = False, path: str | None = None) -> dict[str, float]:
+    """Creators whose own coverage is behind the shared mark (their source failed): {login: covered up to}."""
+    st = _json(path or _coverage())
+    return {k: float(v) for k, v in ((st.get("by_creator") or {}).get("sweep" if sweep else "catchup") or {}).items()}
+
+
+def mark_batch(since: float, until: float, outcome: dict, logins: list[str], sweep: bool = False,
+               path: str | None = None) -> dict:
+    """After a batch: the shared mark moves to `until`; a creator whose source failed keeps its OWN mark at the start
+    of its first failed window, so only that creator is re-scanned next time. (Nov 22: one chronically failing creator
+    held the single shared mark, and every sweep re-scanned the same window — "scanned from saved streams 0".)"""
+    path = path or _coverage()
+    st = _json(path)
+    key, kind = ("sweep_until", "sweep") if sweep else ("catchup_until", "catchup")
+    st[key] = max(float(st.get(key) or 0), until)
+    by = st.setdefault("by_creator", {}).setdefault(kind, {})
+    failed: dict[str, float] = {}
+    for f in outcome.get("failed", []):
+        failed[f["login"]] = min(failed.get(f["login"], until), max(since, float(f.get("from") or since)))
+    for login in logins:
+        if login in failed:
+            by[login] = min(float(by.get(login, failed[login])), failed[login])
+        else:
+            by.pop(login, None)                            # caught up: the shared mark speaks for it again
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(st, open(path, "w"))
+    return {"until": st[key], "behind": dict(by)}
+
+
 def mark_covered(until: float, sweep: bool = False, path: str | None = None) -> None:
     path = path or _coverage()
     st = _json(path)
@@ -489,7 +518,7 @@ def _queue_rows(root: str = RUNS) -> list[dict]:
 
 def _overlaps_any(login: str, s: float, e: float, rows: list[dict]) -> bool:
     for r in rows:
-        if r.get("login") == login and "start" in r and "stop" in r:
+        if r.get("login") == login and "start" in r and "stop" in r and r.get("status") != "dropped":
             inter = min(e, r["stop"]) - max(s, r["start"])
             if inter > 0.5 * min(e - s, r["stop"] - r["start"]):
                 return True
@@ -551,7 +580,7 @@ def _sheet(thumbs: list[str], out: str) -> str | None:
 
 
 def plan_batch(since: float, until: float, logins: list[str] | None = None, roster: dict | None = None,
-               lister=None) -> dict:
+               lister=None, behind_: dict[str, float] | None = None) -> dict:
     """Validate a catch-up batch BEFORE anything is scanned or queued (spec §2): every target is a known, allowed
     creator, and each one's saved streams in the window are listed now. Returns {"items": [{login, vod...}],
     "targets": {login: status}, "invalid": [why...]}. status: "ok" (N windows) · "no broadcast in the window" ·
@@ -583,7 +612,8 @@ def plan_batch(since: float, until: float, logins: list[str] | None = None, rost
             status[login] = "subscriber-only"
             continue
         try:
-            vods = [v for v in lister(login, since, until) if v["b"] - v["a"] >= 60]
+            own = max(min(since, (behind_ or {}).get(login, since)), until - MAX_CATCHUP_H * 3600)
+            vods = [v for v in lister(login, own, until) if v["b"] - v["a"] >= 60]   # a creator behind: from its mark
         except Exception as exc:
             status[login] = f"source failed: couldn't list broadcasts ({str(exc)[:60]})"
             continue
@@ -785,7 +815,8 @@ def sweep_pick(cands: list[dict], vod_id: str, created: float, login: str, rows:
     return out[: int(cfg.get("sweep_keep", 2))]
 
 
-def sweep(since: float, until: float, logins: list[str] | None = None, outcome: dict | None = None) -> list[dict]:
+def sweep(since: float, until: float, logins: list[str] | None = None, outcome: dict | None = None,
+          behind_: dict[str, float] | None = None) -> list[dict]:
     """Scan the roster's saved streams of [since, until] cheaply (chat + viewer clips) and queue the strong
     moments nobody drafted, through the catch-up path. Returns the queued entries; `outcome` as catchup()."""
     out = outcome if outcome is not None else {}
@@ -811,7 +842,7 @@ def sweep(since: float, until: float, logins: list[str] | None = None, outcome: 
                 print(f"[sweep] {login}: couldn't read Kick ({str(exc)[:80]})", flush=True)
             continue
         try:
-            vods = vods_overlapping(login, since, until)
+            vods = vods_overlapping(login, max(min(since, (behind_ or {}).get(login, since)), until - 3 * 3600), until)
         except Exception as exc:
             out["failed"].append({"login": login, "from": since, "why": f"source failed: {str(exc)[:80]}"})
             print(f"[sweep] {login}: couldn't list broadcasts ({str(exc)[:80]})", flush=True)

@@ -49,3 +49,5 @@ word (their first CAPS word), with receipts. `series --confirm LOGIN:WORD --name
 new drafts that continue it are labelled `series: …` in `queue`. Owner overrides never count.
 
 `eval-judge` also prints a confusion table, how many ship calls were right, how many of your keepers the engine shipped, and the always-the-commonest-call baseline. When editors drop most drafts, a high agreement figure alone can just mean "drop everything". Thresholds: `config/grading.json` "judge_call" (drop below 50, ship from 70).
+
+`headlines --id ID` offers up to three checked headlines from viewers' clip titles. `queue` lists chat-and-loudness-only drafts last ("maybe"). `funnel` shows where moments are lost.

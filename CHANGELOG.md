@@ -372,3 +372,23 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.5.0
+
+**v0.5: finding where winners are lost, and stopping the biggest leak.**
+
+- **`clipengine funnel [--days 3]` shows where moments are lost.** It reports every route (viewer clips, live spike, streamer reaction, tier-1 chat spike, sweep, catch-up) as drafts → dropped by the engine → archived by triage → waiting → skipped by the editor → published, with the top reason at each loss. It also shows the moments viewers clipped (25+ views) that we caught or missed (and why), and recording holes by cause.
+- **A moment our recording missed is drafted from the saved stream instead of being dropped.**
+  - A moment whose payoff wasn't in our recording used to be dropped as "recording gap (ad break)", whatever the real reason: a long hole while nothing was recording, before the recording started, or segments pruned. One install lost every viewer-clipped moment this way (90 of 90).
+  - Such a moment from a creator with saved streams now goes to the saved-stream route. It waits a few minutes when the VOD's copy hasn't caught up yet.
+  - The drop line says the real reason and that the hand-off happened. A dropped line no longer blocks the re-draft.
+- **Coverage marks per creator.** One creator whose saved streams keep failing no longer freezes the catch-up / sweep coverage mark for everyone. The shared mark moves, that creator keeps its own mark and is re-scanned from it (up to 12 h back), and weekly metrics read each creator's own mark.
+- **Crowd-first queue.** Drafts backed by viewer clips or the streamer's own reaction come first. Drafts on chat and loudness alone are listed last under "maybe".
+- **Headline options.** `clipengine headlines --id ID` and the review page offer up to three headlines condensed from viewers' clip titles. Each one is checked first (2–5 words, ≤ 32 characters, a CAPS punch word, no claim or number the evidence lacks, no flagged wording). Fewer than three comes with the reason. You pick.
+
+Export diff
+- Added (0)
+- Changed (10): `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/autopilot.py`, `clipengine/judge.py`, `clipengine/metrics.py`, `clipengine/review.py`, `clipengine/sentinel.py`, `docs/judging.md`, `tests/test_engine.py`
+- Removed (0)
+
+Leak scan: clean.

@@ -371,6 +371,52 @@ def draft_evidence(entry: dict) -> tuple[str, list[str]]:
     return (" ".join(w["w"].strip() for w in words) or entry.get("said", ""), entry.get("titles") or [])
 
 
+_FILLER = {"lol", "lmao", "bro", "omg", "chat", "clip", "clipped", "this", "that", "the", "a", "an", "is", "just", "so",
+           "gta", "gta6", "vi", "6", "live", "stream", "moment", "funny", "lmfao", "xd", "kekw", "w", "l"}
+_ACR = {"GTA", "NPC", "NPCS", "RP", "VI", "FBI", "CEO", "DLC", "USA", "TV", "OMG", "LOL", "W", "L"}
+
+
+def headline_options(entry: dict, n: int = 3) -> dict:
+    """Up to `n` distinct headline options from verified evidence (wishlist 7): each viewer-clip title — the crowd's
+    own words for what happened — condensed to our card (2–5 words, ≤ 32 chars, the punch word in CAPS) and kept only
+    if the headline checker passes it (no unsupported claim, no number or name the evidence lacks, no flagged word).
+    The editor picks one. Fewer than `n`: `why_fewer` says why."""
+    import re
+    from . import safety
+    transcript, titles = draft_evidence(entry)
+    opts, rejected = [], []
+    for raw in dict.fromkeys(t.strip() for t in titles if t and t.strip()):
+        text = re.sub(r"https?://\S+|[@#]\w+", " ", raw)
+        words = [w for w in re.findall(r"[A-Za-z][A-Za-z']*", text) if w.lower() not in _FILLER]
+        if len(words) < 2:
+            rejected.append(f"«{raw[:40]}»: too little to say")
+            continue
+        words = words[:5]
+        while len(" ".join(words)) > 32 and len(words) > 2:
+            words = words[:-1]
+        punch = max((i for i, w in enumerate(words) if len(w) >= 3 and w.upper() not in _ACR), default=len(words) - 1)
+        title = " ".join(w.upper() if i == punch else (w if w.isupper() and w in _ACR else w[:1].upper() + w[1:].lower()
+                                                         if i == 0 else w.lower()) for i, w in enumerate(words))
+        if any(o["title"].lower() == title.lower() for o in opts):
+            continue
+        chk = check_headline(entry, title)
+        issues = chk["problems"] + [f"unsupported: {u}" for u in chk["unsupported"]]
+        if safety.screen(headline=title)["flagged"] or safety.death_hint("", [title]):
+            issues.append("safety / death-screen wording")
+        if issues:
+            rejected.append(f"{title}: {'; '.join(issues)[:80]}")
+            continue
+        opts.append({"title": title, "from": raw[:80]})
+        if len(opts) >= n:
+            break
+    why = None
+    if len(opts) < n:
+        why = (f"{len(opts)} of {n}: " + ("no viewer-clip titles to work from — write it from the frames" if not titles
+               else f"{len(titles)} viewer-clip title(s), {len(rejected)} failed the checker"
+                    + (f" ({rejected[0]})" if rejected else "")))
+    return {"options": opts, "why_fewer": why, "rejected": rejected}
+
+
 def check_headline(entry: dict, title: str, quote: str | None = None) -> dict:
     from . import publish
 
