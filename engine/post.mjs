@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { ROOT, SYNC, OUTBOX, agentPosts, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, notifyOnce, acquireLock, probe } from './lib.mjs';
+import { ROOT, SYNC, OUTBOX, agentPosts, POSTED, FAILED, GIT_AUTHOR, log, sha256, alreadyLive, appendLedger, notify, notifyOnce, acquireLock, probe, PostingRightsError, postingRightsReason } from './lib.mjs';
 import { postYouTube, checkYouTube } from './youtube.mjs';
 import { postInstagram, checkInstagram } from './instagram.mjs';
 import { postTikTok, checkTikTok } from './tiktok.mjs';
@@ -29,12 +29,25 @@ function duePlatforms(meta, now = Date.now()) {
     .filter(p => !sched[p] || Date.parse(sched[p]) <= now);
 }
 
+function reportRightsHold(slug, reason) {
+  const message = `${slug}: ${reason}; owner review required`;
+  if (notifyOnce(`rights:${slug}`, 'clipengine: clip held for rights review', message)) {
+    log('HELD:', message);
+  }
+}
+
 function readyItems() {
   return fs.readdirSync(OUTBOX, { withFileTypes: true }).filter(d => d.isDirectory())
     .map(d => path.join(OUTBOX, d.name))
     .filter(dir => fs.existsSync(path.join(dir, 'post.json')) && fs.existsSync(path.join(dir, 'clip.mp4')))
     .filter(dir => {
-      try { return duePlatforms(JSON.parse(fs.readFileSync(path.join(dir, 'post.json'), 'utf8'))).length > 0; }
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(dir, 'post.json'), 'utf8'));
+        if (!duePlatforms(meta).length) return false;
+        const reason = postingRightsReason(meta.login);
+        if (reason) reportRightsHold(meta.slug, reason);
+        return !reason;
+      }
       catch { return true; }                      // unreadable post.json: let processItem hold it with a reason
     });
 }
@@ -89,6 +102,10 @@ async function processItem(ctx, dir) {
         results[platform] = 'live';
         break;
       } catch (e) {
+        if (e instanceof PostingRightsError) {
+          reportRightsHold(item.slug, e.message);
+          return;
+        }
         lastErr = e;
         log(item.slug, platform, `attempt ${attempt} failed:`, e.message.split('\n')[0]);
         await page.screenshot({ path: path.join(dir, `${platform}-fail-${attempt}.png`) }).catch(() => {});

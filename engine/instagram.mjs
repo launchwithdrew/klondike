@@ -1,6 +1,6 @@
 // Instagram Reel poster — the exact flow verified by hand on 2026-11-18.
 import path from 'node:path';
-import { ACCOUNTS, log, extractFrame, setLocalFiles } from './lib.mjs';
+import { ACCOUNTS, checkPostingRights, log, extractFrame, setLocalFiles } from './lib.mjs';
 
 const PROFILE_URL = `https://www.instagram.com/${ACCOUNTS.instagram.username}/`;
 
@@ -21,6 +21,7 @@ async function newestReels(page) {
 const dlgBtn = (page, name) => page.locator('div[role=dialog] div[role=button], div[role=dialog] button').filter({ hasText: new RegExp(`^${name}$`) }).first();
 
 export async function postInstagram(page, item, { dry = false } = {}) {
+  checkPostingRights(item);
   const chk = await checkInstagram(page);
   if (!chk.ok) throw new Error(`Instagram check failed: ${chk.why}`);
   const before = await newestReels(page);
@@ -60,6 +61,7 @@ export async function postInstagram(page, item, { dry = false } = {}) {
 
   if (dry) { log('instagram', item.slug, 'DRY RUN: stopped before Share'); return { dry: true }; }
 
+  checkPostingRights(item);
   await dlgBtn(page, 'Share').click();
   await page.locator('text=Your reel has been shared').waitFor({ timeout: 600000 });
 

@@ -86,10 +86,18 @@ def measure_transcribe(model_name: str, max_audio_s: float = 30.0) -> dict:
     x = A.decode_pcm(fx, 0, max_audio_s)
     secs = len(x) / A.SR
     t0 = time.monotonic()
-    A._transcribe(x, model_name, 0.0, "")
+    result = A._transcribe(x, model_name, 0.0, "")
     wall = time.monotonic() - t0
-    return {"model": model_name, "audio_s": round(secs, 1), "load_s": round(load, 1), "wall_s": round(wall, 1),
-            "realtime": round(secs / max(wall, 1e-3), 2)}
+    measured = {"model": model_name, "device": result.get("device"), "audio_s": round(secs, 1),
+                "load_s": round(load, 1), "wall_s": round(wall, 1),
+                "realtime": round(secs / max(wall, 1e-3), 2),
+                "words": A.real_words(result), "fallback": result.get("fallback")}
+    if A.requested_device() == "cuda" and result.get("device") == "cuda":
+        start = time.monotonic()
+        cpu = A._whisper_once(x, model_name, 0.0, A.vocab_prompt(),
+                              False if result["pass"] == "no-vad" else A.VAD_GENTLE, "cpu")
+        measured["cpu_reference"] = {"infer_s": round(time.monotonic() - start, 2), "words": A.real_words(cpu)}
+    return measured
 
 
 def predict(render: dict | None, trans: dict | None) -> dict:
@@ -158,16 +166,20 @@ def lines(res: dict) -> list[str]:
     out.append(f"  render   {r['realtime']}× realtime ({r['layout']}) → a {CLIP_S:.0f} s clip ≈ {p.get('render_s')} s"
                f"{_fmt_ok(p.get('render_ok'))} (target {TARGET_RENDER_S:.0f} s)" if r.get("realtime") else
                f"  render   {r.get('skipped') or r.get('error')}")
-    out.append(f"  whisper  {t['model']}: {t['realtime']}× realtime (load {t['load_s']} s) → a draft ≈ {p.get('draft_s')} s"
+    out.append(f"  whisper  {t['model']} ({t.get('device') or 'device unrecorded'}): {t['realtime']}× realtime (load {t['load_s']} s) → a draft ≈ {p.get('draft_s')} s"
                f"{_fmt_ok(p.get('draft_ok'))} (target {TARGET_DRAFT_S:.0f} s)" if t.get("realtime") else
                f"  whisper  {t.get('skipped') or t.get('error')}")
-    verdict = [p.get(k) for k in ("draft_ok", "render_ok") if k in p]
-    if verdict:
-        out.append("  verdict  " + ("this host meets both speed targets on this profile" if all(verdict) else
-                                    "this host misses a speed target on this profile — try `bench --profile lite`, "
-                                    "or a bigger host"))
-    if res.get("path"):
-        out.append(f"  saved    {os.path.relpath(res['path'], _repo())}")
+    if t.get("fallback"):
+        out.append(f"  whisper  CUDA fell back to CPU: {t['fallback']}")
+    measured = [p[k] for k in ("draft_ok", "render_ok") if k in p]
+    if not measured:
+        out.append("  verdict  speed targets unmeasured")
+    elif not all(measured):
+        out.append("  verdict  this host misses a speed target on this profile — try `bench --profile lite` or a bigger host")
+    elif len(measured) < 2:
+        out.append("  verdict  one speed target met; the other is unmeasured")
+    else:
+        out.append("  verdict  this host meets both speed targets on this profile")
     return out
 
 

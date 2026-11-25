@@ -370,11 +370,33 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
             print(f"[sentinel] {login}: no warm start ({str(exc)[:80]}) — building the baseline live", flush=True)
     p_hist: collections.deque = collections.deque(maxlen=int(3600 / STEP_S))   # (t, p) for crowd drafts
     drafted: list[tuple] = []
+    try:                    # a restart (every code update) forgets nothing: what's queued, and drafts it cut short
+        drafted.extend(queued_windows(out))
+        for mo in resume_pending(out):
+            drafted.append((mo["start"], mo["stop"]))
+            print(f"[sentinel] {login}: re-drafting a moment a restart interrupted ({draft_id(login, mo['start'])})",
+                  flush=True)
+            threading.Thread(target=_draft_safe, args=(out, login, mo, model_name), daemon=True).start()
+        if resume_fallbacks(out, login):
+            print(f"[sentinel] {login}: resuming saved-stream drafts a restart left waiting", flush=True)
+    except Exception as exc:
+        print(f"[sentinel] {login}: couldn't read earlier drafts ({str(exc)[:80]})", flush=True)
     crowd_checked = 0.0
+    handed: set[str] = set()             # viewer clips our recording doesn't have, already given to catch-up
     audio_seen: dict[str, float] = {}
     cur, last_end, fired = None, 0.0, 0
     status_path = os.path.join(out, "sentinel.json")
+    from . import cliplog as CL
+    clog = CL.ClipLog(out)
     print(f"[sentinel] {login}: listening (trigger p ≥ {m['trigger']}) -> {out}", flush=True)
+    shadow_t = None
+    try:                                             # §1.4: a new trigger fires beside this one, drafting nothing
+        from . import shadow as SH
+        shadow_t = SH.start(out, clog._write) if not youtube and not kick else None
+        if shadow_t:
+            print(f"[sentinel] {login}: shadow trigger {shadow_t.m.get('name', 'model')} on (drafts nothing)", flush=True)
+    except Exception as exc:
+        print(f"[sentinel] shadow trigger off ({str(exc)[:80]})", flush=True)
     threading.Thread(target=_facecam_suggest, args=(login, out, time.time()), daemon=True).start()
     t_next = time.time() + STEP_S
     last_beat = 0.0
@@ -404,28 +426,66 @@ def run(login: str, out: str, buffer_h: float = 3.0, draft: bool = True, model_n
             p = prob(f, m) if len(hist.get("users", [])) >= MIN_HISTORY else 0.0
         _push(hist, raw, keep)
         p_hist.append((now, p))
-        # moments viewers already clipped while we were recording: draft them now, no live spike needed
-        if draft and not youtube and not kick and crowd.new and now - crowd_checked >= 60:
-            crowd_checked = now
+        if shadow_t is not None:
             try:
-                for cm in L.live_moments(out):
-                    w = (cm["start"] - 3, cm["end"] + 3)
-                    if cm["views"] < CROWD_DRAFT_MIN_VIEWS or _overlaps(w, drafted) or (cur and w[1] >= cur["fire"] - 60):
-                        continue
-                    drafted.append(w)
-                    pm = max([q for tq, q in p_hist if w[0] - 10 <= tq <= w[1] + REACTION_DELAY_S] or [0.0])
-                    moment = {"start": w[0], "stop": w[1], "p": round(max(pm, 0.5), 3), "fire": cm["end"],
-                              "crowd_end": cm["end"], "features": None, "crowd_new": cm["clips"], "chat": chat.window(w[0], w[1] + 20),
-                              "source": "viewer clips"}
-                    print(f"[sentinel] {login}: viewers clipped a moment ({cm['views']} views) — drafting it", flush=True)
-                    threading.Thread(target=_draft_safe, args=(out, login, moment, model_name), daemon=True).start()
-            except Exception as exc:
-                print(f"[sentinel] crowd draft check failed ({str(exc)[:80]})", flush=True)
+                shadow_t.step(now, f)
+            except Exception:
+                shadow_t = None                          # a shadow fault never touches the live trigger
+        # moments viewers already clipped while we were recording: draft them now, no live spike needed.
+        # Every check and every clip's outcome goes in events.jsonl (cliplog): a miss gets a cause, not a guess.
+        if draft and not youtube and not kick and now - crowd_checked >= 60:
+            crowd_checked = now
+            if not crowd.new:
+                clog.poll(False, why="no new clip in the top-100 list since the sentinel started", now=now)
+            else:
+                try:
+                    moments_, clips_, info_ = L.live_clips(out)
+                    clog.poll(True, info_, now=now)
+                    fate: dict[str, tuple[str, str | None]] = {}
+                    for cm in moments_:
+                        w = (cm["start"] - 3, cm["end"] + 3)
+                        hit = _overlap_with(w, drafted)
+                        if cm["views"] < CROWD_DRAFT_MIN_VIEWS:
+                            res = ("below 10 views", None)
+                        elif hit:
+                            res = ("overlaps a draft", draft_id(login, hit[0]))
+                        elif cur and w[1] >= cur["fire"] - 60:
+                            res = ("spike open", None)
+                        else:
+                            drafted.append(w)
+                            res = ("drafted", draft_id(login, w[0]))
+                            pm = max([q for tq, q in p_hist if w[0] - 10 <= tq <= w[1] + REACTION_DELAY_S] or [0.0])
+                            bc = cm.get("best") or {}
+                            moment = {"start": w[0], "stop": w[1], "p": round(max(pm, 0.5), 3), "fire": cm["end"],
+                                      "crowd_end": cm["end"], "features": None, "crowd_new": cm["clips"],
+                                      "chat": chat.window(w[0], w[1] + 20), "source": "viewer clips",
+                                      **{k: bc[k] for k in ("slug", "created", "placed") if bc.get(k)}}
+                            print(f"[sentinel] {login}: viewers clipped a moment ({cm['views']} views) — drafting it", flush=True)
+                            threading.Thread(target=_draft_safe, args=(out, login, moment, model_name), daemon=True).start()
+                        for slug in cm.get("slugs") or []:
+                            fate[slug] = res
+                    for c in handoff(clips_, drafted, handed, now):
+                        w = (c["start"] - 3, c["end"] + 3)
+                        said = saved_stream_fallback(login, {"start": w[0], "stop": w[1], "source": "viewer clips"},
+                                                     now=now, out=out)
+                        handed.add(c["slug"])
+                        if said:
+                            drafted.append(w)
+                            fate[c["slug"]] = ("handed to catch-up", None)
+                            print(f"[sentinel] {login}: viewers clipped a moment our recording doesn't have "
+                                  f"({c['views']} views, {c['state']}) — {said}", flush=True)
+                    for c in clips_:
+                        state, did = fate.get(c["slug"], (c.get("state") or "", None))
+                        clog.clip(c, state, did, now=now)
+                except Exception as exc:
+                    clog.poll(False, why=f"crowd check failed: {str(exc)[:100]}", now=now)
+                    print(f"[sentinel] crowd draft check failed ({str(exc)[:80]})", flush=True)
         if cur is None:
             if p >= m["trigger"] and now - last_end >= cooldown(m):
                 cur = {"fire": now, "peak": now, "p": p, "end": now, "chat": chat.window(now - 20, now),
                        "features": {k: round(v, 3) for k, v in f.items()}}
                 print(f"[sentinel] {login}: FIRED p={p:.2f} {json.dumps({k: round(v, 2) for k, v in f.items()})}", flush=True)
+                clog._write({"ev": "fire", "t": round(now, 1), "trigger": "live", "p": round(p, 3)})
         else:
             if p > cur["p"]:
                 cur["p"], cur["peak"] = p, now
@@ -519,6 +579,22 @@ def warm_history(login: str, hist: dict, keep: int, minutes: float = 30.0) -> in
     return n
 
 
+HANDOFF_STATES = ("before the recording", "pruned before we saw it")
+HANDOFF_MAX_AGE_S = 2 * 3600   # older viewer clips are the 30-min sweep's job (and soon stale for triage)
+HANDOFF_PER_CHECK = 2          # a sentinel that starts mid-stream sees a whole day of clips: the freshest few only
+
+
+def handoff(clips: list[dict], drafted: list, handed: set, now: float) -> list[dict]:
+    """Viewer clips (10+ views) whose moment our recording doesn't have — it started after, or the buffer
+    pruned it before the sentinel looked — fresh enough to draft from the saved stream. Each one once, most
+    viewed first, at most HANDOFF_PER_CHECK a check (pure). Before 24 Nov these were only logged: 23 of the
+    day's 42 recorded-but-not-drafted misses."""
+    out = [c for c in clips if c.get("state") in HANDOFF_STATES and c["slug"] not in handed
+           and int(c.get("views") or 0) >= CROWD_DRAFT_MIN_VIEWS and now - c["end"] <= HANDOFF_MAX_AGE_S
+           and not _overlap_with((c["start"] - 3, c["end"] + 3), drafted)]
+    return sorted(out, key=lambda c: -int(c.get("views") or 0))[:HANDOFF_PER_CHECK]
+
+
 def _overlaps(a: tuple, drafted: list, frac: float = 0.5) -> bool:
     for b in drafted:
         inter = min(a[1], b[1]) - max(a[0], b[0])
@@ -527,11 +603,100 @@ def _overlaps(a: tuple, drafted: list, frac: float = 0.5) -> bool:
     return False
 
 
+def _overlap_with(a: tuple, drafted: list, frac: float = 0.5) -> tuple | None:
+    """The first drafted window `a` overlaps by more than `frac` of the shorter one, or None."""
+    return next((b for b in drafted if _overlaps(a, [b], frac)), None)
+
+
 def draft_id(login: str, start: float) -> str:
     return f"{login}-{dt.datetime.fromtimestamp(start, dt.timezone.utc):%H%M%S}"
 
 
+PENDING = "drafting"            # <rec>/drafting/<id>.json while a draft is being cut: a restart re-drafts it
+QUEUED_WINDOW_S = 6 * 3600
+
+
+def _pending_path(out: str, login: str, moment: dict) -> str:
+    return os.path.join(out, PENDING, draft_id(login, moment["start"]) + ".json")
+
+
+def queued_windows(out: str, now: float | None = None) -> list[tuple[float, float]]:
+    """Every moment this recording's queue already holds (drafted or dropped) from the last 6 h, so a restarted
+    sentinel doesn't draft the same viewer-clipped moment twice."""
+    now = now or time.time()
+    out_: list[tuple[float, float]] = []
+    try:
+        for line in open(os.path.join(out, "queue.jsonl")):
+            try:
+                r = json.loads(line)
+                a, b = float(r["start"]), float(r["stop"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if b >= now - QUEUED_WINDOW_S:
+                out_.append((a, b))
+    except OSError:
+        pass
+    return out_
+
+
+def resume_pending(out: str, now: float | None = None) -> list[dict]:
+    """Moments whose draft a restart cut short (a marker with no queue line): to draft again. Markers already
+    answered by a queue line, or older than 6 h, are cleared (the old one with a dropped line, never silently)."""
+    now = now or time.time()
+    d = os.path.join(out, PENDING)
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    ids = set()
+    try:
+        for line in open(os.path.join(out, "queue.jsonl")):
+            try:
+                ids.add(json.loads(line).get("id"))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    todo = []
+    for n in names:
+        p = os.path.join(d, n)
+        try:
+            rec = json.load(open(p))
+            login, mo = rec["login"], rec["moment"]
+        except (OSError, ValueError, KeyError, TypeError):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        if n[:-5] in ids:
+            os.remove(p)
+        elif now - float(mo.get("stop") or 0) > QUEUED_WINDOW_S:
+            log_dropped(out, login, mo, "draft interrupted by a restart, too old to redo")
+            os.remove(p)
+        else:
+            todo.append({**mo, "resumed": True})
+    return todo
+
+
 def _draft_safe(out, login, moment, model_name):
+    marker = _pending_path(out, login, moment)
+    try:
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        json.dump({"login": login, "moment": moment, "at": time.time()}, open(marker, "w"))
+    except OSError:
+        marker = None
+    try:
+        _draft_body(out, login, moment, model_name)
+    finally:
+        if marker:
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+
+
+def _draft_body(out, login, moment, model_name):
     try:
         draft_moment(out, login, moment, model_name)
     except Exception as exc:
@@ -554,7 +719,7 @@ def log_dropped(out: str, login: str, moment: dict, reason: str, **extra) -> dic
     entry = {"id": draft_id(login, moment["start"]), "login": login, "rec": out, "start": round(moment["start"], 1),
              "stop": round(moment["stop"], 1), "at": dt.datetime.fromtimestamp(moment.get("fire") or moment["start"],
                                                                                 dt.timezone.utc).isoformat(),
-             "p": moment.get("p"), "engine": 0, "best": 0, "flags": [], "unsafe": "", "chat": "", "said": "",
+             "drafted_at": dt.datetime.now(dt.timezone.utc).isoformat(), "p": moment.get("p"), "engine": 0, "best": 0, "flags": [], "unsafe": "", "chat": "", "said": "",
              "sheet": None, "status": "dropped", "reason": reason, "via": moment.get("source", "live spike"), **extra}
     with open(os.path.join(out, "queue.jsonl"), "a") as fh:
         fh.write(json.dumps(entry) + "\n")
@@ -610,6 +775,45 @@ def chat_score_from_p(p: float) -> float:
 
 SETUP_S = (3.0, 15.0)     # before the payoff, starting on a sentence boundary
 REACT_MAX_S = 8.0         # after it
+
+
+def place_by_audio(out: str, moment: dict, locate=None) -> dict | None:
+    """A viewer-clip moment: find the clip's audio in our recording and move crowd_end to where it really ends.
+    The estimate is good to a few seconds when the clip has a saved-stream place, and only rough (createdAt minus
+    the typical lag, 5-150 s spread) when it doesn't, so the search is wider then. Writes moment["placement"]
+    ({"how", "corr", "shift_s"}) either way, so the queue line says how the moment was placed (U2)."""
+    if moment.get("source") != "viewer clips" or not moment.get("slug") or not moment.get("crowd_end"):
+        return None
+    from . import align as AL
+    from . import live as L
+    est = float(moment["crowd_end"])
+    if moment.get("placed") == "saved-stream place":
+        lo, hi = moment["start"] - 30, est + 30
+    else:
+        c = float(moment.get("created") or est)
+        lo, hi = c - L.CLIP_LAG_RANGE_S[1] - 60, c
+    found = (locate or AL.in_recording)(out, moment["slug"], lo, hi)
+    if not found:
+        moment["placement"] = {"how": moment.get("placed") or "estimate", "corr": None, "shift_s": 0.0}
+        return None
+    moment["crowd_end"] = found["end"]
+    moment["placement"] = {"how": "audio match", "corr": found["corr"], "shift_s": round(found["end"] - est, 1),
+                           "was": moment.get("placed") or "estimate"}
+    return found
+
+
+def _push_if_hot(entry: dict) -> None:
+    """A hot draft (ops.is_hot: URGENT, or best ≥ ops.HOT_BEST with a ship call) pushes the phone as it lands, not at
+    the next cycle (§3.3)."""
+    try:
+        from . import attention as AT
+        from . import ops as O
+        if O.is_hot(entry):
+            AT.push_now(O.config(), f"draft:{entry['id']}",
+                        ("🔥 URGENT draft — be first: " if is_urgent(entry) else "hot draft: ")
+                        + O.draft_item_text(entry, time.time()) + " → clipengine queue")
+    except Exception as exc:
+        print(f"[sentinel] phone push failed ({str(exc)[:80]})", flush=True)
 
 
 def estimate_payoff(moment: dict) -> float:
@@ -702,10 +906,80 @@ def not_recorded_why(rec_dir: str, payoff: float) -> str:
     return "the moment isn't in our recording (segments missing or pruned around it)"
 
 
-def saved_stream_fallback(login: str, moment: dict, now: float | None = None, run=None) -> str | None:
+FALLBACK_DIR = "fallback"          # <rec>/fallback/<key>.json while a saved-stream draft waits: survives a restart
+FALLBACK_LOG = "fallback.jsonl"    # one line per saved-stream hand-off: what became of it (scouts reads it)
+FALLBACK_MAX_AGE_S = 6 * 3600      # triage archives a moment older than this anyway
+
+
+def _fallback_done(out: str | None, key: str, login: str, s: float, e: float, result: str) -> None:
+    if not out:
+        return
+    try:
+        with open(os.path.join(out, FALLBACK_LOG), "a") as fh:
+            fh.write(json.dumps({"key": key, "login": login, "start": round(s, 1), "stop": round(e, 1),
+                                 "result": result, "at": time.time()}) + "\n")
+        os.remove(os.path.join(out, FALLBACK_DIR, key + ".json"))
+    except OSError:
+        pass
+
+
+def run_fallback(out: str | None, login: str, s: float, e: float, via: str, key: str | None = None) -> str:
+    """Draft [s, e] from the saved stream now and record what became of it: queued / nothing strong / failed."""
+    from . import autopilot as AP
+    outcome: dict = {}
+    try:
+        got = AP.catchup(s, e, [login], keep=1, probe=3, via=via, outcome=outcome)
+        if got:
+            result = f"queued {got[0].get('id', '')}".strip()
+        elif outcome.get("failed"):
+            result = "failed: " + str(outcome["failed"][0].get("why") or "")[:90]
+        elif outcome.get("windows"):
+            result = str(outcome["windows"][0].get("result") or "nothing strong")
+        else:
+            result = "no saved stream covers it"
+    except Exception as exc:
+        result = f"failed: {str(exc)[:80]}"
+        print(f"[sentinel] {login}: saved-stream fallback failed ({str(exc)[:80]})", flush=True)
+    _fallback_done(out, key or f"{login}-{int(s)}", login, s, e, result)
+    return result
+
+
+def resume_fallbacks(out: str, login: str, now: float | None = None, run=None) -> int:
+    """Saved-stream drafts a restart left waiting: run them again, or record them as lost once too old. Never silent."""
+    from . import autopilot as AP
+    now = time.time() if now is None else now
+    d = os.path.join(out, FALLBACK_DIR)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        try:
+            m = json.load(open(os.path.join(d, name)))
+            key, s, e, via = name[:-5], float(m["start"]), float(m["stop"]), m.get("via") or "catch-up (saved stream)"
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if now - e > FALLBACK_MAX_AGE_S:
+            _fallback_done(out, key, login, s, e, "lost: a restart interrupted it and the moment is over 6 h old")
+            continue
+        wait = max(0.0, e + AP.SWEEP_LAG_S - now)
+
+        def go(key=key, s=s, e=e, via=via, wait=wait):
+            if wait:
+                time.sleep(wait)
+            run_fallback(out, login, s, e, via, key)
+        (run or (lambda f: threading.Thread(target=f, daemon=True).start()))(go)
+        n += 1
+    return n
+
+
+def saved_stream_fallback(login: str, moment: dict, now: float | None = None, run=None,
+                          out: str | None = None) -> str | None:
     """A moment our recording missed is drafted from the creator's saved stream (VOD) instead of being lost —
     in the background, once the VOD has caught up (it trails live by a few minutes). None when the creator has
-    no usable saved streams."""
+    no usable saved streams. With `out` (the recording), the hand-off is written down first, so a restart resumes
+    it (resume_fallbacks), and its outcome goes to <out>/fallback.jsonl."""
     from . import autopilot as AP
     from . import publish as PB
     from . import vodaccess as VA
@@ -723,13 +997,19 @@ def saved_stream_fallback(login: str, moment: dict, now: float | None = None, ru
     via = "catch-up (" + ("viewer clips" if moment.get("crowd_end") or moment.get("source") == "viewer clips"
                           else "moment") + ", not in our recording)"
 
+    key = f"{login}-{int(s)}"
+    if out:
+        try:
+            os.makedirs(os.path.join(out, FALLBACK_DIR), exist_ok=True)
+            with open(os.path.join(out, FALLBACK_DIR, key + ".json"), "w") as fh:
+                json.dump({"start": s, "stop": e, "via": via, "at": now}, fh)
+        except OSError:
+            pass
+
     def go():
         if wait:
             time.sleep(wait)
-        try:
-            AP.catchup(s, e, [login], keep=1, probe=3, via=via)
-        except Exception as exc:
-            print(f"[sentinel] {login}: saved-stream fallback failed ({str(exc)[:80]})", flush=True)
+        run_fallback(out, login, s, e, via, key)
     (run or (lambda f: threading.Thread(target=f, daemon=True).start()))(go)
     return "drafting it from the saved stream instead" + (f" in {wait / 60:.0f} min" if wait > 60 else "")
 
@@ -811,6 +1091,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
         return log_dropped(out, login, moment, "nothing recorded yet")
     game = moment.get("game") or stream_game(login)
     bad_game = wrong_game(game)
+    place_by_audio(out, moment)
     payoff = estimate_payoff(moment)
     a, b = payoff - SETUP_S[1] - 10, payoff + REACT_MAX_S + 6
     t_wait = time.time() + wait_s
@@ -822,7 +1103,7 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     cov = covered(out, a, b, payoff)
     if cov is None or cov[1] - cov[0] < 8:
         why = not_recorded_why(out, payoff)
-        fb = saved_stream_fallback(login, moment)          # Nov 22: these were dropped — 90 of 90 viewer-clip moments
+        fb = saved_stream_fallback(login, moment, out=out)   # Nov 22: these were dropped — 90 of 90 viewer-clip moments
         return log_dropped(out, login, moment, why + (f" — {fb}" if fb else ""), payoff=round(payoff, 1),
                            fallback="saved stream" if fb else None)
     a, b = cov
@@ -881,7 +1162,8 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
     chat_lines = [c["text"] for c in moment.get("chat", [])]
     vis = VI.check(src, s - first, e - s)
     sig = G.signals_from_live(out, login, s, e, in_win)
-    sf = SF.screen(said, titles=sig.get("titles"), chat_lines=chat_lines)
+    audible = " ".join(w["w"].strip() for w in in_win)
+    sf = SF.screen(audible, titles=sig.get("titles"), chat_lines=chat_lines)
     death = SF.death_hint(said, sig.get("titles"), chat_lines)
     sig["chat_score"] = chat_score_from_p(moment["p"])
     if moment.get("crowd_new"):                     # viewers already clipping it: strong early crowd signal
@@ -928,11 +1210,14 @@ def draft_moment(out: str, login: str, moment: dict, model_name: str = "small", 
              "game": game, "sheet": sheet, "status": "dropped" if reason else "new", "reason": reason or None,
              **({"visual": seen} if seen else {}),
              "recut": recut, "features": moment.get("features"), "via": moment.get("source", "live spike"),
+             **({"placed": moment["placement"]} if moment.get("placement") else {}),
              "words": os.path.join(ddir, mid + ".words.json")}
     with open(os.path.join(out, "queue.jsonl"), "a") as fh:
         fh.write(json.dumps(entry) + "\n")
     print(f"[sentinel] {'dropped' if reason else 'queued'} {mid}: {e - s:.0f}s, payoff +{payoff - s:.0f}s ({how}), "
           f"engine {eng['score']} (best {best}) [{entry['parts']}] {reason or sf['why'] or ''}", flush=True)
+    if not reason:
+        _push_if_hot(entry)
     if not reason and prerender_on():
         _prerender_safe(entry)
     return entry
@@ -967,18 +1252,44 @@ def _queue_files(root: str) -> list[str]:
     return sorted(glob.glob(os.path.join(root, "*", "queue.jsonl")))
 
 
-def load_queue(root: str = os.path.join(REPO, "runs")) -> list[dict]:
-    rows = []
-    for qf in _queue_files(root):
-        latest: dict[str, dict] = {}
-        for line in open(qf):
+def read_queue_file(path: str) -> dict[str, dict]:
+    latest: dict[str, dict] = {}
+    try:
+        stream = open(path)
+    except FileNotFoundError:
+        return latest
+    with stream:
+        for line in stream:
             try:
-                r = json.loads(line)
+                row = json.loads(line)
             except ValueError:
                 continue
-            latest[r["id"]] = {**latest.get(r["id"], {}), **r}       # later lines update status
-        rows += latest.values()
-    return rows
+            did = row["id"]
+            previous = latest.get(did, {})
+            # Live IDs use time of day. A later day's full draft can reuse an ID.
+            if row.get("rec") and row.get("start") is not None and previous.get("start") is not None:
+                if abs(row["start"] - previous["start"]) >= 12 * 3600:
+                    previous = {}
+            merged = {**previous, **row}
+            if previous.get("status") == "skipped" and not row.get("reopen_reason"):
+                # Redrafts refresh evidence. A newer score or a stale triage write cannot replace a verdict.
+                merged.update(status="skipped", reason=previous.get("reason"), judged_at=previous.get("judged_at"))
+                if row.get("status") == "skipped":
+                    merged.update(reason=row.get("reason", previous.get("reason")),
+                                  judged_at=row.get("judged_at", previous.get("judged_at")))
+            latest[did] = merged
+    return latest
+
+
+def load_queue(root: str = os.path.join(REPO, "runs")) -> list[dict]:
+    return [row for qf in _queue_files(root) for row in read_queue_file(qf).values()]
+
+
+def is_skipped(entry: dict) -> bool:
+    if entry.get("status") == "skipped":
+        return True
+    current = read_queue_file(os.path.join(entry["rec"], "queue.jsonl")).get(entry["id"], {})
+    return current.get("status") == "skipped"
 
 
 def note(entry: dict, **extra) -> None:
@@ -1047,10 +1358,17 @@ def is_urgent(r: dict) -> bool:
         return False
     if any("death screen?" in str(f) or "adult scene on screen?" in str(f) for f in r.get("flags") or []):
         return False                                   # look at the frames first, however hot it is
+    from . import judge as JG
+    call = JG.engine_call(r)
+    if call == "drop":
+        return False                                   # a named check drops it (a death screen on the picture)
     corr = corroboration(r)
     if "viewers clipped it" in corr:
         return True
-    return float(r.get("best") or 0) >= URGENT_BEST and bool(corr)
+    # §4.1: the streamer's laugh / volume burst alone doesn't make it urgent — on Muse's verdicts all 5 high scores
+    # carried by a strong reaction with the streamer saying little were duds. The engine's ship call must agree.
+    # (No engine score on record = no call to check.)
+    return float(r.get("best") or 0) >= URGENT_BEST and bool(corr) and call in ("ship", None)
 
 
 def confidence_markers(r: dict) -> list[str]:
@@ -1070,6 +1388,13 @@ def confidence_markers(r: dict) -> list[str]:
         out.append("unconfirmed: chat + loudness only")
     if any("death screen?" in str(f) for f in r.get("flags") or []):
         out.append("possible death screen — check the frames")
+    from . import judge as JG
+    call, why = JG.engine_call_why(r)
+    if call == "hold" and float(r.get("best") or 0) >= URGENT_BEST:
+        # a banger-level score the named checks hold back (§4.1); "unconfirmed" above already says chat + loudness
+        why = [w for w in why if not (w.startswith("chat + loudness") and unconfirmed(r))]
+        if why:
+            out.append("no ship call: " + "; ".join(why))
     return out
 
 

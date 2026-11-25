@@ -83,9 +83,15 @@ def policy(login: str, roster: dict | None = None) -> str:
     return p if p in ("allowed", "pools", "never") else "allowed"
 
 
-def refuse_never(login: str, roster: dict | None = None) -> None:
-    if policy(login, roster) == "never":
-        raise SystemExit(f"PUBLISH REFUSED: {login} does not allow clipping (config/creators.json policy: never)")
+def policy_refusal(login: str | None, roster: dict | None = None) -> str | None:
+    if login and policy(login, roster) == "never":
+        return f"{login} does not allow clipping (config/creators.json policy: never)"
+    return None
+
+
+def refuse_never(login: str | None, roster: dict | None = None) -> None:
+    if reason := policy_refusal(login, roster):
+        raise SystemExit(f"PUBLISH REFUSED: {reason}")
 
 
 # ---- buffer by disk ---------------------------------------------------------------------------------
@@ -108,14 +114,10 @@ def explicit_buffer() -> float | None:
 
 def protected_windows(rec_dir: str) -> list[tuple[float, float]]:
     """Wall-clock windows a queued draft (status new) still needs from this recording."""
-    latest: dict[str, dict] = {}
+    from . import sentinel as SN
+
     try:
-        for line in open(os.path.join(rec_dir, "queue.jsonl")):
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            latest[r["id"]] = {**latest.get(r["id"], {}), **r}
+        latest = SN.read_queue_file(os.path.join(rec_dir, "queue.jsonl"))
     except OSError:
         return []
     out = []
@@ -130,20 +132,37 @@ def protected_windows(rec_dir: str) -> list[tuple[float, float]]:
     return out
 
 
+_DURS: dict[str, tuple[int, int, dict[str, float]]] = {}
+
+
 def segment_durations(rec_dir: str) -> dict[str, float]:
-    """{segment file: its length in seconds} from index.jsonl (Twitch writes 2 s; YouTube / Kick can be longer)."""
-    out = {}
+    """{segment file: its length in seconds} from index.jsonl (Twitch writes 2 s; YouTube / Kick can be longer).
+    The recorder asks every loop (2 s) and the index only grows (days of lines), so only new lines are read:
+    re-parsing it all took ~0.5 s a loop on a 5-day index, time a recorder needs to keep up with the playlist."""
+    path = os.path.join(rec_dir, "index.jsonl")
     try:
-        for line in open(os.path.join(rec_dir, "index.jsonl")):
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            if r.get("f"):
-                out[r["f"]] = float(r.get("d") or 2.0)
+        st = os.stat(path)
     except OSError:
-        pass
-    return out
+        return {}
+    ino, pos, out = _DURS.get(path, (st.st_ino, 0, {}))
+    if ino != st.st_ino or st.st_size < pos:          # replaced or truncated: start again
+        pos, out = 0, {}
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(pos)
+            chunk = fh.read()
+    except OSError:
+        return dict(out)
+    end = chunk.rfind(b"\n") + 1                     # a half-written last line waits for the next call
+    for line in chunk[:end].splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("f"):
+            out[r["f"]] = float(r.get("d") or 2.0)
+    _DURS[path] = (st.st_ino, pos + end, out)
+    return dict(out)
 
 
 def is_protected(t: float, d: float, windows: list[tuple[float, float]]) -> bool:
@@ -152,19 +171,32 @@ def is_protected(t: float, d: float, windows: list[tuple[float, float]]) -> bool
 
 # ---- recorder health --------------------------------------------------------------------------------
 
-def gap_cause(fresh_start: bool, ads: int, reconnects: int, failed: int, prev_age_s: float = 0) -> str:
-    """The likely reason the recording jumped (pure: the recorder counts what happened since its last
-    saved segment)."""
+FELL_BEHIND = "we fell behind the playlist (the recorder loop was too slow; segments slid off before we fetched them)"
+TIMELINE_JUMP = "the stream's own timeline jumped (every segment in sequence was saved: Twitch's side)"
+TIMELINE_GUESS = "the stream's own timeline jumped (the streamer's connection)"
+DISK_FULL = "the disk was full (quota or filesystem): segments couldn't be saved — the oldest recording was cleared"
+
+
+def gap_cause(fresh_start: bool, ads: int, reconnects: int, failed: int, prev_age_s: float = 0,
+              behind: int = 0, seq_known: bool = False, disk: int = 0) -> str:
+    """The reason the recording jumped (pure: the recorder counts what happened since its last saved segment).
+    `behind`: media-sequence numbers that left the playlist before we read them (ours). `seq_known`: the playlist
+    carries #EXT-X-MEDIA-SEQUENCE and no number was skipped, so a remaining jump is measured as the stream's own;
+    without sequence numbers that last label is the old fallback guess (TIMELINE_GUESS)."""
     if fresh_start:
         return ("the stream was offline (or nothing was recording)" if prev_age_s > 1800 else
                 "the recorder was restarted (sentinel restart or crash)")
     if ads:
         return "Twitch ad break (the stream is replaced by ads for viewers too)"
+    if disk:
+        return DISK_FULL
     if failed:
         return "segment downloads failed (network to the video host)"
     if reconnects:
         return "the stream dropped and the recorder reconnected"
-    return "the stream's own timeline jumped (the streamer's connection)"
+    if behind:
+        return FELL_BEHIND
+    return TIMELINE_JUMP if seq_known else TIMELINE_GUESS
 
 
 def recorder_stats(rec_dir: str, since: float, now: float | None = None) -> dict:
@@ -663,6 +695,7 @@ def catchup(since: float, until: float, logins: list[str] | None = None, keep: i
     from . import vodaccess as VA
     out = outcome if outcome is not None else {}
     out.setdefault("windows", []); out.setdefault("failed", [])
+    completed = out.setdefault("completed_windows", [])
     plan = plan or plan_batch(since, until, logins)
     if plan["invalid"]:
         raise ValueError("catchup: " + "; ".join(plan["invalid"]))
@@ -710,6 +743,7 @@ def catchup(since: float, until: float, logins: list[str] | None = None, keep: i
                                       "why": f"source failed: {msg[:80]}"})
             print(f"[catchup] {login} {v['id']}: {msg[:100]}", flush=True)
             continue
+        completed.append({"login": login, "start": v["created"] + v["a"], "end": v["created"] + v["b"]})
         rows = _queue_rows()
         entries = []
         for c in res["candidates"]:
@@ -826,7 +860,8 @@ def sweep(since: float, until: float, logins: list[str] | None = None, outcome: 
     moments nobody drafted, through the catch-up path. Returns the queued entries; `outcome` as catchup()."""
     out = outcome if outcome is not None else {}
     out.setdefault("windows", []); out.setdefault("failed", [])
-    from . import twitch as T
+    completed = out.setdefault("completed_windows", [])
+    from . import twitch as T, vodaccess as VA
     from .ops import config
     from .publish import creators
     cfg = config()
@@ -835,6 +870,8 @@ def sweep(since: float, until: float, logins: list[str] | None = None, outcome: 
     queued = []
     print(f"[sweep] {_hm(since)} → {_hm(until)}: {len(targets)} creator(s)", flush=True)
     for login in targets:
+        if VA.restricted(login):
+            continue
         if login.startswith("kick:"):                        # Kick: no chat replay — its viewers' clips are the scan
             try:
                 from . import kick as K
@@ -863,10 +900,15 @@ def sweep(since: float, until: float, logins: list[str] | None = None, outcome: 
                 except Exception:
                     crowd = []
             except Exception as exc:
+                if VA.is_restricted_error(exc):
+                    VA.mark(login, v["id"])
+                    out["windows"].append({"login": login, "vod": v["id"], "result": "subscriber-only"})
+                    break
                 out["failed"].append({"login": login, "vod": v["id"], "from": v["created"] + v["a"],
                                       "why": f"source failed: {str(exc)[:80]}"})
                 print(f"[sweep] {login} {v['id']}: {str(exc)[:100]}", flush=True)
                 continue
+            completed.append({"login": login, "start": v["created"] + v["a"], "end": v["created"] + v["b"]})
             picks = sweep_pick(light_moments(msgs, crowd), v["id"], v["created"], login, _queue_rows(), cfg)
             if not picks:
                 out["windows"].append({"login": login, "vod": v["id"], "result": "nothing strong"})
@@ -990,16 +1032,27 @@ def uptime(now: float | None = None, hours: float = 24.0, root: str | None = Non
     now = time.time() if now is None else now
     st = _json(os.path.join(root, "autopilot.json") if root else APSTATE)
     since = now - hours * 3600
-    recent = [d for d in st.get("deaths") or [] if since <= d.get("at", 0) <= now]
-    gaps = [max(0.0, d["at"] - max(since, d.get("dark_from", d["at"]))) / 60 for d in recent]
+    # one outage is often on record twice — the autopilot's own death and the supervisor's incident — so the dark
+    # stretches are merged before they're added up (Nov: the report's window total read as one "43 min dark" run)
+    spans = [(max(since, d.get("dark_from", d["at"])), d["at"], d.get("cause"))
+             for d in st.get("deaths") or [] if since <= d.get("at", 0) <= now]
     for inc in SV.incidents(root or _root(), since=since):
         end = inc.get("recovered_at") or now
-        recent.append({"cause": inc.get("cause")})
-        gaps.append(max(0.0, end - max(since, inc.get("dark_from", end))) / 60)
+        spans.append((min(end, max(since, inc.get("dark_from", end))), end, inc.get("cause")))
+    outages: list[list] = []
+    for a, b, cause in sorted(spans, key=lambda x: x[0]):
+        if outages and a <= outages[-1][1] + 60:
+            outages[-1][1] = max(outages[-1][1], b)
+            if cause and not outages[-1][2]:
+                outages[-1][2] = cause
+        else:
+            outages.append([a, b, cause])
+    gaps = [max(0.0, b - a) / 60 for a, b, _ in outages]
     running = _alive(_read_pid(os.path.join(root, "autopilot.pid"))) if root else autopilot_status()["running"]
-    return {"deaths": len(recent), "dark_min": round(sum(gaps)), "running": running,
+    return {"deaths": len(outages), "dark_min": round(sum(gaps)), "running": running, "hours": hours,
+            "longest_min": round(max(gaps)) if gaps else 0,
             "dark_periods": [round(minutes) for minutes in gaps if minutes > 15],
-            "causes": [d.get("cause") or "unknown" for d in recent]}
+            "causes": [cause or "unknown" for _, _, cause in outages]}
 
 
 def revive_supervised(by: str) -> str | None:
@@ -1246,6 +1299,8 @@ def _loop(every_min, sessions, rounds, cycle_cmd, stop, hb, lease, root) -> None
                 AT.event("failure", f"cycle failed (exit {rc}): {(out.splitlines() or [''])[-1][:80]}",
                          key=f"cycle-fail:{int(t0) // 3600}")
             _write_ap(last_cycle_at=t0, last_rc=rc)
+            if rc == 0:
+                lease.update(last_successful_cycle_at=time.time())
             hb.set_phase("sleep")
         n += 1
         if rounds is None and cycle_cmd is None:            # a loop with a custom cycle (a test) never re-execs

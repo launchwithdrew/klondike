@@ -11,7 +11,8 @@ and the engine's signals — chat, loudness, speech — can't see any of it.
             (webcam only, black screen, desktop), death (a death / game-over screen) and adult (a strip club,
             underwear, nudity); a frame's shares sum to 1 and a draft's are the mean (and for action, death and
             adult the peak) over its frames
-  safety    adult peak >= 0.75 flags `adult scene on screen?` whatever the mode: demoted (the `adult_scene`
+  safety    adult peak >= 0.45 notes `possible adult scene` (no penalty); >= 0.75 flags `adult scene on screen?`
+            whatever the mode: demoted (the `adult_scene`
             penalty), never urgent — text can't see it; the editor's look still decides
   headline  how much better a headline describes the frames than a plain "a video game scene" does (advisory)
   eval      `clipengine visual eval` reads the frames editors judged (data/labels/<id>/<ship|hold|drop>/) and prints
@@ -44,6 +45,7 @@ SCALE = 100.0           # CLIP's logit scale
 MIN_AUC = 0.70
 MIN_EACH = 8
 ADULT_PEAK = 0.75      # 7 of 7 flagged sheets were real on 56 real GTA VI sheets (Nov 22); one at .53 missed
+ADULT_HINT = 0.45      # .45-.75: 3 real (incl. a live miss at .478) and 4 false on the same sheets: a note, no penalty
 
 PROMPTS = {
     "action": ["a car crash in a video game", "an explosion in a video game", "a police chase in a video game",
@@ -257,6 +259,8 @@ def short(v: dict) -> str:
         bits.append(f"death {v['death_peak']:.2f}")
     if v.get("adult_peak", 0) >= ADULT_PEAK:
         bits.append(f"⛔adult {v['adult_peak']:.2f}")
+    elif v.get("adult_peak", 0) >= ADULT_HINT:
+        bits.append(f"adult? {v['adult_peak']:.2f}")
     return "vis " + " ".join(bits)
 
 
@@ -305,7 +309,11 @@ def adult_flag(v: dict) -> str | None:
     """A safety flag, on whenever the model is: a strip club / underwear / nudity on screen is what a transcript
     can't see (rules/safety.md). It demotes and stops `urgent`; the editor's look still decides."""
     p = (v or {}).get("adult_peak") or 0
-    return f"adult scene on screen? (picture {p:.2f}) — look before posting" if p >= ADULT_PEAK else None
+    if p >= ADULT_PEAK:
+        return f"adult scene on screen? (picture {p:.2f}) — look before posting"
+    if p >= ADULT_HINT:                       # weaker: a note to look, never a penalty (false alarms cost winners)
+        return f"possible adult scene (picture {p:.2f}) — look before posting"
+    return None
 
 
 def assess_images(images: list, root: str | None = None, *, titles: list[str] | None = None) -> dict:

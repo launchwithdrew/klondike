@@ -153,7 +153,8 @@ def scan(vod_id: str, out_dir: str, start_s: float | None = None, end_s: float |
             "transcript_text": " ".join(w["w"].strip() for w in in_win if w.get("spk", "streamer") != "game"),
         })
         from . import safety as SF
-        sf = SF.screen(c["transcript_text"], (c.get("crowd") or {}).get("titles"),
+        audible = " ".join(w["w"].strip() for w in in_win)
+        sf = SF.screen(audible, (c.get("crowd") or {}).get("titles"),
                        [t for t, n in c["chat_context"]])
         c["safety"] = sf
         dh = SF.death_hint(c["transcript_text"], (c.get("crowd") or {}).get("titles"), [t for t, n in c["chat_context"]])
@@ -427,12 +428,16 @@ def render_pick(scan_dir: str, pick: int, out_dir: str | None = None, header: st
             crop = V.crop_for_game(T.Vod.fetch(vod_id).game_at(s))
         except Exception:
             crop = c.get("crop", "blur")
+    from . import safety as SF
     if fixes:
         from . import censor as C
+        original_speech = SF.screen_words(words, s, e)
         words = C.apply_fixes(words, fixes)
     info = V.render(src, first, s, e, words, out, crop=crop, layout=layout, title=title, quote=quote,
                     header=header, hook=hook, watermark=watermark, mute_audio=mute_audio,
                     extra_censor=extra_censor)
+    if fixes and original_speech["flagged"]:
+        info["speech_safety"] = original_speech
     t_render = time.time() - t0
     probe = V.ffprobe(out)
     strip = V.frames(out, [1, (e - s) / 2, e - s - 1], os.path.join(out_dir, "frames"))

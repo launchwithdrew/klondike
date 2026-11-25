@@ -1,5 +1,5 @@
 // YouTube Studio Shorts uploader — the exact flow verified by hand on 2026-11-18.
-import { ACCOUNTS, log, setLocalFiles } from './lib.mjs';
+import { ACCOUNTS, checkPostingRights, log, setLocalFiles } from './lib.mjs';
 
 // The channel id is optional in the brand pack: Studio redirects to the signed-in channel, and the
 // handle on the page must match the pack's.
@@ -33,6 +33,7 @@ async function setText(page, box, text) {
 }
 
 export async function postYouTube(page, item, { dry = false } = {}) {
+  checkPostingRights(item);
   const chk = await checkYouTube(page);
   if (!chk.ok) throw new Error(`YouTube check failed: ${chk.why}`);
   // Never re-upload: if a Short with this title already exists on the channel, record that one.
@@ -82,6 +83,7 @@ export async function postYouTube(page, item, { dry = false } = {}) {
 
   if (dry) { log('youtube', item.slug, 'DRY RUN: stopped before Publish (video stays a private draft)'); return { dry: true }; }
 
+  checkPostingRights(item);
   await dialog.locator('#done-button').click();
   const share = page.locator('ytcp-video-share-dialog, tp-yt-paper-dialog:has-text("Video published")');
   await share.first().waitFor({ timeout: 120000 });

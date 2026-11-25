@@ -113,6 +113,7 @@ class Lease:
         self.path = _p("autopilot.lease.json", self.root)
         self.fd: int | None = None
         self.generation = 0
+        self._update_lock = threading.Lock()
 
     def acquire(self, wait_s: float = 0.0, poll_s: float = 5.0, should_stop=lambda: False) -> bool:
         os.makedirs(self.root, exist_ok=True)
@@ -138,11 +139,12 @@ class Lease:
         return True
 
     def update(self, **kw) -> None:
-        st = _read(self.path)
-        if st.get("generation") != self.generation:
-            return                                          # someone else's lease now: never overwrite it
-        st.update(kw)
-        _write(self.path, st)
+        with self._update_lock:
+            st = _read(self.path)
+            if st.get("generation") != self.generation:
+                return                                      # someone else's lease now: never overwrite it
+            st.update(kw)
+            _write(self.path, st)
 
     def release(self) -> None:
         if self.fd is not None:
@@ -267,6 +269,7 @@ def reconcile(recovered_by: str | None, root: str | None = None, now: float | No
     if rec is None:
         rec = {"id": iid, "component": "autopilot", "generation": gen, "dark_from": last,
                "last_progress": prev.get("progress_at"), "last_phase": prev.get("phase"),
+               "last_successful_cycle_at": prev.get("last_successful_cycle_at"), "boot_id": prev.get("boot_id"),
                "detected_at": now, "cause": cause, "evidence": evidence[:300], "status": "open",
                "recovery_attempts": 0}
         _append_incident(rec, root)
@@ -335,6 +338,7 @@ class Heartbeat(threading.Thread):
         self.lease.update(heartbeat_at=wall, phase=self.phase)
         if self.phase == "cycle" and wall - self.phase_at > self.stall_s:
             self.on_stall(wall - self.phase_at)
+            return
         if self.ping_url and wall - self.last_ping >= PING_EVERY_S:
             self.last_ping = wall
             try:
@@ -552,6 +556,7 @@ def service_start() -> bool:
 
 # ---- keeper and boot: for hosts where the native service can't run or won't come back after a reboot -------
 KEEPER_RESTART_S = 30.0          # same as the services' restart delay
+LOCK_TRIES = 10                  # 0.5 s of retries before a held keeper.lock means another keeper
 CRON_TAG = "# klondike-boot"
 
 
@@ -607,11 +612,17 @@ def keep(every: float, sessions: bool = False, root: str | None = None, run=None
     wasn't a stop. One keeper per install (an OS lock)."""
     os.makedirs(root or RUNS, exist_ok=True)
     fd = os.open(_p("keeper.lock", root), os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return f"keeper: another keeper is running (pid {keeper_alive(root)})"
+    for attempt in range(LOCK_TRIES):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            # keeper_alive() probes with a shared lock held for microseconds: a probe landing on our start must not
+            # look like another keeper (U5: 2 in 60 starts under load quit "another keeper is running")
+            if attempt == LOCK_TRIES - 1:
+                os.close(fd)
+                return f"keeper: another keeper is running (pid {keeper_alive(root)})"
+            time.sleep(0.05)
     os.ftruncate(fd, 0)
     os.pwrite(fd, str(os.getpid()).encode(), 0)
     env = {**os.environ, "CLIPENGINE_STARTED_BY": "keeper", "PYTHONUNBUFFERED": "1"}

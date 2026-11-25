@@ -220,7 +220,7 @@ def apply(root: str | None = None, now: float | None = None, floor: float | None
             r = {**r, **(fixed or {}), "repairs": int(r.get("repairs", 0)) + 1}
             a = assess(r, now, floor=floor)
         if a["route"] == "archive":
-            SN.set_status(r, "archived", reason=a["reason"], triage="archive")
+            SN.set_status(r, "archived", reason=a["reason"], triage="archive", archived_at=now)
             counts["archived"] = counts.get("archived", 0) + 1
         elif a["route"] in ("preview", "review") and (r.get("triage") != a["route"] or r.get("triage_reason") != a["reason"]):
             SN.note(r, triage=a["route"], triage_reason=a["reason"], expires_at=a["expires_at"])

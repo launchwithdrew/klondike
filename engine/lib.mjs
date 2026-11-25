@@ -15,6 +15,23 @@ export function ops() {
 }
 // "post_with": "agent" — the agent posts with its own browser; this engine's poster and stats stand down
 export const agentPosts = () => ops().post_with === 'agent';
+
+export function postingRightsReason(login) {
+  if (!login) return '';
+  let roster;
+  try { roster = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'creators.json'), 'utf8')).creators; }
+  catch { return ''; }                       // the posting policy defaults to allowed without roster evidence
+  return String(roster?.[login.toLowerCase()]?.policy || '').toLowerCase() === 'never'
+    ? `${login} does not allow clipping (config/creators.json policy: never)` : '';
+}
+
+export class PostingRightsError extends Error {}
+
+export function checkPostingRights(item) {
+  const reason = postingRightsReason(item.login);
+  if (reason) throw new PostingRightsError(reason);
+}
+
 // Our shared operation syncs through git; a public copy (.public-build) is one machine and never commits or pushes.
 export const SYNC = !fs.existsSync(path.join(ROOT, '.public-build')) && process.env.CLIPENGINE_NO_SYNC !== '1';
 export const POSTED = path.join(ROOT, 'posted');

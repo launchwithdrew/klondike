@@ -251,11 +251,14 @@ def _chat_for(login: str, multi: MultiChat):
     return _View(multi, login)
 
 
-CROWD_Q = """query($ls: [String!]) { users(logins: $ls) { login clips(first: 20, criteria: {period: LAST_DAY,
+CROWD_Q = """query($ls: [String!]) { users(logins: $ls) { login clips(first: 100, criteria: {period: LAST_DAY,
   sort: VIEWS_DESC}) { edges { node { slug title createdAt viewCount } } } } }"""
 CROWD_MIN_VIEWS = 10        # a fresh viewer clip with this many views = a moment the crowd is reacting to
 CROWD_FRESH_S = 1200        # only clips made in the last 20 min count as "happening now"
 CROWD_HOT_S = 600           # after one, the creator counts as hot (promotion to a full sentinel) this long
+CROWD_LATE_S = 2 * 3600     # a clip we saw under 10 views that passes them later (up to 2 h old) is still a moment
+CROWD_PAGE = 100            # clips per creator per poll (24 Nov: at 20, 2 of 23 creators' lists were full at night)
+CROWD_LOG = os.path.join(DIR, "crowd.jsonl")
 
 
 class CrowdWatch(threading.Thread):
@@ -267,24 +270,59 @@ class CrowdWatch(threading.Thread):
         self.logins: list[str] = []
         self.every_s, self.stop_flag = every_s, False
         self.fired: dict[str, float] = {}           # slug -> when we fired on it
+        self.below: dict[str, float] = {}           # slug -> when we last saw it under CROWD_MIN_VIEWS
+        self.seen: dict[str, float] = {}            # slug -> when we first saw it (how soon after it was made: A1)
         self.hot: dict[str, float] = {}             # login -> hot until
         self.out: list[dict] = []
         self.lock = threading.Lock()
 
-    def poll(self, now: float | None = None) -> list[dict]:
+    def lists(self, logins: list[str], now: float) -> tuple[list[tuple[str, list[dict]]], str]:
+        """[(login, clip nodes)] and where they came from: Helix (every clip of the last 2 h, by creation time) when
+        there's a Twitch pass, else the public top-100-by-views list. Helix failing mid-poll falls back for that poll."""
+        from . import helix as HX
         from . import twitch as T
+        if logins and HX.token():
+            try:
+                ids = HX.user_ids(logins)
+                return [(l, HX.recent_clips(ids[l], now - CROWD_LATE_S)) for l in logins if l in ids], "helix"
+            except Exception:
+                pass
+        out = []
+        for i in range(0, len(logins), 25):
+            for u in T.gql(CROWD_Q, {"ls": logins[i:i + 25]}).get("users") or []:
+                out.append(((u or {}).get("login", ""),
+                            [e.get("node") or {} for e in ((u or {}).get("clips") or {}).get("edges") or []]))
+        return out, "gql"
+
+    def poll(self, now: float | None = None) -> list[dict]:
         now = now or time.time()
         logins = [l for l in self.logins if not l.startswith(("kick:", "yt"))]
-        got = []
-        for i in range(0, len(logins), 25):
-            users = T.gql(CROWD_Q, {"ls": logins[i:i + 25]}).get("users") or []
-            for u in users:
-                for e in ((u or {}).get("clips") or {}).get("edges") or []:
-                    sp = crowd_spike((u or {}).get("login", ""), e.get("node") or {}, now, self.fired)
-                    if sp:
-                        self.fired[e["node"]["slug"]] = now
+        got, full, ages = [], [], []
+        lists, src = self.lists(logins, now)
+        for login, nodes in lists:
+            if src == "gql" and saturated(nodes):
+                full.append(login)
+            for n in nodes:
+                if n.get("slug") and n["slug"] not in self.seen:
+                    self.seen[n["slug"]] = now
+                    try:
+                        age = now - dt.datetime.fromisoformat(n["createdAt"].replace("Z", "+00:00")).timestamp()
+                        if 0 <= age <= CROWD_FRESH_S:
+                            ages.append(round(age))
+                    except (KeyError, ValueError, AttributeError):
+                        pass
+            for n in nodes:
+                sp = crowd_spike(login, n, now, self.fired, self.below)
+                if sp:
+                    self.fired[n["slug"]] = now
+                    self.below.pop(n["slug"], None)
+                    if not sp.get("late"):              # an old moment says nothing about who's hot now
                         self.hot[sp["login"]] = now + CROWD_HOT_S
-                        got.append(sp)
+                    got.append(sp)
+                elif n.get("slug") and int(n.get("viewCount") or 0) < CROWD_MIN_VIEWS:
+                    self.below[n["slug"]] = now
+        if logins:
+            log_crowd(now, len(logins), full, src=src, ages=ages)
         for l in [l for l in self.logins if l.startswith("kick:")]:     # Kick: its own clips listing, one call each
             try:
                 from . import kick as K
@@ -298,6 +336,10 @@ class CrowdWatch(threading.Thread):
                 pass                                        # kick.com refused / slow: Twitch's clips still count
         for slug in [k for k, t in self.fired.items() if now - t > 6 * 3600]:
             self.fired.pop(slug)
+        for slug in [k for k, t in self.below.items() if now - t > CROWD_LATE_S]:
+            self.below.pop(slug)
+        for slug in [k for k, t in self.seen.items() if now - t > CROWD_LATE_S + 3600]:
+            self.seen.pop(slug)
         return got
 
     def run(self):
@@ -317,17 +359,52 @@ class CrowdWatch(threading.Thread):
         return got
 
 
-def crowd_spike(login: str, n: dict, now: float, fired: dict) -> dict | None:
-    """A viewer clip -> a spike record, if it is fresh, has views, and wasn't fired on already (pure)."""
+def crowd_spike(login: str, n: dict, now: float, fired: dict, below: dict | None = None) -> dict | None:
+    """A viewer clip -> a spike record, if it has views, wasn't fired on already, and is fresh — or passed
+    CROWD_MIN_VIEWS late, after we saw it under them (`below`), within CROWD_LATE_S (marked "late") (pure).
+    A clip first seen already old and over the bar is not a late pass: the sweep / catch-up own those."""
     try:
         t = dt.datetime.fromisoformat(n["createdAt"].replace("Z", "+00:00")).timestamp()
     except (KeyError, ValueError, AttributeError):
         return None
-    if not login or n.get("slug") in fired or now - t > CROWD_FRESH_S or int(n.get("viewCount") or 0) < CROWD_MIN_VIEWS:
+    if not login or n.get("slug") in fired or int(n.get("viewCount") or 0) < CROWD_MIN_VIEWS:
         return None
-    return {"login": login.lower(), "kind": "crowd", "fire": round(t - 30, 1), "peak": round(t, 1), "end": round(t, 1),
-            "start": round(t - 90, 1), "stop": round(t + 20, 1), "p": 1.0, "views": int(n["viewCount"]),
-            "title": (n.get("title") or "")[:80]}
+    age = now - t
+    late = age > CROWD_FRESH_S
+    if late and (age > CROWD_LATE_S or n.get("slug") not in (below or {})):
+        return None
+    # a clip is made 0.5-155 s after its moment ends (U2, p05-p95; 50 clips): the window reaches back 180 s + the clip
+    sp = {"login": login.lower(), "kind": "crowd", "fire": round(t - 30, 1), "peak": round(t, 1), "end": round(t, 1),
+          "start": round(t - 180 - float(n.get("durationSeconds") or 30), 1), "stop": round(t + 20, 1), "p": 1.0, "views": int(n["viewCount"]),
+          "title": (n.get("title") or "")[:80]}
+    if late:
+        sp["late"] = round(age)
+    return sp
+
+
+def saturated(nodes: list[dict], page: int = CROWD_PAGE) -> bool:
+    """The clip list is full and its lowest clip already has CROWD_MIN_VIEWS: a fresh clip with that many can't
+    show (pure)."""
+    return len(nodes) >= page and int(nodes[-1].get("viewCount") or 0) >= CROWD_MIN_VIEWS
+
+
+def log_crowd(now: float, n: int, full: list[str], path: str | None = None, src: str = "gql",
+              ages: list[int] | None = None) -> None:
+    """One line per clip poll: how many creators, whose list was too full to show a fresh clip, where the clips came
+    from (helix | gql) and how many seconds after it was made each clip first seen this poll was. Keeps ~8 days."""
+    path = path or CROWD_LOG
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"t": round(now, 1), "n": n, "full": sorted(l for l in full if l), "src": src,
+                                 **({"ages": ages} if ages else {})}) + "\n")
+        if os.path.getsize(path) > 3_000_000:
+            keep = [r for r in _jsonl(path) if r.get("t", 0) >= now - PLAN_KEEP_S]
+            with open(path + ".tmp", "w") as fh:
+                fh.writelines(json.dumps(r) + "\n" for r in keep)
+            os.replace(path + ".tmp", path)
+    except OSError:
+        pass
 
 
 def run(stop_after_s: float | None = None) -> None:
@@ -354,6 +431,7 @@ def run(stop_after_s: float | None = None) -> None:
     crowd.start()
     t0 = time.time()
     t_next, last_cfg, last_state = time.time() + SN.STEP_S, 0.0, 0.0
+    previously_connected: set[str] = set()
     print(f"[tier1] chat-only watcher started (trigger p ≥ {m['trigger']})", flush=True)
     while stop_after_s is None or time.time() - t0 < stop_after_s:
         time.sleep(max(0.0, t_next - time.time()))
@@ -394,6 +472,15 @@ def run(stop_after_s: float | None = None) -> None:
                 for sp in spikes:
                     fh.write(json.dumps(sp) + "\n")
         if now - last_state >= 15:
+            connected = {l for l, chat in chats.items() if getattr(chat, "connected", False)}
+            overlap = sorted(connected & previously_connected)
+            if overlap and now - last_state <= 30:
+                try:
+                    with open(os.path.join(os.path.dirname(STATE), "coverage.jsonl"), "a") as stream:
+                        stream.write(json.dumps({"start": last_state, "end": now, "channels": overlap}) + "\n")
+                except OSError as exc:
+                    print(f"[tier1] could not save coverage sample: {exc}", flush=True)
+            previously_connected = connected
             last_state = now
             st = {"pid": os.getpid(), "beat": now, "connected": multi.connected, "msgs_total": multi.total,
                   "channels": {l: {"p": round(j.p, 3), "chat_per_min": j.chat_per_min(),
@@ -444,9 +531,123 @@ def stop() -> bool:
 
 def tier1_channels(roster: dict, live: set[str], cfg: dict) -> list[str]:
     """Every live roster creator whose clipping is allowed (pure). YouTube sources stay audio-only (tier 2)."""
+    return coverage_plan(roster, live, cfg)[0]
+
+
+PLAN = os.path.join(DIR, "plan.jsonl")
+COVERAGE = os.path.join(DIR, "coverage.jsonl")
+PLAN_KEEP_S = 8 * 86400
+NO_CYCLE_S = 900            # a moment more than this after the last cycle's plan: no cycle was running
+
+
+def coverage_plan(roster: dict, live: set[str], cfg: dict, status: dict | None = None,
+                  check_error: str | None = None, game: str = "") -> tuple[list[str], dict[str, str]]:
+    """(channels the chat scout watches, {login: why it doesn't}) for the roster (pure). `status` is the roster's
+    own live check (twitch.live_status); creators it shows offline are simply absent from both."""
     from . import autopilot as AP
-    out = [l for l in roster if l in live and AP.policy(l, roster) != "never" and not l.startswith("yt")]
-    return out[: int(cfg.get("tier1_max", 60))]
+    cap = int(cfg.get("tier1_max", 60))
+    watch, why = [], {}
+    try:
+        from . import yields as YL
+        y = YL.load()
+    except Exception:
+        y = {}
+    order = sorted(roster, key=lambda l: -y.get(l, 0.5)) if y else list(roster)   # over the cap: best yield first
+    for l in order:
+        if l.startswith("yt"):
+            continue                                   # YouTube: audio-only (tier 2), no chat scout
+        if AP.policy(l, roster) == "never":
+            continue
+        if l in live:
+            if len(watch) < cap:
+                watch.append(l)
+            else:
+                why[l] = f"over the chat-scout cap (tier1_max {cap})"
+            continue
+        if ":" in l:
+            continue                                   # Kick: its own live check, nothing to explain here
+        st = (status or {}).get(l.lower()) if status is not None else None
+        if status is None:
+            why[l] = ("not in the radar's top streams; the roster live check failed"
+                      + (f" ({check_error[:40]})" if check_error else ""))
+        elif st and game and (st.get("game") or "").lower() != game.lower():
+            why[l] = f"live, playing {st.get('game') or 'no category'}"
+    return watch, why
+
+
+def log_plan(now: float, watched: list[str], left_out: dict[str, str], path: str | None = None) -> None:
+    """One line per cycle: who the chat scout was told to watch and why anyone live wasn't (scouts reads it to
+    say WHY a viewer-clipped moment had no scout). Keeps 8 days."""
+    path = path or PLAN
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(json.dumps({"at": now, "watched": sorted(watched), "left_out": left_out}) + "\n")
+    try:
+        if os.path.getsize(path) > 2_000_000:
+            keep = [r for r in _jsonl(path) if r.get("at", 0) >= now - PLAN_KEEP_S]
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.writelines(json.dumps(r) + "\n" for r in keep)
+            os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _jsonl(path: str) -> list[dict]:
+    out = []
+    try:
+        for line in open(path):
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def scout_records(since: float, root: str | None = None) -> tuple[list[dict], dict[str, list[tuple[float, float]]]]:
+    """(cycle plans since `since` minus a margin, {login: [(start, end)] the chat scout was connected})."""
+    d = os.path.join(root, "tier1") if root else DIR
+    every = sorted((r for r in _jsonl(os.path.join(d, "plan.jsonl")) if isinstance(r.get("at"), (int, float))),
+                   key=lambda r: r["at"])
+    # the window's plans, plus the last one before it: a moment after a long silence still reads "no cycle ran",
+    # while a moment before the FIRST plan on record has no records to say (plans began 24 Nov; Muse's 3-day funnel
+    # counted 204 pre-record moments as "autopilot down")
+    plans = [r for r in every if r["at"] >= since - NO_CYCLE_S]
+    older = [r for r in every if r["at"] < since - NO_CYCLE_S]
+    plans = older[-1:] + plans
+    spans: dict[str, list[tuple[float, float]]] = {}
+    for r in _jsonl(os.path.join(d, "coverage.jsonl")):
+        try:
+            if r["end"] < since - 60:
+                continue
+            for l in r.get("channels") or []:
+                spans.setdefault(l, []).append((float(r["start"]), float(r["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return plans, spans
+
+
+def scout_reason(login: str, t: float, plans: list[dict], spans: dict) -> str | None:
+    """Was a chat scout on `login` at moment `t`? "watched", else why not (from the cycle plan in force then), else
+    None when there are no records to say (an older install). Pure."""
+    if any(a - 20 <= t <= b + 20 for a, b in spans.get(login, ())):
+        return "watched"
+    if not plans:
+        return None
+    import bisect
+    i = bisect.bisect_right([p["at"] for p in plans], t) - 1
+    if i < 0:
+        return None                                    # before the first plan on record: nothing to say
+    if t - plans[i]["at"] > NO_CYCLE_S:
+        return "no cycle ran in the 15 min before (autopilot down?)"
+    p = plans[i]
+    if login in (p.get("watched") or ()):
+        return "on the chat scout's list, but it wasn't connected then"
+    if login in (p.get("left_out") or {}):
+        return p["left_out"][login]
+    return "offline at the last cycle's check — the stream started between cycles"
 
 
 def promoted(state: dict, t1: dict, cfg: dict, now: float, live: set[str] | None = None) -> list[str]:

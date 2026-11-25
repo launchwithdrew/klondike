@@ -6,7 +6,7 @@
 //     --description "One true sentence about the clip. #game #streamer" \
 //     --moment-at 2026-11-18T12:41:00-05:00 --brand-safe
 //
-// Options: --platforms youtube,instagram,tiktok (default all) · --schedule tiktok=ISO,... · --grade JSON · --finish JSON · --cover 1.2 · --no-push (stage only) · --check (validate only)
+// Options: --platforms youtube,instagram,tiktok (default all) · --schedule tiktok=ISO,... · --grade JSON · --finish JSON · --rights JSON · --cover 1.2 · --no-push (stage only) · --check (validate only)
 // It refuses: bad slug, slug or title already live (ledger), missing brand-safe flag, non-vertical or >3 min video.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -26,6 +26,8 @@ if (title.length > 100) die(`title is ${title.length} chars (max 100)`);
 if (!flag('brand-safe')) die('pass --brand-safe only after checking: no sexualised framing, nudity, gambling, explicit lyrics, hate');
 const platforms = opt('platforms', 'youtube,instagram,tiktok').split(',').map(s => s.trim()).filter(Boolean);
 for (const p of platforms) if (!['youtube', 'instagram', 'tiktok'].includes(p)) die(`unknown platform ${p}`);
+let rights;
+if (opt('rights')) { try { rights = JSON.parse(opt('rights')); } catch { die('--rights must be JSON'); } }
 
 // Never repeat a live post (slug or title) — the ledger is the record of everything live.
 const ledgerPath = path.join(ROOT, 'ledger.jsonl');
@@ -57,6 +59,7 @@ for (const pair of (opt('schedule', '') || '').split(',').map(s => s.trim()).fil
   schedule[p] = new Date(when).toISOString();
 }
 const post = { slug, title, description, platforms, cover_s: Number(opt('cover', '1.2')), moment_at: opt('moment-at', null), brand_safe: true, dropped_at: new Date().toISOString() };
+if (rights) post.rights = rights;
 if (Object.keys(schedule).length) post.schedule = schedule;
 const momentWindow = opt('moment-window', null);
 if (momentWindow) {

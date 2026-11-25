@@ -70,9 +70,13 @@ def captions(meta: dict) -> dict:
 
 
 def due(now: float | None = None) -> list[dict]:
+    from . import autopilot as AP
+    from . import publish as PB
+
     outbox = _dirs()[0]
     now = now or dt.datetime.now(dt.timezone.utc).timestamp()
     ledger = _ledger()
+    roster = PB.creators()
     items = []
     for name in sorted(os.listdir(outbox)) if os.path.isdir(outbox) else []:
         d = os.path.join(outbox, name)
@@ -93,9 +97,20 @@ def due(now: float | None = None) -> list[dict]:
             else:
                 plats.append(p)
         if plats or later:
-            items.append({"slug": meta.get("slug", name), "file": clip, "now": plats, "later": later,
-                          "captions": captions(meta), "sha256": sha})
+            item = {"slug": meta.get("slug", name), "file": clip, "now": plats, "later": later,
+                    "captions": captions(meta), "sha256": sha}
+            if reason := AP.policy_refusal(meta.get("login"), roster):
+                item.update(now=[], later={}, rights_reason=reason)
+            items.append(item)
     return items
+
+
+def account_handle(platform: str) -> str | None:
+    """Our account on that platform, as it shows in the signed-in browser ("@name"), from brand.json accounts."""
+    from . import brand
+    acc = (brand.load().get("accounts") or {}).get(platform) or {}
+    name = str(acc.get("handle") or acc.get("username") or "").strip()
+    return ("@" + name.lstrip("@")) if name else None
 
 
 def show() -> list[dict]:
@@ -104,12 +119,17 @@ def show() -> list[dict]:
         print("to-post: nothing due")
         return items
     for it in items:
+        if reason := it.get("rights_reason"):
+            print(f"{it['slug']}: blocked — {reason}; owner review required")
+            continue
         if not it["now"]:
             print(f"{it['slug']}: scheduled — " + ", ".join(f"{p} at {a}" for p, a in it["later"].items()))
             continue
         from . import bank
         print(f"{it['slug']}  file: {it['file']}")
         for p in it["now"]:
+            if who := account_handle(p):          # the posting browser has held another account (OP_SPEC §6)
+                print(f"  {p} — before uploading, check the browser is signed in as {who}")
             st = bank.state(it["slug"], p, sha=it["sha256"])
             if st["state"] == "uncertain":
                 print(f"  {p} — " + bank.reconcile_hint({**st, "slug": it["slug"], "platform": p}))

@@ -90,10 +90,12 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
     from . import censor as CN
     from . import vision as VI
     from . import sentinel as SN
+    from . import safety as SF
+    from .admission import track_draft
     mp4, meta_path = paths(entry)
     have = load(entry)
     key = brand_key()
-    if have and not force and have.get("brand") == key:
+    if have and have.get("speech_screened") and not force and have.get("brand") == key:
         return have
     lock = meta_path + ".lock"
     os.makedirs(os.path.dirname(meta_path), exist_ok=True)
@@ -112,6 +114,8 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
         return prerender(entry, listen, force)
     t0 = time.time()
     try:
+        if SN.is_skipped(entry):
+            return None
         s, e = float(entry["start"]), float(entry["stop"])
         words = SN.draft_words(entry, s, e)
         src = mp4 + ".src.ts"
@@ -123,7 +127,8 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
             early = A.gate(x, first, entry.get("payoff"), route="prerender")
             if early.observation in A.SKIP_OBS:
                 raise RuntimeError(A.skip_reason(early.observation))
-            words = A.real_words(A.transcribe(x, O.whisper_model(), offset=first))
+            with track_draft(entry):
+                words = A.real_words(A.transcribe(x, O.whisper_model(), offset=first))
         tmp = mp4.rsplit(".mp4", 1)[0] + f".part{os.getpid()}.mp4"   # per process: an orphan can't race a retry
         for old in glob.glob(mp4.rsplit(".mp4", 1)[0] + ".part*"):     # leftovers of a killed run
             m = re.search(r"\.part(\d+)", old)
@@ -133,7 +138,9 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
                 except OSError:
                     pass
         try:
-            with FC.creator(entry.get("login")):
+            if SF.screen_words(words, s, e)["flagged"]:
+                raise RuntimeError("pre-render refused: sexual dialogue")
+            with track_draft(entry), FC.creator(entry.get("login")), V.purpose("prerender"):
                 info = V.render(src, first, s, e, words, tmp, crop="blur", layout="stack",
                                 watermark=V.WATERMARK, drop_captions=SN.game_spans(words) or None,
                                 captions_later=True)
@@ -167,7 +174,7 @@ def prerender(entry: dict, listen: bool = True, force: bool = False) -> dict | N
                 "layout": info.get("layout"), "facecam": info.get("facecam"), "watermark": info.get("watermark"),
                 "bleeps": info.get("bleeps"), "audit": audit,
                 "vision": {k: vis[k] for k in ("cuts_per_min", "static", "dark", "flags")},
-                "brand": key, "version": _version(), "secs": round(time.time() - t0, 1),
+                "brand": key, "speech_screened": True, "version": _version(), "secs": round(time.time() - t0, 1),
                 "at": time.time(), "ok": True}
         json.dump(meta, open(meta_path, "w"), indent=1)
         SN.note(entry, pre=mp4)
@@ -195,6 +202,8 @@ def usable(entry: dict, start: float, stop: float, fixes: dict | None = None,
     m = load(entry)
     if not m or m.get("brand") != brand_key() or not (m.get("audit") or {}).get("ok"):
         return None
+    if not m.get("speech_screened"):
+        return None
     if start < m["start"] - 0.05 or stop > m["stop"] + 0.05 or stop - start < 3:
         return None
     return m
@@ -204,7 +213,10 @@ def pending(root: str | None = None) -> list[dict]:
     from . import sentinel as SN
     floor = _floor()
     rows = SN.load_queue(root) if root else SN.load_queue()
-    return [r for r in rows if eligible(r, floor) and not load(r) and not _failed_recently(r)]
+    todo = [r for r in rows if eligible(r, floor) and not load(r) and not _failed_recently(r)]
+    # URGENT first, then the freshest moment: a moment's worth decays by the minute, so an older draft never
+    # makes a fresh one wait (§3.2); the queue's own order is per recording, not per moment
+    return sorted(todo, key=lambda r: (not SN.is_urgent(r), -float(r.get("payoff") or r.get("stop") or 0)))
 
 
 def _failed_recently(entry: dict) -> bool:

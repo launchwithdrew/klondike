@@ -27,7 +27,7 @@ NOTIFY_EVERY_S = 60
 
 # lower = shown first. Overdue posts first (item 11), then due posts, failures, drafts, setup looks
 # (a suggested webcam box), the daily report.
-PRIO = {"overdue": 0, "due": 1, "failure": 2, "draft": 3, "setup": 4, "report": 5}
+PRIO = {"urgent": -1, "overdue": 0, "due": 1, "failure": 2, "draft": 3, "setup": 4, "report": 5}
 
 
 def _paths(root: str | None = None) -> tuple[str, str]:
@@ -102,11 +102,15 @@ def line(items: list[dict] | None = None, root: str | None = None) -> str:
         return ""
     parts: list[str] = []
     by: dict[str, list[dict]] = {}
+    expiring = [i for i in items if str(i.get("key", "")).startswith("expiring:")]
     for i in items:
-        by.setdefault(i.get("kind", "failure"), []).append(i)
+        if i not in expiring:
+            by.setdefault(i.get("kind", "failure"), []).append(i)
     if by.get("urgent"):
         parts.append(f"🔥 {len(by['urgent'])} URGENT draft(s) — be first: " + ", ".join(i["text"] for i in by["urgent"][:3])
                      + " → clipengine queue")
+    if expiring:                                          # a hot draft's last hour before triage archives it (§3.3)
+        parts.append("⏳ " + ", ".join(i["text"] for i in expiring[:3]) + " → clipengine queue")
     overdue = by.get("overdue") or []
     posts = [i for i in overdue if not str(i.get("key", "")).startswith("measure:")]
     measures = [i for i in overdue if str(i.get("key", "")).startswith("measure:")]
@@ -174,7 +178,38 @@ def notify(cfg: dict, root: str | None = None, now: float | None = None) -> str 
         return None
     if now - st.get("notify_at", 0) < NOTIFY_EVERY_S:
         return None                                        # rate limit: the next cycle sends it
-    text = line(items)
+    errs = _send(cfg, line(items))
+    st = _load(root)
+    if not errs:                                           # failed (offline?): keep them for the next try
+        st["notified_keys"] = (list(told) + [i["key"] for i in new])[-500:]
+    st["notify_at"] = now
+    _save(st, root)
+    return "notify: " + ("; ".join(errs) if errs else f"sent ({len(new)} new)")
+
+
+def push_now(cfg: dict, key: str, text: str, root: str | None = None, now: float | None = None) -> str | None:
+    """Push one item the moment it happens (a sentinel queuing a hot draft), not at the next cycle — up to 5 min
+    sooner. The key is marked notified, so the cycle's own push doesn't repeat it; inside the once-a-minute limit
+    nothing is sent and the cycle pushes it as usual."""
+    if not cfg.get("notify_cmd") and not cfg.get("notify_url"):
+        return None
+    now = now or time.time()
+    st = _load(root)
+    told = list(st.get("notified_keys") or [])
+    if key in told or now - st.get("notify_at", 0) < NOTIFY_EVERY_S:
+        return None
+    errs = _send(cfg, "attention: " + text)
+    st = _load(root)
+    if not errs:
+        st["notified_keys"] = (told + [key])[-500:]
+        st["notify_at"] = now
+        _save(st, root)
+    return "; ".join(errs) if errs else "sent"
+
+
+def _send(cfg: dict, text: str) -> list[str]:
+    """notify_cmd and/or notify_url with this text; the errors (empty = sent)."""
+    cmd, url = cfg.get("notify_cmd"), cfg.get("notify_url")
     errs = []
     if cmd:
         try:
@@ -191,9 +226,4 @@ def notify(cfg: dict, root: str | None = None, now: float | None = None) -> str 
             urllib.request.urlopen(req, timeout=15).read()
         except Exception as exc:
             errs.append(f"notify_url failed ({str(exc)[:60]})")
-    st = _load(root)
-    if not errs:                                           # failed (offline?): keep them for the next try
-        st["notified_keys"] = (list(told) + [i["key"] for i in new])[-500:]
-    st["notify_at"] = now
-    _save(st, root)
-    return "notify: " + ("; ".join(errs) if errs else f"sent ({len(new)} new)")
+    return errs

@@ -125,8 +125,12 @@ def check_title(title: str) -> list[str]:
 def drop(file: str, slug: str, title: str, description: str, moment_at: str, post: bool,
          push: bool = True, check_only: bool = False, platforms: list[str] | None = None,
          schedule: dict | None = None, grade: dict | None = None, moment_window: dict | None = None) -> None:
+    from . import autopilot as AP
     from . import finish as FN
     from . import migrate as MG
+    login = (moment_window or {}).get("login")
+    roster = creators() if login else {}
+    AP.refuse_never(login, roster)
     if post and not check_only:
         MG.guard_publish()                       # a shadow or handed-over machine never drops for posting
     receipt = FN.gate(file)                      # a clip with a look other than the approved finish never drops
@@ -140,6 +144,12 @@ def drop(file: str, slug: str, title: str, description: str, moment_at: str, pos
         cmd += ["--grade", json.dumps(grade, separators=(",", ":"))]
     if moment_window:
         cmd += ["--moment-window", json.dumps(moment_window, separators=(",", ":"))]
+    if login:
+        creator = roster.get(login.lower()) or {}
+        rights = {"policy": AP.policy(login, roster), "policy_source": creator.get("policy_source"),
+                  "policy_checked": creator.get("policy_checked"),
+                  "evaluated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+        cmd += ["--rights", json.dumps(rights, separators=(",", ":"))]
     if receipt:
         cmd += ["--finish", json.dumps({k: receipt[k] for k in ("key", "approved", "matches_approved", "engine",
                                                                   "stage") if k in receipt}, separators=(",", ":"))]
@@ -219,7 +229,8 @@ def publish_scan(scan_dir: str, pick: int, title: str, line: str, quote: str | N
     problems = check_title(title) + check_question(question)
     if problems:
         raise SystemExit("PUBLISH REFUSED: " + "; ".join(problems))
-    with FC.creator(vod.get("login")):          # the facecam layout looks up this streamer's webcam
+    from .admission import track_draft
+    with track_draft(draft), FC.creator(vod.get("login")):
         rep = P.render_pick(scan_dir, pick, layout="stack", title=title, quote=quote, **render_kw)
     s, e = rep["window"]
     hit = already_clipped(vod["id"], s, e)
@@ -270,12 +281,16 @@ def publish_window(rec_dir: str, start_ts: float, end_ts: float, title: str, lin
         raise SystemExit(f"PUBLISH REFUSED: this moment was already published as '{hit['slug']}'")
     os.makedirs(os.path.join(rec_dir, "renders"), exist_ok=True)
     out = os.path.join(rec_dir, "renders", f"{login}_{int(start_ts)}.mp4")
-    if pre:                                     # pre-rendered draft: only the headline card is burned in
-        info = from_prerender(pre, out, start_ts, end_ts, title, quote, payoff_ts=kw.get("payoff_ts"))
-    else:
-        with FC.creator(login):                 # the facecam layout looks up this streamer's webcam
-            info = L.render_window(rec_dir, start_ts, end_ts, out, title, quote, watermark=V.WATERMARK, **kw)
-    moment = dt.datetime.fromtimestamp((start_ts + end_ts) / 2, dt.timezone.utc)
+    from .admission import track_draft
+    with track_draft(draft):
+        if pre:                                     # pre-rendered draft: only the headline card is burned in
+            info = from_prerender(pre, out, start_ts, end_ts, title, quote, payoff_ts=kw.get("payoff_ts"))
+        else:
+            with FC.creator(login):                 # the facecam layout looks up this streamer's webcam
+                info = L.render_window(rec_dir, start_ts, end_ts, out, title, quote, watermark=V.WATERMARK, **kw)
+    payoff = kw.get("payoff_ts")
+    moment_ts = payoff if payoff is not None and start_ts <= payoff < end_ts else (start_ts + end_ts) / 2
+    moment = dt.datetime.fromtimestamp(moment_ts, dt.timezone.utc)
     rep = {**info, "window": [start_ts, end_ts], "frames": V.frames(out, [1, (end_ts - start_ts) / 2, end_ts - start_ts - 1],
                                                                      os.path.join(rec_dir, "renders", "frames"))}
     tr = json.load(open(out.rsplit(".mp4", 1)[0] + ".transcript.json"))
@@ -362,7 +377,13 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
     tr = json.load(open(rep["out"].rsplit(".mp4", 1)[0] + ".transcript.json"))
     # what is in OUR cut (card times are clip seconds): a --start trim drops the words before it
     said = " ".join(seg["text"] for seg in tr["segments"] if 0 <= seg.get("start", 0) < (e - s))
+    raw_words = (sig or {}).get("words_all") or []
+    spoken = " ".join(w.get("w", "").strip() for w in raw_words)
     sf = SF.screen(said, headline=(title or "") + " " + (quote or ""))
+    if not sf["flagged"]:
+        audible = rep.get("speech_safety") or SF.screen(spoken)
+        if audible["flagged"]:
+            sf = audible
     report = {"out": rep["out"], "frames": rep.get("frames"), "safety": sf, "moment_at": moment.isoformat(),
               "layout": rep.get("layout"), **({"facecam_note": rep["facecam"]["note"]}
                                                 if (rep.get("facecam") or {}).get("note") else {}),
@@ -382,23 +403,22 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
         if not aud["ok"]:
             raise SystemExit("PUBLISH REFUSED: the render still has an uncensored word "
                              f"({', '.join(aud['captions'] + [w['w'] for w in aud['audio']])}) — re-run with --bleep WORD")
-    raw_words = (sig or {}).get("words_all") or []
-    spoken = " ".join(w.get("w", "").strip() for w in raw_words)
     spoken = ". ".join(part for part in (spoken, said) if part)
     missing = SF.headline_support(title, spoken, (sig or {}).get("titles"),
                                   names=[login, creators().get(login.lower(), {}).get("name", "")])
     if missing:
         report["warnings"] = [f"headline words not in the transcript or viewer titles: {', '.join(missing[:5])} — "
                               "make sure the cut SHOWS it (rules/headlines.md)"]
-    adult = [f for f in (draft or {}).get("flags") or [] if "adult scene on screen?" in str(f)]
+    adult = [f for f in (draft or {}).get("flags") or [] if "adult scene" in str(f)]
     if adult:
         report.setdefault("warnings", []).append(adult[0] + " — rules/safety.md: strip clubs, underwear and nudity "
                                                  "don't post; answer --frames-checked only after looking")
     fit = _headline_fit(title, draft)
     if fit is not None:
-        report["visual_headline"] = (f"{fit:+.3f} vs a plain 'video game scene' — "
-                                     + ("the frames look like the headline" if fit > 0.01 else
-                                        "the frames don't obviously show the headline: check the payoff is ON SCREEN"))
+        # Not evidence either way (§4.2, 24 Nov, eval/eval_headline_fit.py): on 81 GTA VI viewer clips the picture
+        # model scored a title on its own frames no better than on another clip of the same streamer (AUC 0.54).
+        report["visual_headline"] = (f"{fit:+.3f} vs a plain 'video game scene' — the picture model can't tell a true "
+                                     "headline from a false one: check the payoff is ON SCREEN yourself")
     if not sf["flagged"] and (draft or {}).get("unsafe"):
         sf = {**sf, "flagged": True, "why": draft["unsafe"]}
         report["safety"] = sf
@@ -484,7 +504,9 @@ def _finish(rep, login, source, s, e, moment, title, line, quote, slug, frames_c
         if not check_only:
             JG.record(example, "ship", "approved for posting", frames=rep.get("frames"), artifact=JG.artifact_id(example, rep.get("out")),
                       override=accepted_override, slug=slug)
-            record_clipped({"slug": slug, "source": source, "login": login, "start_s": s, "end_s": e,
+            from .admission import draft_key
+            record_clipped({"slug": slug, "draft_key": draft_key(draft), "source": source, "login": login,
+                            "start_s": s, "end_s": e,
                             "moment_at": moment.isoformat(), **moment_window, "title": title, "grade": final["score"],
                             "engine": eng["score"], "rubric": rubric, "taste": "yes", "platforms": platforms,
                             "explore": [p for p, d in decision.items() if d.get("explore")],

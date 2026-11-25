@@ -44,6 +44,8 @@ Give the user `brand/kit/` (profile picture, banner, bios) and walk them through
 streamers, keeps the poster running, collects views hourly, learns daily, frees disk space, and shows
 the **queue** — the only part that needs you.
 
+Short on context: `clipengine next`, and `guides/` (a page per job).
+
 ## Let it run by itself
 ```bash
 .venv/bin/python -m clipengine supervisor install        # cycle every 5 min; restarted after crashes and reboots
@@ -98,7 +100,6 @@ checks the machine. If neither solves it: `docs/troubleshooting.md`, then `docs/
 | Need | Read |
 |---|---|
 | Publishing details, captions, trimming | `docs/publishing.md` |
-| Something broken | `docs/troubleshooting.md` |
 | Fixing a bug in the engine yourself | `docs/fixing-bugs.md` |
 | Changing the look, streamers or category | `docs/customizing.md` |
 | Telling the user how it's going | `report`; weekly: `metrics` |

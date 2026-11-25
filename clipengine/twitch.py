@@ -146,6 +146,25 @@ def gql(query: str, variables: dict | None = None, playback: bool = False) -> di
     return out.get("data") or {}
 
 
+_LIVE_STATUS = """query($ls: [String!]) { users(logins: $ls) { login stream { createdAt viewersCount game { name } } } }"""
+
+
+def live_status(logins: list[str], batch: int = 50) -> dict[str, dict | None]:
+    """Every given login's live state in one query per `batch`: {login: {"game", "started", "viewers"} or None
+    (offline)}. A login Twitch doesn't know is left out. Raises on a network/GQL failure."""
+    out: dict[str, dict | None] = {}
+    ls = [l.lower() for l in logins]
+    for i in range(0, len(ls), batch):
+        for u in (gql(_LIVE_STATUS, {"ls": ls[i:i + batch]}).get("users") or []):
+            if not u or not u.get("login"):
+                continue
+            s = u.get("stream")
+            out[u["login"].lower()] = ({"game": ((s.get("game") or {}).get("name") or ""),
+                                        "started": s.get("createdAt"), "viewers": int(s.get("viewersCount") or 0)}
+                                       if s else None)
+    return out
+
+
 # --------------------------------------------------------------------------
 # VOD metadata + chapters
 # --------------------------------------------------------------------------
@@ -241,6 +260,40 @@ _CLIPS = """query($login: String!, $period: ClipsPeriod) { user(login: $login) {
       video { id } } } } } }"""
 
 
+# Where a viewer clip sits in its saved stream (U2, measured Nov 24 by matching each clip's audio against the saved
+# stream: eval/eval_clip_offset.py). videoOffsetSeconds is where the clip ENDS, not where it starts — within 4 s, most
+# within 1 s. The engine read it as the start until then, so every saved-stream viewer clip was placed one clip-length
+# (~30 s) late. The saved stream's clock: its playlist's PROGRAM-DATE-TIME (the clock our recordings use) starts
+# VOD_CLOCK_LEAD_S before GQL's video.createdAt (1.4-3.7 s on 8 saved streams).
+VOD_CLOCK_LEAD_S = 2.7
+
+
+def clip_span(c: dict) -> tuple[float, float] | None:
+    """(start, end) of a viewer clip in its saved stream, seconds; None = no saved-stream place (pure)."""
+    off = c.get("videoOffsetSeconds")
+    if off is None:
+        return None
+    try:
+        end, dur = float(off), float(c.get("durationSeconds") or 0)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, end - dur), end
+
+
+def clip_wall(c: dict) -> tuple[float, float] | None:
+    """(start, end) of a viewer clip on the broadcaster's clock (epoch seconds) from its saved-stream place;
+    None when the clip has no saved stream (live-only creators) (pure)."""
+    span, v = clip_span(c), c.get("video") or {}
+    if span is None or not v.get("createdAt"):
+        return None
+    try:
+        import datetime as _dt
+        t0 = _dt.datetime.fromisoformat(v["createdAt"].replace("Z", "+00:00")).timestamp() - VOD_CLOCK_LEAD_S
+    except (ValueError, AttributeError):
+        return None
+    return t0 + span[0], t0 + span[1]
+
+
 def crowd_moments(vod: "Vod", start_s: float = 0, end_s: float | None = None, wide: bool = False) -> list[dict]:
     """Where viewers clipped this VOD, merged into moments, most-viewed first.
 
@@ -274,12 +327,12 @@ def crowd_moments(vod: "Vod", start_s: float = 0, end_s: float | None = None, wi
             if (n.get("video") or {}).get("id") == vod.id and n.get("videoOffsetSeconds") is not None:
                 seen.setdefault(n["slug"], n)
     clips = list(seen.values())
-    clips = [c for c in clips if start_s - 60 <= c["videoOffsetSeconds"] < end_s]
-    clips.sort(key=lambda c: c["videoOffsetSeconds"])
+    clips = [c for c in clips if start_s - 60 <= clip_span(c)[0] < end_s]
+    clips.sort(key=lambda c: clip_span(c)[0])
     now = datetime.datetime.now(datetime.timezone.utc)
     moments: list[dict] = []
     for c in clips:
-        s, e = float(c["videoOffsetSeconds"]), float(c["videoOffsetSeconds"] + c["durationSeconds"])
+        s, e = clip_span(c)                       # videoOffsetSeconds is the clip's END (U2)
         try:
             mins = max(1.0, (now - datetime.datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))).total_seconds() / 60)
         except ValueError:

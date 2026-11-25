@@ -28,6 +28,15 @@ _SEXUAL = [
 _RE = re.compile("|".join(_SEXUAL), re.I)
 
 
+# A specific phrase can establish the topic on its own. Single ambiguous words still need context.
+# A catch-up draft (23 Nov): "you can see my titties through the robe … come fuck me" had ONE listed term, so it
+# passed. These phrases are sexual on their own; "fuck me" alone stays out (in GTA it's a crash, not a come-on).
+_EXPLICIT = re.compile(r"\b(?:prison wife|nipple clamps?|fucking each other|hyperdom(?:me)?s?"
+                       r"|come (?:and |over (?:here )?(?:and )?)?fuck me|fuck me (?:daddy|harder|baby|raw)"
+                       r"|see my (?:tits|titties|boobs|nipples|pussy|dick|cock)|suck (?:my|your|his|her) (?:dick|cock|tits)"
+                       r"|(?:eat|eating) (?:my|your|her) (?:ass|pussy)|ride (?:my|your|his) (?:dick|cock|face))\b", re.I)
+
+
 def scan_text(*texts: str) -> list[str]:
     hits = []
     for t in texts:
@@ -67,16 +76,18 @@ def death_hint(transcript: str = "", titles: list[str] | None = None, chat_lines
 
 def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: list[str] | None = None,
            headline: str = "") -> dict:
-    """{'flagged': bool, 'why': str, 'hits': [...]}. Two or more distinct sexual
+    """{'flagged': bool, 'why': str, 'hits': [...]}. An explicit phrase or two distinct sexual
     terms in what is SAID, or any in a viewer-clip title / our headline, flags it.
     Chat alone needs a majority-ish signal (chat jokes about everything)."""
     said = scan_text(transcript)
+    explicit = list(dict.fromkeys(m.group(0).lower() for m in _EXPLICIT.finditer(transcript or "")))
+    said = list(dict.fromkeys(explicit + said))
     named = scan_text(" ".join(titles or []), headline)
     chat = scan_text(" ".join(chat_lines or []))
     # chat jokes about everything, so one word is noise — but several people on it is the moment's topic
     chat_msgs = sum(1 for c in chat_lines or [] if _RE.search(c or ""))
     chat_hot = len(chat) >= 3 or chat_msgs >= max(3, 0.03 * len(chat_lines or []))
-    flagged = "prison wife" in said or len(said) >= 2 or bool(named) or chat_hot
+    flagged = bool(explicit) or len(said) >= 2 or bool(named) or chat_hot
     why = []
     if said:
         why.append("said: " + ", ".join(said[:5]))
@@ -86,6 +97,11 @@ def screen(transcript: str = "", titles: list[str] | None = None, chat_lines: li
         why.append("chat: " + ", ".join(chat[:3]))
     return {"flagged": flagged, "why": "; ".join(why), "hits": said + named + chat,
             "chat_hits": chat, "chat_msgs": chat_msgs}
+
+
+def screen_words(words: list[dict], start: float, stop: float) -> dict:
+    """Speech inside the cut, including game dialogue that has no captions."""
+    return screen(" ".join(w["w"].strip() for w in words if start <= w["start"] < stop))
 
 
 _STOP = set("""a an the and or but so of to in on at for with by from up down out over is are was were be been it its

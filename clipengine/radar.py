@@ -10,7 +10,8 @@ and scores each streamer as an *opportunity* (0–100):
 
   audience   live viewers now, log scale                         (30)
   heat       viewer-clip views per minute, last `heat_window_h`  (35)
-  history    their clips' views with us vs our median            (20)
+  history    their clips' views with us vs our median, and their    (20)
+             measured yield per hour live (data/yield.json, §2.2)
   priority   roster priority (config/creators.json)              (15)
 
 Streamers off the roster appear when they earn it. Live Kick and YouTube streams of the game are listed too
@@ -67,7 +68,7 @@ _STREAMS = """query($name: String!, $first: Int, $langs: [String!]) { game(name:
 _CLIPS = """query($name: String!, $langs: [Language!], $first: Int) { game(name: $name) {
   clips(first: $first, criteria: {period: LAST_DAY, sort: VIEWS_DESC, languages: $langs}) { edges { node {
     slug title viewCount createdAt durationSeconds videoOffsetSeconds
-    broadcaster { login displayName } video { id } } } } } }"""
+    broadcaster { login displayName } video { id createdAt } } } } } }"""
 
 
 def config() -> dict:
@@ -188,9 +189,16 @@ def category_clips(cfg: dict) -> list[dict]:
         b = n.get("broadcaster") or {}
         if not b.get("login"):
             continue
+        try:
+            from . import live as L
+            moment = L.moment_time(n)            # a replay clip is the moment it shows, not when it was made
+        except (KeyError, ValueError, TypeError):
+            moment = None
         out.append({"slug": n["slug"], "title": n.get("title") or "", "views": int(n.get("viewCount") or 0),
+                    **({"t": moment} if moment is not None else {}),
                     "created": n["createdAt"], "duration": float(n.get("durationSeconds") or 0),
-                    "offset": n.get("videoOffsetSeconds"), "video": (n.get("video") or {}).get("id"),
+                    "offset": (T.clip_span(n) or (None,))[0],   # where it starts (videoOffsetSeconds = its end)
+                    "video": (n.get("video") or {}).get("id"),
                     "login": b["login"].lower(), "name": b.get("displayName") or b["login"]})
     return out
 
@@ -218,9 +226,11 @@ def _event_boost(login: str, now: dt.datetime) -> float:
 
 
 def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learned: dict,
-                    cfg: dict, now: dt.datetime, restricted: set[str] | None = None) -> list[dict]:
+                    cfg: dict, now: dt.datetime, restricted: set[str] | None = None,
+                    yields: dict[str, float] | None = None) -> list[dict]:
     """Opportunity score per live streamer (pure: no network). `restricted`: creators whose saved streams
-    are subscriber-only (default: data/vod_access.json) — like "vods": false, they're recorded live."""
+    are subscriber-only (default: data/vod_access.json) — like "vods": false, they're recorded live.
+    `yields`: {login: 0-1} from data/yield.json (§2.2) — blended with posted clips' performance into `history`."""
     if restricted is None:
         from . import vodaccess as VA
         restricted = VA.restricted_set()
@@ -240,7 +250,9 @@ def score_streamers(streams: list[dict], clips: list[dict], roster: dict, learne
             continue
         r = roster.get(s["login"], {})
         f = factors.get(s["login"])
-        hist = 0.5 if f is None else max(0.0, min(1.0, (float(f) - 0.5) / 1.5))
+        known = ([max(0.0, min(1.0, (float(f) - 0.5) / 1.5))] if f is not None else []) + \
+                ([float(yields[s["login"]])] if yields and s["login"] in yields else [])
+        hist = sum(known) / len(known) if known else 0.5
         pri = {1: 1.0, 2: 0.5}.get(r.get("priority"), 0.0)
         pri = min(1.0, pri + _event_boost(s["login"], now))       # a creator in a live event (config/events.json)
         parts = {
@@ -332,7 +344,8 @@ def run(out: str | None = None, hours: float | None = None, show: int = 15, quie
     kick_rows, kick_line = kick_streams(cfg, now.timestamp())
     yt_rows, yt_line = youtube_streams(cfg, now.timestamp())
     kick_rows = kick_rows + yt_rows               # other platforms: rows marked by "platform"
-    rows = score_streamers(streams + kick_rows, clips, creators(), learned_weights(), cfg, now)
+    from . import yields as YL
+    rows = score_streamers(streams + kick_rows, clips, creators(), learned_weights(), cfg, now, yields=YL.load())
     for r in rows[:show]:
         r["action"] = _action(r, cfg)
     moments = trending_moments(clips, cfg, now, load_clipped())

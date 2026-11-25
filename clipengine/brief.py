@@ -187,10 +187,12 @@ def series_line(root: Path, ledger: list[dict]) -> str | None:
     return f"forming: {login} {hook} clips ({length}, {wins} winners)" if wins >= 2 else None
 
 
-def rights_line(roster: dict, now: float) -> str | None:
-    stale = []
-    for login, settings in roster.items():
-        if settings.get("policy") == "never":
+def rights_status(roster: dict, now: float) -> list[dict]:
+    """Each clippable creator's rights evidence (OP_SPEC §6): policy, where it came from, when it was checked, and
+    what is needed when it is missing or older than 90 days. `policy: never` creators are left out (not clipped)."""
+    out = []
+    for login, settings in sorted(roster.items()):
+        if not isinstance(settings, dict) or settings.get("policy") == "never":
             continue
         checked = timestamp(settings.get("policy_checked"))
         if checked is None and isinstance(settings.get("policy_checked"), str):
@@ -198,8 +200,40 @@ def rights_line(roster: dict, now: float) -> str | None:
                 checked = dt.datetime.combine(dt.date.fromisoformat(settings["policy_checked"]), dt.time(), dt.timezone.utc).timestamp()
             except ValueError:
                 pass
-        if not settings.get("policy_source") or checked is None or not now - 90 * DAY <= checked <= now:
-            stale.append(login)
+        need = []
+        if not settings.get("policy_source"):
+            need.append("where permission came from (policy_source: their clip rules page, a message, a pool)")
+        if checked is None:
+            need.append("the date it was checked (policy_checked)")
+        elif not now - 90 * DAY <= checked <= now:
+            need.append(f"a re-check (last checked {int((now - checked) // DAY)} days ago)")
+        out.append({"login": login, "policy": settings.get("policy", "allowed"), "source": settings.get("policy_source"),
+                    "checked": checked, "need": need})
+    return out
+
+
+def record_rights(path, login: str, source: str, checked: str | None = None) -> dict:
+    """Write where a creator's permission came from and the date it was checked into config/creators.json
+    (policy_source, policy_checked). Never changes the policy itself: that is the owner's call."""
+    login = login.strip().lower()
+    source = " ".join(str(source or "").split())
+    if not source:
+        raise ValueError("say where permission came from (--source)")
+    day = checked or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    dt.date.fromisoformat(day)                                  # refuses a malformed date
+    doc = json.loads(Path(path).read_text())
+    roster = doc.get("creators") or {}
+    key = next((k for k in roster if k.lower() == login), None)
+    if key is None:
+        raise ValueError(f"{login} is not on the roster (config/creators.json)")
+    roster[key]["policy_source"] = source[:200]
+    roster[key]["policy_checked"] = day
+    Path(path).write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    return roster[key]
+
+
+def rights_line(roster: dict, now: float) -> str | None:
+    stale = [r["login"] for r in rights_status(roster, now) if r["need"]]
     if not stale:
         return None
     example = ", ".join(stale[:3])

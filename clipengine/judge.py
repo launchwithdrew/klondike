@@ -20,15 +20,22 @@ def _path(name: str) -> str:
 
 
 def _rows(path: str) -> list[dict]:
-    out = []
     try:
-        for line in open(path):
-            try:
-                out.append(json.loads(line))
-            except ValueError:
-                continue
+        with open(path) as stream:
+            return _parse_rows(stream)
     except OSError:
-        pass
+        return []
+
+
+def _parse_rows(lines) -> list[dict]:
+    out = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
     return out
 
 
@@ -131,33 +138,116 @@ def score_snapshot(engine: dict, signals: dict) -> dict:
             "duration_s": speech.get("dur"), "reaction": signals.get("reaction"), "why": engine["why"]}
 
 
-CALL_DEFAULTS = {"drop_below": 50.0, "ship_from": 70.0}
+CALL_DEFAULTS = {"drop_below": 50.0, "ship_from": 70.0,
+                 # OP_SPEC 4.1: the editor's drop reasons as named checks, each measured on Muse's verdicts
+                 # (eval/eval_engine_call.py; Nov 24, 107 drafts: 2 ships, 105 drops)
+                 "min_speech_s": 10.0,     # dud: under this much streamer speech and no viewer clip = chat + loudness
+                 "death_peak": 0.6,        # death screen: the picture model's death read on any frame
+                 "menu": 0.6,              # map / menu: the picture model's mean menu read
+                 "still_action_peak": 0.4,  # cutscene / standing around: no frame reads as action
+                 "adult_peak": 0.45}       # possible adult scene: look first
 
 
-def engine_call(draft: dict) -> str | None:
-    """The engine's own ship / hold / drop before an editor looks (J2 compares it with the editor's call).
+def _speech_s(draft: dict) -> float | None:
+    j = draft.get("judgment") if isinstance(draft.get("judgment"), dict) else {}
+    for v in (draft.get("speech_s"), j.get("speech_s"), (draft.get("speakers") or {}).get("streamer_s")):
+        if v is not None:
+            return float(v)
+    return None
 
-    drop  unsafe, already dropped, a possible death screen the channel penalises, or an engine score under
-          `drop_below` (the old rule assumed a PERFECT rubric, so it held everything from 33 up — Nov 21: the editor
-          dropped 14 of 15 held drafts between 35 and 55)
-    ship  an engine score from `ship_from`, not flagged
+
+def _viewer_clipped(draft: dict) -> bool:
+    parts = draft.get("parts") if isinstance(draft.get("parts"), dict) else (draft.get("judgment") or {}).get("parts") or {}
+    return bool(draft.get("viewer_clip") or draft.get("titles") or (parts or {}).get("crowd")
+                or "viewer clip" in str(draft.get("via") or "") or "crowd" in str(draft.get("via") or ""))
+
+
+def drop_checks(draft: dict, cfg: dict | None = None) -> list[tuple[str, str]]:
+    """The editor's named drop reasons that apply to this draft (OP_SPEC 4.1): [(effect, reason)], effect "drop"
+    (never ships: a death screen where the channel penalises them) or "hold" (no ship call — look at the frames).
+    Measured on Muse's 107 judged drafts (eval/eval_engine_call.py): each check touched no editor ship.
+      dud        no viewer clip and under `min_speech_s` of the streamer's own speech: chat and loudness alone
+                 (16 of the 20 wrong ship calls on Nov 24's replay). The streamer's laugh / volume burst does not
+                 rescue it: all 5 wrong ship calls carrying a strong reaction were duds.
+      death      the `death screen?` flag, or a frame the picture model reads as a death (`death_peak`): 3 of 4
+                 death-screen drops, 0 of 71 other drafts with picture reads
+      map/menu   the mean menu read (`menu`): 2 drops, 0 others
+      still      no frame reads as action (`still_action_peak`): 12 drafts, all drops (3 of 3 cutscenes)
+      adult      `adult_peak`: 6 drafts, all drops (the sexual one, 2 cutscenes, 3 duds)
+    Picture checks need the picture model (`visual` on the draft); without it they don't apply."""
+    from . import grade
+    cfg = cfg if cfg is not None else grade.config()
+    c = {**CALL_DEFAULTS, **(cfg.get("judge_call") or {})}
+    out: list[tuple[str, str]] = []
+    flags = " ".join(str(f) for f in draft.get("flags") or []).lower()
+    v = draft.get("visual") if isinstance(draft.get("visual"), dict) else {}
+    deaths_banned = float((cfg.get("penalties") or {}).get("death", 1.0)) < 1.0
+    if deaths_banned and ("death screen?" in flags or (v.get("death_peak") or 0) >= c["death_peak"]):
+        out.append(("drop", "death screen" + (f" (picture {v['death_peak']:.2f})" if (v.get("death_peak") or 0)
+                                              >= c["death_peak"] else "?")))
+    speech = _speech_s(draft)
+    if speech is not None and speech < c["min_speech_s"] and not _viewer_clipped(draft):
+        out.append(("hold", f"chat + loudness only: the streamer says little ({speech:.0f} s), no viewer clip"))
+    if v:
+        if (v.get("menu") or 0) >= c["menu"]:
+            out.append(("hold", f"map/menu on screen (picture {v['menu']:.2f})"))
+        if v.get("action_peak") is not None and v["action_peak"] < c["still_action_peak"]:
+            out.append(("hold", f"little moves on screen — cutscene or standing around (action {v['action_peak']:.2f})"))
+        if (v.get("adult_peak") or 0) >= c["adult_peak"]:
+            out.append(("hold", f"possible adult scene (picture {v['adult_peak']:.2f})"))
+    return out
+
+
+def engine_call(draft: dict, cfg: dict | None = None) -> str | None:
+    """The engine's own ship / hold / drop before an editor looks (J2 compares it with the editor's call)."""
+    return engine_call_why(draft, cfg)[0]
+
+
+def engine_call_why(draft: dict, cfg: dict | None = None) -> tuple[str | None, list[str]]:
+    """(call, reasons). The call:
+    drop  unsafe, already dropped, a death screen the channel penalises, or an engine score under `drop_below`
+          (Nov 21: the editor dropped 14 of 15 held drafts between 35 and 55)
+    ship  an engine score from `ship_from` that no named check (`drop_checks`) or the game-dialogue rule holds back
     hold  in between: look at the frames
-    Thresholds: config/grading.json "judge_call" (defaults 50 / 70)."""
+    Thresholds: config/grading.json "judge_call"."""
     from . import grade
 
     if draft.get("unsafe") or draft.get("status") == "dropped":
-        return "drop"
+        return "drop", ["unsafe" if draft.get("unsafe") else "already dropped"]
     score = draft.get("engine")
     if score is None:
-        return None
-    cfg = grade.config()
+        return None, []
+    cfg = cfg if cfg is not None else grade.config()
     calls = {**CALL_DEFAULTS, **(cfg.get("judge_call") or {})}
-    flags = " ".join(str(f) for f in draft.get("flags") or []).lower()
-    if "death screen?" in flags and float((cfg.get("penalties") or {}).get("death", 1.0)) < 1.0:
-        return "drop"
+    checks = drop_checks(draft, cfg)
+    drops = [r for e, r in checks if e == "drop"]
+    if drops:
+        return "drop", drops
     if score < calls["drop_below"]:
-        return "drop"
-    return "ship" if score >= calls["ship_from"] else "hold"
+        return "drop", [f"engine {score:.0f} under {calls['drop_below']:g}"]
+    if score < calls["ship_from"]:
+        return "hold", []
+    holds = [r for e, r in checks if e == "hold"]
+    if game_dialogue_uncarried(draft, cfg):
+        holds.append("game dialogue nobody reacted to")    # OP_SPEC 4.3: the game's lines never carry a ship call
+    return ("hold", holds) if holds else ("ship", [])
+
+
+def game_dialogue_uncarried(draft: dict, cfg: dict | None = None) -> bool:
+    """Game dialogue is ≥ 40% of the speech (the flag, or the stored speaker share) and neither viewers (a viewer
+    clip / the crowd part) nor the streamer's own reaction carries it (pure but for config)."""
+    from . import grade
+    from . import speaker
+    cfg = {**grade.DEFAULTS, **(cfg or grade.config())}
+    flags = " ".join(str(f) for f in draft.get("flags") or []).lower()
+    share = (draft.get("speakers") or {}).get("game_share")
+    if "game dialogue" not in flags and not (share is not None and share >= speaker.GAME_SHARE_FLAG):
+        return False
+    parts = draft.get("parts") if isinstance(draft.get("parts"), dict) else (draft.get("judgment") or {}).get("parts") or {}
+    react = draft.get("reaction", (draft.get("judgment") or {}).get("reaction"))
+    crowd = (parts or {}).get("crowd") or 0
+    viewers = crowd >= cfg["carry_crowd"] or bool(draft.get("titles")) or draft.get("via") == "viewer clips"
+    return not viewers and (react or 0) < cfg["carry_reaction"]
 
 
 def artifact_id(draft: dict, path: str | None = None) -> str | None:
@@ -191,18 +281,27 @@ def record(draft: dict, verdict: str, reason: str, *, frames=(), override: str |
         return _record(draft, verdict, reason, frames=frames, override=override, slug=slug, artifact=art)
 
 
+def _call_fields(draft: dict) -> dict:
+    call, why = engine_call_why(draft)
+    return {"engine_call": call, **({"call_why": why} if why else {})}
+
+
 def _record(draft: dict, verdict: str, reason: str, *, frames=(), override: str | None = None,
             slug: str | None = None, artifact: str | None = None) -> dict:
     snapshot = draft.get("judgment") or draft
     speakers = draft.get("speakers") or {}
     row = {"kind": "judgment", "id": draft["id"], "login": draft.get("login"),
-           "verdict": verdict, "reason": reason, "engine_call": engine_call(draft),
+           "verdict": verdict, "reason": reason, **_call_fields(draft),
            "engine": snapshot.get("engine"), "parts": snapshot.get("parts"),
            "speech_s": snapshot.get("speech_s", speakers.get("streamer_s")),
            "duration_s": snapshot.get("duration_s") or (
                draft["stop"] - draft["start"] if draft.get("start") is not None and draft.get("stop") is not None else None),
            "reaction": snapshot.get("reaction"), "why": snapshot.get("why") or [],
            "flags": list(draft.get("flags") or []), "at": _now_iso()}
+    if speakers.get("game_share") is not None:          # the replay can apply the game-dialogue rule (OP_SPEC 4.3)
+        row["speakers"] = {"game_share": speakers["game_share"]}
+    if draft.get("titles") or draft.get("via"):
+        row["viewer_clip"] = bool(draft.get("titles")) or draft.get("via") == "viewer clips"
     if draft.get("visual"):
         row["visual"] = draft["visual"]
     if override:
@@ -263,14 +362,42 @@ def label_frames(draft: dict, verdict: str, frames=()) -> list[str]:
 
 
 def eval_judge(rows: list[dict] | None = None) -> dict:
+    from collections import Counter
     from . import untrusted
 
-    rows = rows if rows is not None else _rows(_path("judged.jsonl"))
-    latest = {r["id"]: r for r in rows if r.get("kind") == "judgment" and r.get("verdict") in ("ship", "hold", "drop")}
+    if rows is None:
+        import hashlib
+        from pathlib import Path
+
+        path = Path(_path("judged.jsonl"))
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            raw = b""
+            print(f"verdict snapshot unavailable: {path}")
+        else:
+            print(f"verdict snapshot SHA-256: {hashlib.sha256(raw).hexdigest()}")
+        lines = raw.decode("utf-8").splitlines()
+        rows = _parse_rows(lines)
+        raw_count = sum(bool(line.strip()) for line in lines)
+    else:
+        raw_count = len(rows)
+    editorial = [r for r in rows if r.get("kind") == "judgment" and r.get("id")
+                 and r.get("verdict") in ("ship", "hold", "drop")
+                 and r.get("classification") not in ("technical", "fixture")]
+    latest = {r["id"]: r for r in editorial}
+    totals = Counter(r["verdict"] for r in latest.values())
+    revisions = len({(r["id"], r.get("artifact")) for r in editorial})
+    cohort = {"raw": raw_count, "editorial_events": len(editorial), "viewed_revisions": revisions,
+              "effective": len(latest), "excluded": raw_count - len(editorial),
+              "ship": totals["ship"], "hold": totals["hold"], "drop": totals["drop"]}
+    print(f"verdict counts: {raw_count} raw · {len(editorial)} editorial events · {revisions} viewed revisions · "
+          f"{len(latest)} effective ({totals['ship']} ship / {totals['hold']} hold / {totals['drop']} drop) · "
+          f"{cohort['excluded']} excluded")
     judged = [r for r in latest.values() if r.get("engine_call")]
     low = [r for r in judged if r.get("speech_s") is not None and r.get("duration_s")
            and r["speech_s"] < 0.2 * r["duration_s"]]
-    stats = {}
+    stats = {"cohort": cohort}
     for name, group in (("overall", judged), ("low speech", low)):
         correct = sum(r["engine_call"] == r["verdict"] for r in group)
         stats[name] = {"correct": correct, "count": len(group),
@@ -279,7 +406,6 @@ def eval_judge(rows: list[dict] | None = None) -> dict:
         print(f"{name}: {correct}/{len(group)} agree ({result})")
     print(f"low-speech keepers: {sum(r['verdict'] == 'ship' for r in low)} · unscored judgments: {len(latest) - len(judged)}")
     # agreement alone rewards "drop everything" when editors drop most drafts: show what the calls actually do
-    from collections import Counter
     cm = Counter((r["engine_call"], r["verdict"]) for r in judged)
     order = ("ship", "hold", "drop")
     print("engine \\ editor   " + "  ".join(f"{v:>5}" for v in order))
@@ -293,11 +419,16 @@ def eval_judge(rows: list[dict] | None = None) -> dict:
     print(f"ship calls right: {stats['ship_precision'][0]}/{stats['ship_precision'][1]} · editor's keepers the engine "
           f"shipped: {stats['keepers_caught'][0]}/{stats['keepers_caught'][1]} · always-the-commonest-call baseline: "
           f"{base}/{len(judged)}")
-    today = [(engine_call({"engine": r.get("engine"), "flags": r.get("flags") or []}), r["verdict"]) for r in judged
+    today = [(engine_call({k: r.get(k) for k in ("engine", "flags", "parts", "reaction", "speakers", "speech_s",
+                                                 "visual", "viewer_clip")}), r["verdict"]) for r in judged
              if r.get("engine") is not None]
     if today:
         ok = sum(c == v for c, v in today)
         stats["today_rule"] = (ok, len(today))
+        t_ships = [v for c, v in today if c == "ship"]
+        stats["today_ship_precision"] = (sum(v == "ship" for v in t_ships), len(t_ships))
+        print(f"today's rule, ship calls right: {stats['today_ship_precision'][0]}/{len(t_ships)} "
+              f"(eval/eval_engine_call.py breaks it down by named check)")
         print(f"today's rule on the same drafts: {ok}/{len(today)} agree ({100 * ok / len(today):.0f}%) "
               f"(calls above are as made at the time)")
     for r in judged:

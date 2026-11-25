@@ -42,14 +42,121 @@ PROFILES = {"full": {},
                      "tier1_max": 15}}
 
 
+# What a MEASURED lite choice changes (§2.3). Only the render preset: x264 ultrafast at the same CRF looks the same
+# and is 2-3x faster. Not Whisper tiny (measured, not adopted: eval/eval_triage_model.py), not fewer chat scouts or
+# a shorter buffer (both lose moments): those stay a pinned "profile": "lite" choice.
+AUTO_LITE = {"render_preset": "ultrafast"}
+PROFILE_STATE = os.path.join(RUNS, ".profile.json")
+PROFILE_EVERY_S = 86400
+SENTINEL_SHARE = 0.6      # full scouts may use this share of the CPUs; the rest is for drafts and renders
+TIER1_MB = 50             # one chat scout's memory (measured: ~50 MB)
+
+
+def _own_config() -> dict:
+    if os.path.exists(CONFIG):
+        return {k: v for k, v in json.load(open(CONFIG)).items() if not k.startswith("_")}
+    return {}
+
+
 def config() -> dict:
     cfg = dict(DEFAULTS)
-    own = {}
-    if os.path.exists(CONFIG):
-        own = {k: v for k, v in json.load(open(CONFIG)).items() if not k.startswith("_")}
-    cfg.update(PROFILES.get(own.get("profile") or "full", {}))
+    own = _own_config()
+    prof = own.get("profile")
+    if prof:
+        cfg.update(PROFILES.get(prof, {}))
+    else:                                         # not pinned: the profile measured on this host (§2.3)
+        try:
+            prof = json.load(open(PROFILE_STATE)).get("profile")
+        except (OSError, ValueError):
+            prof = None
+        if prof == "lite":
+            cfg.update(AUTO_LITE)
     cfg.update(own)
+    cfg["profile"] = own.get("profile") or prof or "full"
     return cfg
+
+
+def _latest_bench(host: str, now: float, max_age_d: float = 14) -> dict | None:
+    """This host's newest `clipengine bench` on the full profile's settings (runs/bench), if recent."""
+    best = None
+    for f in glob.glob(os.path.join(RUNS, "bench", f"{host}-*.json")):
+        try:
+            r = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if (r.get("settings") or {}).get("profile") != "full" or now - os.path.getmtime(f) > max_age_d * 86400:
+            continue
+        if best is None or os.path.getmtime(f) > best[0]:
+            best = (os.path.getmtime(f), r)
+    return best[1] if best else None
+
+
+def measured_profile(own: dict, mc: dict, bench: dict | None, per_sentinel_cpu: float | None,
+                     mem_free_gb: float | None, cap: int = 10) -> dict:
+    """The profile this host supports and how many scouts at target speed (OP_SPEC §2.3). Pure.
+    full when the last bench meets both speed targets (draft ≤ 3 min, render ≤ 2 min) on a machine of 4+ CPUs and
+    8+ GB; else lite. Full scouts: SENTINEL_SHARE of the CPUs over one scout's measured CPU; chat scouts: a quarter
+    of free memory at ~50 MB each. A "profile" in config/ops.json pins it."""
+    small = mc["ram_gb"] > 0 and (mc["ram_gb"] < 8 or mc["cores"] < 4)
+    p = (bench or {}).get("predict") or {}
+    if small:
+        prof, why = "lite", f"a small machine ({mc['ram_gb']:.0f} GB, {mc['cores']:g} CPUs)"
+    elif bench and p.get("draft_ok") is False:
+        prof, why = "lite", f"bench: a draft takes ≈{p.get('draft_s')} s on full (target 180)"
+    elif bench and p.get("render_ok") is False:
+        prof, why = "lite", f"bench: a render takes ≈{p.get('render_s')} s on full (target 120)"
+    elif bench and p.get("draft_ok") and p.get("render_ok"):
+        prof, why = "full", f"bench: draft ≈{p['draft_s']} s, render ≈{p['render_s']} s on full — both on target"
+    else:
+        prof, why = "full", "no bench on this host yet (`clipengine bench`): sized by CPUs and memory only"
+    full = None
+    if per_sentinel_cpu and per_sentinel_cpu > 0:
+        full = max(2, min(cap, int(mc["cores"] * SENTINEL_SHARE / per_sentinel_cpu)))
+    t1 = int((mem_free_gb or 0) * 1000 * 0.25 / TIER1_MB) if mem_free_gb else None
+    t1_max = int({**DEFAULTS, **(PROFILES.get(own["profile"], {}) if own.get("profile") else {}),
+                  **own}.get("tier1_max", 60))
+    out = {"profile": own.get("profile") or prof, "measured": prof, "why": why, "pinned": bool(own.get("profile")),
+           "full_sentinels": full, "per_sentinel_cpu": per_sentinel_cpu,
+           "tier1": min(t1, t1_max) if t1 is not None else t1_max}
+    return out
+
+
+def profile_line(r: dict) -> str:
+    cap = (f"supports {r['full_sentinels']} full scouts" if r.get("full_sentinels") else
+           "full scouts: not measured yet (one stream day of cycles measures a scout's CPU)")
+    head = (f"profile {r['profile']} (pinned in config/ops.json; measured: {r['measured']} — {r['why']})" if r["pinned"]
+            else f"profile {r['profile']} (measured — {r['why']})")
+    eff = "" if r["pinned"] or r["profile"] != "lite" else " (measured lite = ultrafast renders only)"
+    return f"{head}{eff} · this host {cap} + {r['tier1']} chat scouts at target speed"
+
+
+def refresh_profile(state: dict, now: float, running: int | None = None, load_per_core: float | None = None,
+                    force: bool = False) -> tuple[dict, str | None]:
+    """Keep a measured per-scout CPU (EMA of this container's CPU over running full scouts) and, once a day or when
+    forced, re-choose the profile. Returns (choice, a note when the profile changed)."""
+    from . import host as H
+    mc = machine()
+    if running and load_per_core is not None:
+        per = load_per_core * mc["cores"] / running             # upper bound: includes drafts, tier 1, renders
+        old = state.get("per_sentinel_cpu")
+        state["per_sentinel_cpu"] = round(per if old is None else 0.8 * old + 0.2 * per, 3)
+    try:
+        prev = json.load(open(PROFILE_STATE))
+    except (OSError, ValueError):
+        prev = {}
+    if not force and prev and now - float(prev.get("at") or 0) < PROFILE_EVERY_S:
+        return prev, None
+    own = _own_config()
+    r = measured_profile(own, mc, _latest_bench(H.summary()["host"], now), state.get("per_sentinel_cpu"),
+                         _mem_available_gb(), int({**DEFAULTS, **own}.get("max_sentinels_cap", 10)))
+    r["at"] = now
+    os.makedirs(RUNS, exist_ok=True)
+    with open(PROFILE_STATE, "w") as fh:
+        json.dump(r, fh)
+    note = None
+    if prev.get("profile") and prev["profile"] != r["profile"] and not r["pinned"]:
+        note = f"profile {prev['profile']} → {r['profile']} ({r['why']})"
+    return r, note
 
 
 def whisper_model() -> str:
@@ -190,7 +297,7 @@ def start(channel: str, buffer_h: float | None = None) -> str:
         return f"{os.path.basename(d).replace('sentinel-', '')} not started — doesn't allow clipping (policy: never)"
     if st and st["alive"]:
         if not st["stopped"]:
-            start_recorder(channel, d, buffer_h or AP.buffer_hours(config(), _free_gb(), AP.explicit_buffer()))
+            start_recorder(channel, d, buffer_h or AP.buffer_hours(config(), _sizing_free_gb(config()), AP.explicit_buffer()))
         return f"{st['login']} already running"
     os.makedirs(d, exist_ok=True)
     for f in ("STOPPED",):
@@ -199,7 +306,7 @@ def start(channel: str, buffer_h: float | None = None) -> str:
         except OSError:
             pass
     open(os.path.join(d, "source"), "w").write(channel)
-    buf = buffer_h if buffer_h is not None else AP.buffer_hours(config(), _free_gb(), AP.explicit_buffer())
+    buf = buffer_h if buffer_h is not None else AP.buffer_hours(config(), _sizing_free_gb(config()), AP.explicit_buffer())
     start_recorder(channel, d, buf)
     pid = _detach([sys.executable, "-m", "clipengine", "sentinel", "--channel", channel, "--out", d,
                    "--buffer", str(buf), "--no-record"], d + ".log")
@@ -373,7 +480,21 @@ def _poster_running() -> bool:
 
 
 def _free_gb() -> float:
-    return shutil.disk_usage(REPO).free / 1e9
+    """Free disk as the OS enforces it: the filesystem's free space and the user's quota, whichever is smaller."""
+    from . import disk as DK
+    try:
+        return DK.free_gb(config())
+    except Exception:
+        return shutil.disk_usage(REPO).free / 1e9
+
+
+def _sizing_free_gb(cfg: dict) -> float:
+    """What the recording buffer may plan with (under a quota: only up to 80% of it)."""
+    from . import disk as DK
+    try:
+        return DK.sizing_free_gb(cfg)
+    except Exception:
+        return _free_gb()
 
 
 def _mem_available_gb() -> float | None:
@@ -480,6 +601,20 @@ def _prune(cfg: dict) -> list[str]:
                 except OSError:
                     pass
                 out.append(f"cleared {st['login']}'s old recording")
+    # still short (a quota fills while sentinels run): the oldest recording anywhere goes, running ones included —
+    # never a queued draft's stretch
+    try:
+        from . import disk as DK
+        st_ = DK.status(cfg)
+        q = st_["quota"]
+        need = max(cfg["min_free_gb"] - st_["free_gb"],
+                   (q["used_gb"] - DK.KEEP_UNDER * q["limit_gb"]) if q else 0.0)
+        if need > 0.05:
+            n_, gb = DK.prune_oldest(need, root=RUNS)
+            if n_:
+                out.append(f"cleared the oldest {gb:.1f} GB of recording ({n_} segments, queued drafts' stretches kept)")
+    except Exception as exc:
+        out.append(f"couldn't clear old recording ({str(exc)[:60]})")
     return out
 
 
@@ -516,7 +651,7 @@ def _git(*a: str) -> bool:
 
 def plan_sentinels(rows: list[dict], moments: list[dict], roster: dict, top: int,
                    promoted: list[str] | None = None, live_extra: set[str] | None = None,
-                   restricted: set[str] | None = None) -> list[str]:
+                   restricted: set[str] | None = None, yields: dict[str, float] | None = None) -> list[str]:
     """Who should have a sentinel (tier 2), in order (pure but for data/vod_access.json when `restricted`
     isn't given):
     1. roster creators with no saved VODs ("vods": false, or subscriber-only VODs — learned, vodaccess.py)
@@ -524,7 +659,8 @@ def plan_sentinels(rows: list[dict], moments: list[dict], roster: dict, top: int
        radar heat;
     2. creators whose tier-1 chat is hot right now (`promoted`, hottest first) — a moment is building;
     3. the radar's picks (action scan/record);
-    4. free slots go to the streamers of the hottest viewer-clipped moments, then the rest by radar score.
+    4. free slots go to the streamers of the hottest viewer-clipped moments, then the rest by radar score,
+       then live roster creators the radar's list didn't have (the roster's own live check), best yield first.
     Creators with policy "never" never get one."""
     from . import autopilot as AP
     live = {r["login"] for r in rows} | set(live_extra or ())
@@ -537,7 +673,27 @@ def plan_sentinels(rows: list[dict], moments: list[dict], roster: dict, top: int
     picked = [r["login"] for r in rows if r.get("action") in ("scan", "record", "start") and ok(r["login"])]
     hot = [m["login"] for m in moments if not m.get("unsafe") and not m.get("published") and ok(m["login"])]
     rest = [r["login"] for r in rows if ok(r["login"])]
-    return list(dict.fromkeys(first + prom + picked + hot + rest))[:top]
+    y = yields or {}
+    extra = sorted((l for l in (live_extra or ()) if ok(l) and l in roster), key=lambda l: (-y.get(l, 0.5), l))
+    return list(dict.fromkeys(first + prom + picked + hot + rest + extra))[:top]
+
+
+def roster_live(roster: dict, game: str) -> tuple[dict | None, str | None, list[dict]]:
+    """(the Twitch roster's live status or None when the check failed, the failure, radar-like rows for the ones
+    live in `game`). One query per 50 creators each cycle."""
+    from . import autopilot as AP
+    from . import twitch as T
+    logins = [l for l in roster if ":" not in l and not l.startswith("yt") and AP.policy(l, roster) != "never"]
+    if not logins:
+        return {}, None, []
+    try:
+        status = T.live_status(logins)
+    except Exception as exc:
+        return None, str(exc)[:80], []
+    key = {l.lower(): l for l in logins}
+    rows = [{"login": key.get(l, l), "started": st.get("started"), "viewers": st.get("viewers", 0)}
+            for l, st in status.items() if st and (st.get("game") or "").lower() == game.lower()]
+    return status, None, rows
 
 
 def _note_live(state: dict, rows: list[dict], roster: dict, now: float) -> None:
@@ -604,14 +760,55 @@ def _missed_minutes(state: dict, rows: list[dict], roster: dict, now: float) -> 
     return out
 
 
+HOT_BEST = 70             # §3.3: a draft this good never ages out unseen: time left on the line, a last-hour push
+
+
+def time_left(entry: dict, now: float) -> float:
+    """Seconds until triage archives this draft (its MOMENT turns evergreen_h old, 6 h by default)."""
+    from . import triage as TG
+    return TG.moment_time(entry) + float(TG.config()["evergreen_h"]) * 3600 - now
+
+
+def _left(s: float) -> str:
+    return f"{s / 3600:.0f}h{(s % 3600) / 60:02.0f}m left" if s >= 3600 else f"{max(0.0, s) / 60:.0f} min left"
+
+
+def is_hot(r: dict) -> bool:
+    """URGENT, or best ≥ HOT_BEST that the engine would call ship (§3.3 + §4.1). A high score the named checks hold back
+    (chat + loudness with the streamer saying little, a map, a still picture…) stays on the queue but doesn't push the
+    phone: on Muse's verdicts every one of those was dropped (eval/eval_engine_call.py)."""
+    from .sentinel import is_urgent
+    from . import judge as JG
+    if is_urgent(r) or r.get("angle_urgent"):
+        return True
+    return float(r.get("best") or 0) >= HOT_BEST and JG.engine_call(r) in ("ship", None)   # None: no score to check
+
+
+def draft_item_text(r: dict, now: float) -> str:
+    """'<id> <best>' — with the time left before it's archived when it's hot (is_hot)."""
+    hot = is_hot(r)
+    return f"{r['id']} {r.get('best', 0):.0f}" + (f" ({_left(time_left(r, now))})" if hot else "")
+
+
 def _attention_items(rows: list[dict], cfg: dict, state: dict, now: float) -> list[dict]:
     """The state half of the attention line, as of this cycle."""
     from .sentinel import is_urgent
-    items = [{"kind": "urgent" if is_urgent(r) or r.get("angle_urgent") else "draft", "key": f"draft:{r['id']}",
-              "text": f"{r['id']} {r.get('best', 0):.0f}", "score": r.get("best", 0)} for r in rows]
+    items = []
+    for r in rows:
+        kind = "urgent" if is_urgent(r) or r.get("angle_urgent") else "draft"
+        items.append({"kind": kind, "key": f"draft:{r['id']}", "text": draft_item_text(r, now), "score": r.get("best", 0)})
+        left = time_left(r, now)
+        if is_hot(r) and 0 < left <= 3600:
+            # its last hour, still unhandled: a NEW key, so the phone is pushed once more (§3.3)
+            items.append({"kind": kind, "key": f"expiring:{r['id']}", "score": r.get("best", 0),
+                          "text": f"{r['id']} {r.get('best', 0):.0f} — LAST HOUR before it's archived, {_left(left)}"})
     from . import handpost as HP
     if HP.enabled():
         for it in HP.due(now):
+            if reason := it.get("rights_reason"):
+                items.append({"kind": "failure", "key": f"rights:{it['slug']}",
+                              "text": f"owner review {it['slug']}: {reason}"})
+                continue
             try:
                 meta = json.load(open(os.path.join(os.path.dirname(it["file"]), "post.json")))
             except (OSError, ValueError):
@@ -704,6 +901,14 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
                                  int(state.get("live_roster") or 0), now)
         if cap_why.startswith(("more", "fewer")):
             notes.append(f"full scouts → {top} ({cap_why})")
+        try:                                       # §2.3: the profile follows what this host measured
+            _n = sum(1 for s_ in all_sentinels() if s_["alive"] and not s_["stopped"])
+            _, pnote = refresh_profile(state, now, _n, lpc)
+            if pnote:
+                notes.append(pnote)
+                cfg = config()
+        except Exception as exc:
+            AT.event("failure", f"profile choice failed ({str(exc)[:80]})", key=f"profile:{int(now) // 86400}")
 
     # 0. auto-update (public copies): once an hour, take a new release — tested here, rolled back if it fails
     line = auto_update(state, cfg)
@@ -736,14 +941,14 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             notes.append(start(s["source"] or s["login"]).replace("started", "restarted"))
             AT.event("failure", f"sentinel {s['login']} had died — restarted", key=f"died:{s['login']}:{int(now) // 600}")
         elif not _alive(recorder_pid(s["dir"])) and os.path.exists(os.path.join(s["dir"], "recorder.pid")):
-            start_recorder(s["source"] or s["login"], s["dir"], AP.buffer_hours(cfg, _free_gb(), AP.explicit_buffer()))
+            start_recorder(s["source"] or s["login"], s["dir"], AP.buffer_hours(cfg, _sizing_free_gb(cfg), AP.explicit_buffer()))
             notes.append(f"{s['login']}'s recorder restarted")
             AT.event("failure", f"{s['login']}'s recorder had stopped — restarted", key=f"recdied:{s['login']}:{int(now) // 600}")
         else:
             stuck = recorder_stalled(s["dir"], now)
             if stuck:
                 stop_recorder(s["dir"])
-                start_recorder(s["source"] or s["login"], s["dir"], AP.buffer_hours(cfg, _free_gb(), AP.explicit_buffer()))
+                start_recorder(s["source"] or s["login"], s["dir"], AP.buffer_hours(cfg, _sizing_free_gb(cfg), AP.explicit_buffer()))
                 notes.append(f"{s['login']}'s recorder was stuck ({stuck / 60:.0f} min without media) — restarted")
                 AT.event("failure", f"{s['login']}'s recorder was alive but stuck ({stuck / 60:.0f} min without media) "
                          "— restarted it alone", key=f"recstuck:{s['login']}:{int(now) // 600}")
@@ -763,11 +968,22 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
                 from .live import source_name as _sn
                 kl = K.live_roster(roster)
                 live |= kl | {_sn(k) for k in kl}
-            _note_live(state, res["streamers"], roster, now)
+            # the roster's own live check: a roster creator below the radar's top streams (or tagged another
+            # language) is live too — without this they had no scout at all (24 Nov: 39 "no scout" misses)
+            status, check_err, extra_rows = roster_live(roster, R.config()["game"])
+            live |= {r["login"] for r in extra_rows}
+            _note_live(state, res["streamers"] + [r for r in extra_rows
+                                                 if r["login"] not in {x["login"] for x in res["streamers"]}],
+                       roster, now)
             # tier 1: chat-only on every live roster creator; a hot one is promoted to tier 2
             from . import tier1 as TR
             try:
-                n1 = TR.ensure(TR.tier1_channels(roster, live, cfg))
+                channels, left_out = TR.coverage_plan(roster, live, cfg, status, check_err, R.config()["game"])
+                try:
+                    TR.log_plan(now, channels, left_out)
+                except OSError:
+                    pass
+                n1 = TR.ensure(channels)
                 if n1:
                     notes.append(n1)
                 prom = TR.promoted(state, TR.load_state(), cfg, now, live)
@@ -777,7 +993,9 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             except Exception as exc:
                 prom = []
                 notes.append(f"tier 1 failed: {str(exc)[:60]}")
-            want = plan_sentinels(plan_rows, res["moments"], roster, top, promoted=prom, live_extra=live)
+            from . import yields as YL
+            want = plan_sentinels(plan_rows, res["moments"], roster, top, promoted=prom, live_extra=live,
+                                  yields=YL.load())
             state["watch_today"] = want
             for l in prom:
                 if l in want and l not in {s_["login"] for s_ in all_sentinels() if s_["alive"] and not s_["stopped"]}:
@@ -875,6 +1093,32 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
             _git("pull", "-q", "--no-rebase") and _git("push", "-q")
         lines.append("learn: updated data/weights.json" + (f" — {res['report'][0]}" if res.get("report") else ""))
 
+    # 3a'. the Twitch pass (official clips feed): a week before it runs out, or once Twitch refuses it — once a day
+    try:
+        from . import helix as HX
+        st, ln = HX.status(now=now)
+        if st in ("expiring", "expired", "refused"):
+            AT.event("failure", ln, key=f"twitch-pass:{st}:{today.strftime('%Y-%m-%d')}", now=now)
+    except Exception:
+        pass
+
+    # 3a. the roster ranked by yield (§2.2), once a day: feeds the radar's history term and the sentinel order
+    if not test_run and state.get("yield_day") != today.strftime("%Y-%m-%d"):
+        state["yield_day"] = today.strftime("%Y-%m-%d")
+        try:
+            from . import yields as YL
+            rep = YL.refresh()
+            from . import repo as RP
+            if RP.sync() and _git("add", "data/yield.json") and _git(
+                    "-c", "user.name=clipengine", "-c", "user.email=clipengine@users.noreply.github.com",
+                    "commit", "-qm", "yield: daily roster ranking"):
+                _git("pull", "-q", "--no-rebase") and _git("push", "-q")
+            best = [l for l, v in sorted(rep["creators"].items(), key=lambda kv: -(kv[1].get("yield") or -1))
+                    if v.get("yield") is not None][:3]
+            lines.append("yield: roster re-ranked" + (f" — top {', '.join(best)}" if best else " — no evidence yet"))
+        except Exception as exc:
+            lines.append(f"yield: refresh failed ({str(exc)[:60]}) — the old ranking stays")
+
     # 3b. opt-in community insights, once a day
     try:
         from . import insights as IN
@@ -923,6 +1167,15 @@ def _cycle(top: int | None = None, radar: bool = True, quiet_queue: bool = False
         lines.append(f"disk: ⚠ only {free:.0f} GB free — stop a sentinel (`clipengine stop --channel X`)")
     elif freed:
         lines.append(f"disk: {free:.0f} GB free ({'; '.join(freed)})")
+    try:
+        from . import disk as DK
+        st_ = DK.status(cfg)
+        if st_["quota"] and st_["used_pct"] >= DK.WARN_AT:
+            AT.event("failure", f"disk: {st_['used_pct']:.0%} of the {st_['quota']['limit_gb']:.0f} GB quota used "
+                                f"({st_['quota']['source']}) — recordings are being cleared oldest first",
+                     key=f"disk-quota:{time.strftime('%Y-%m-%d')}")
+    except Exception:
+        pass
 
     _save_state(state)
     for l in lines:
@@ -969,6 +1222,14 @@ def doctor(accounts: bool = False) -> bool:
     check("whisper models (tiny + small)",
           all(glob.glob(os.path.join(hub, "**", f"*faster-whisper-{m}*"), recursive=True) for m in ("tiny", "small")),
           "bash setup/setup.sh (downloads ~540 MB)")
+    try:
+        from .audio import requested_device
+        device = requested_device()
+    except (ImportError, ValueError) as exc:
+        check("whisper device", False, str(exc))
+    else:
+        print(f"  · whisper device: {device} requested"
+              + (" · use bench to verify inference and CPU fallback" if device == "cuda" else ""))
     for b in ("ffmpeg", "ffprobe", "node", "git"):
         check(b, shutil.which(b) is not None, f"install {b}")
     check("poster deps (engine/node_modules)", os.path.isdir(os.path.join(REPO, "engine", "node_modules", "playwright-core")),
@@ -991,7 +1252,7 @@ def doctor(accounts: bool = False) -> bool:
         lpc = None
     mem = _mem_available_gb()
     from . import autopilot as _AP
-    buf = _AP.buffer_hours(config(), _free_gb(), _AP.explicit_buffer())
+    buf = _AP.buffer_hours(config(), _sizing_free_gb(config()), _AP.explicit_buffer())
     small = cores < MIN_CORES or (mem is not None and mem < MIN_FREE_RAM_GB)
     print(f"  {'!' if small else '\u2713'} machine: {cores:g} CPUs ({_from}), load {lpc:.2f}/CPU" if lpc is not None else
           f"  {'!' if small else '\u2713'} machine: {cores:g} CPUs ({_from})", end="")
@@ -1043,6 +1304,12 @@ def doctor(accounts: bool = False) -> bool:
     else:
         print("  \u00b7 supervisor: no launchd / user systemd here \u2014 `clipengine supervisor install` and the "
               "engine's keeper restarts the autopilot instead")
+    try:
+        from . import helix as _HX
+        _st, _ln = _HX.status()
+        print("  " + ("\u2713" if _st == "ok" else "\u00b7") + " " + _ln)
+    except Exception:
+        pass
     if config().get("heartbeat_url"):
         print("  \u2713 off-host heartbeat: pinged every minute (your monitor alerts when pings stop)")
     else:
@@ -1143,11 +1410,22 @@ def doctor(accounts: bool = False) -> bool:
         check("sign-ins private to this user (chrome-profile/)", (os.stat(prof).st_mode & 0o077) == 0,
               "chmod 700 chrome-profile")
     mc = machine()
+    try:
+        print("  \u2713 " + profile_line(refresh_profile(_state(), time.time(), force=True)[0]))
+    except Exception as exc:
+        print(f"  · profile: not measured ({str(exc)[:80]})")
     tip = suggest_profile(mc["ram_gb"], mc["cores"], config().get("profile", "full"))
     print(f"! {tip}" if tip else f"✓ machine ({mc['ram_gb']:.0f} GB RAM, {mc['cores']:g} CPUs, profile "
           f"{config().get('profile', 'full')})")
     free = _free_gb()
-    check(f"disk ({free:.0f} GB free)", free >= config()["min_free_gb"], f"free up space (needs {config()['min_free_gb']} GB)")
+    try:
+        from . import disk as DK
+        disk_txt = DK.line(config())
+    except Exception:
+        disk_txt = f"{free:.0f} GB free"
+    check(f"disk ({disk_txt})", free >= config()["min_free_gb"],
+          f"free up space (needs {config()['min_free_gb']} GB); a user quota the OS won't report: "
+          "\"disk_quota_gb\" in config/ops.json")
     for f in ("radar.json", "grading.json", "distribution.json", "creators.json", "sentinel_model.json"):
         fp = os.path.join(REPO, "config", f)
         if not os.path.exists(fp):

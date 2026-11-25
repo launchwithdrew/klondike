@@ -428,3 +428,48 @@ Export diff
 - Removed (0)
 
 Leak scan: clean.
+
+## v0.7.0
+
+**Finding more moments**
+- Viewer clips made from the replay are timed at their moment and never drafted as live. A viewer clip is placed where it really is: Twitch's offset marks the clip's end, not its start, and each clip's audio is matched against your recording before it is cut.
+- With a free Twitch developer app (`twitch-pass --set`), the chat scout reads every clip by creation time, so a fresh clip shows the minute it exists on a busy channel. Without one, `funnel` names creators whose clip list was too full to show fresh clips.
+- A chat scout runs on every live roster creator. `cycle` checks the whole roster in one query and records why anyone live isn't watched. A clip that passes 10 views up to 2 hours late is still drafted, and a draft cut short by a restart is redone.
+- The roster is ranked by yield (`clipengine yield`): viewer-clip velocity, strong drafts per hour live and ship rate. Sentinel slots go to the creators who pay off.
+- `scouts --explain` and the sentinel event log give every missed moment a measured cause. A moment your recording missed is handed to catch-up, and the hand-off outcome is logged.
+
+**Recording and disk**
+- Each recording hole's cause comes from the playlist's sequence numbers (ad break, reconnect, fell behind). Segments download 4 at a time, and a recorder that keeps falling behind records one rendition lower.
+- Free disk is the filesystem AND your quota. Buffers stay under 80% of a quota, and a full disk never stops a recorder.
+
+**Judging**
+- The ship call runs named checks: dud (under 10 s of the streamer's own speech, no viewer clip), still picture, map/menu, possible adult scene and death screen. A high score these checks hold stays in the queue but isn't urgent.
+- Game dialogue caps the call. A weak adult read asks for a look without a penalty. More explicit sexual phrases are flagged.
+
+**Speed and alerts**
+- Pre-renders go URGENT first, then the freshest moment, and encode 2.5× faster. The final encode at publish keeps your preset.
+- Hot drafts show their time left, push the phone the moment they're queued, and push once more in their last hour.
+- `doctor` and `cycle` choose the full or lite profile from this host's own measurements. A pin in `config/ops.json` wins.
+
+**Any agent can run it**
+- `clipengine next` says the one thing to do now, with its exact command. `--json` works on `attention`, `queue`, `to-post`, `bank` and `doctor`, and stream text only ever appears under `untrusted`.
+- `guides/` has one page per job. A changed guide shows on `attention` until it is read.
+- `clipengine mcp` serves the same commands as MCP tools over stdio. `clipengine agent-check` says which to use on this host.
+
+**Rights and measuring**
+- `clipengine rights --stale` lists creators with no record of where permission came from. `rights --set LOGIN --source "…"` records it. It never changes a policy.
+- The weekly `metrics` shows the money thresholds and the rights count.
+- `clipengine yardstick`: each week, what other clip channels posted of your two highest-yield creators on YouTube Shorts, and where yours rank.
+
+**Fixes**
+- `facecam --channel` looks at the middle of a finished stream, not its outro.
+- A heavy job that stalled could take a slot that an aged publish was owed. Fixed.
+- A keeper starting up no longer quits when a liveness probe lands on it.
+- The stack layout keeps the picture in shape at any source height.
+
+Export diff
+- Added (15): `clipengine/agent.py`, `clipengine/align.py`, `clipengine/cliplog.py`, `clipengine/disk.py`, `clipengine/helix.py`, `clipengine/mcp.py`, `clipengine/shadow.py`, `clipengine/yardstick.py`, `clipengine/yields.py`, `guides/README.md`, `guides/fix-something.md`, `guides/judge-a-draft.md`, `guides/measure.md`, `guides/operate.md`, `guides/post-a-clip.md`
+- Changed (43): `.gitignore`, `AGENTS.md`, `VERSION`, `clipengine/__init__.py`, `clipengine/__main__.py`, `clipengine/admission.py`, `clipengine/attention.py`, `clipengine/audio.py`, `clipengine/autopilot.py`, `clipengine/bank.py`, `clipengine/bench.py`, `clipengine/brief.py`, `clipengine/facecam.py`, `clipengine/handpost.py`, `clipengine/judge.py`, `clipengine/live.py`, `clipengine/metrics.py`, `clipengine/ops.py`, `clipengine/pipeline.py`, `clipengine/prerender.py`, `clipengine/publish.py`, `clipengine/radar.py`, `clipengine/render.py`, `clipengine/safety.py`, `clipengine/scouts.py`, `clipengine/sentinel.py`, `clipengine/supervise.py`, `clipengine/support.py`, `clipengine/tier1.py`, `clipengine/triage.py`, `clipengine/twitch.py`, `clipengine/visual.py`, `docs/judging.md`, `docs/troubleshooting.md`, `docs/visual.md`, `engine/instagram.mjs`, `engine/lib.mjs`, `engine/post.mjs`, `engine/tiktok.mjs`, `engine/youtube.mjs`, `tests/conftest.py`, `tests/test_engine.py`, `tools/drop.mjs`
+- Removed (0)
+
+Leak scan: clean.

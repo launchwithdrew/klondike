@@ -13,6 +13,9 @@ logs/
 local/
 chrome-profile/
 .engine.lock
+# secrets the engine keeps for you (e.g. the Twitch pass): never committed
+.private/
+
 # environment
 .venv/
 node_modules/

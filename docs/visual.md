@@ -19,8 +19,9 @@ failed or tampered download changes nothing. Without it, the engine works exactl
 - **A safety flag, always on:** `adult scene on screen? — look before posting` when a frame looks like a strip
   club, underwear or nudity. The draft is scored down, never marked urgent, and `publish` repeats the warning.
   A transcript never sees this. The flag doesn't refuse anything. You look at the frames and decide, as always.
-- **Headline check at publish:** `visual_headline` says whether the frames look like the headline
-  ("the frames don't obviously show the headline" = check the payoff is on screen).
+- **Headline check at publish:** `visual_headline` prints how well the headline describes the frames, as a number
+  only. Measured on 81 GTA VI viewer clips, the model scored a title on its own frames no better than on another clip
+  of the same streamer (AUC 0.54; `eval/eval_headline_fit.py`), so it is not evidence: check the payoff is on screen.
 - `clipengine visual read --id DRAFT [--title "…"]` prints the reads for one draft.
 
 ## Scoring with it (only on your evidence)

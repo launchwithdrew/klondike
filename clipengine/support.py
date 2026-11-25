@@ -130,8 +130,10 @@ def report_text(days: float = 1.0, now: float | None = None) -> str:
     periods = ", ".join(f"{n}m" for n in up["dark_periods"]) or "none"
     causes = ", ".join(untrusted.clean(cause, 64) for cause in up["causes"]) or "none"
     running = "running" if up["running"] else "stopped"
-    uptime = (f"engine v{__version__} · uptime: {running} · {up['deaths']} deaths · {up['dark_min']}m dark"
-              f" · >15m: {periods} · causes: {causes}")
+    window = f"{days * 24:g} h" if days < 2 else f"{days:g} days"
+    # the window's total, never worded as one outage (it was read as "this run was 43 min dark")
+    uptime = (f"engine v{__version__} · uptime: {running} · last {window}: {up['deaths']} outage(s), "
+              f"{up['dark_min']}m dark in total, longest {up.get('longest_min', 0)}m · >15m: {periods} · causes: {causes}")
     lead = f"{100 * scout['first'] / scout['caught']:.0f}%" if scout["caught"] else "–"
     recall = f"{100 * scout['caught'] / scout['total']:.0f}%" if scout["total"] else "–"
     trained = brief.read(root / "config" / "sentinel_model.json", {}).get("eval") or {}
@@ -157,6 +159,14 @@ def report_text(days: float = 1.0, now: float | None = None) -> str:
         totals = campaigns.totals(since)
         if campaigns.pools() or totals["submitted_all"] or totals["paid"]:
             extras.append(f"pools: {totals['submitted']} submitted · ${totals['paid']:,.2f} paid")
+    try:
+        from . import facecam
+        boxes = facecam.box_recheck(now, path=str(runs / "facecam_checks.jsonl"),
+                                    creators=str(root / "config" / "creators.json"))
+        if boxes["recheck"]:
+            extras.append(facecam.recheck_line(boxes))
+    except Exception:
+        pass
     extras = [line for line in extras if line]
     remaining = 12 - len(lines)
     if remaining > 0 and extras:

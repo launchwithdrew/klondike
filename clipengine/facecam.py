@@ -377,8 +377,11 @@ def for_clip(source: str, login: str | None, start: float = 0.0, end: float | No
     if login and override(login):
         box = override(login)
         if available() and not cam_present(source, box, start, end):
+            note_check(login, box, False)
             return {"box": None, "confidence": 0.0, "source": "config/creators.json",
                     "why": "the webcam isn't on screen in this clip (full-screen game or another scene)"}
+        if available():
+            note_check(login, box, True)
         return {"box": box, "confidence": 1.0, "source": "config/creators.json"}
     if disabled(login):
         return {"box": None, "confidence": 0.0, "source": "config/creators.json",
@@ -394,6 +397,57 @@ def for_clip(source: str, login: str | None, start: float = 0.0, end: float | No
     if kn and res.get("why", "").startswith("opencv"):
         return kn                       # can't look — trust what we learned before
     return {**res, "box": None, "source": "none", "why": res.get("why", "")}
+
+
+# ---------------------------------------------------------------- the weekly box re-check (OP_SPEC §6)
+
+CHECKS = os.path.join(REPO, "runs", "facecam_checks.jsonl")
+RECHECK_SHARE = 0.5            # the webcam missing from at least half a creator's clips this week: look again
+RECHECK_MIN = 3
+
+
+def note_check(login: str, box: list[float], present: bool, now: float | None = None, path: str | None = None) -> None:
+    """One line per clip cut with a checked box: was the streamer in it? (Never raises.)"""
+    import time
+    try:
+        os.makedirs(os.path.dirname(path or CHECKS), exist_ok=True)
+        with open(path or CHECKS, "a") as fh:
+            fh.write(json.dumps({"at": round(now or time.time(), 1), "login": login.lower(), "box": box,
+                                 "present": bool(present)}) + "\n")
+    except OSError:
+        pass
+
+
+def box_recheck(now: float, days: float = 7, path: str | None = None, creators: str | None = None) -> dict:
+    """Per creator with a checked box: clips cut this week, and how many had no face in the box. A box missing the
+    face in most clips is the wrong box (xQc, 24 Nov: set from his end screen, his GTA webcam sits lower) or a
+    layout change — `facecam --channel LOGIN --refine` and look."""
+    per: dict[str, list[int]] = {}
+    try:
+        for line in open(path or CHECKS):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if now - days * 86400 <= float(r.get("at", 0)) <= now + 60:     # times are rounded; clocks drift
+                c = per.setdefault(r.get("login", "?"), [0, 0])
+                c[0] += 1
+                c[1] += 0 if r.get("present") else 1
+    except OSError:
+        pass
+    boxes = [k for k, v in (_load(creators or CREATORS).get("creators") or {}).items() if isinstance(v, dict)
+             and isinstance(v.get("facecam"), list)]
+    recheck = sorted(k for k, (n, miss) in per.items() if n >= RECHECK_MIN and miss / n >= RECHECK_SHARE)
+    return {"boxes": len(boxes), "seen": len(per), "clips": sum(v[0] for v in per.values()),
+            "recheck": [{"login": k, "clips": per[k][0], "missing": per[k][1]} for k in recheck]}
+
+
+def recheck_line(r: dict) -> str:
+    head = f"webcam boxes: {r['boxes']} set · {r['seen']} cut this week ({r['clips']} clips)"
+    if not r["recheck"]:
+        return head + " · none needs a re-check"
+    return head + " · re-check " + ", ".join(f"{x['login']} (no face in {x['missing']}/{x['clips']})"
+                                             for x in r["recheck"]) + " → `clipengine facecam --channel LOGIN --refine`"
 
 
 # ---------------------------------------------------------------- suggestions for unchecked creators
@@ -483,14 +537,26 @@ def from_recording(rec_dir: str, minutes: float = 5.0, n: int = 32) -> tuple[dic
     return detect_frames(frames) if available() else {"box": None, "confidence": 0.0, "why": "opencv missing"}, login, frames
 
 
+def sample_span(length_s: float, live: bool, minutes: float = 5.0) -> tuple[float, float]:
+    """Where in the newest VOD to look for the webcam: the last minutes while the creator is live (today's layout),
+    else minutes from the middle of the broadcast. A finished VOD's last minutes are usually the outro or the
+    desktop (xQc, 24 Nov: his webcam is top-left on the end screen, left-middle in GTA — the box was set from the
+    wrong scene)."""
+    span = minutes * 60
+    if live or length_s < 3 * span:
+        end = length_s - 5
+        return max(0.0, end - span), end
+    mid = length_s / 2
+    return mid - span / 2, mid + span / 2
+
+
 def from_channel(login: str, minutes: float = 5.0, n: int = 32) -> tuple[dict, list]:
-    """Sample frames from the last minutes of the channel's newest VOD (live VODs included)."""
+    """Sample frames from the channel's newest VOD: its last minutes while live, its middle once finished."""
     from . import twitch as T
     v = T.latest_vod(login)
     pls = T.playlists(v["id"])
     pl = pls["video"]
-    end = pl.length_s - 5
-    start = max(0.0, end - minutes * 60)
+    start, end = sample_span(pl.length_s, bool(v.get("live")), minutes)
     frames = []
     with tempfile.TemporaryDirectory() as tmp:
         for i in range(n):
@@ -501,6 +567,8 @@ def from_channel(login: str, minutes: float = 5.0, n: int = 32) -> tuple[dict, l
             except Exception:
                 continue
             f = _grab(ts, max(0.0, t - first))
+            if f is None:                       # past the segment's last keyframe: its first frame is as good
+                f = _grab(ts, 0.0)
             if f is not None:
                 frames.append(f)
     return detect_frames(frames), frames

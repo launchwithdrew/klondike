@@ -263,6 +263,8 @@ def _render(source: str, source_t0: float, start_s: float, end_s: float,
         raise ValueError(f"crop must be one of {list(CROPS)}")
     base = out.rsplit(".mp4", 1)[0]
     clip_words = [dict(w) for w in words if start_s <= w["start"] < end_s]
+    from . import safety as SF
+    speech_safety = SF.screen(" ".join(w["w"].strip() for w in clip_words))
     bleeps: list[list[float]] = []
     if censor:
         clip_words, bleeps = C.censor_words(clip_words, extra=extra_censor)
@@ -334,8 +336,11 @@ def _render(source: str, source_t0: float, start_s: float, end_s: float,
     if layout == "stack":
         # top: the action, zoomed (centre of the frame); bottom: the full frame
         # with the facecam and HUD; the title card sits on the seam
-        zw = int(1080 * 1080 / stack_top) // 2 * 2
-        vf = (f"[0:v]split[s1][s2];[s1]crop={zw}:ih:(iw-{zw})/2:0,scale=1080:{stack_top},setsar=1[top];"
+        # the crop keeps the panel's own shape (1080 x stack_top) at ANY source height: a fixed pixel width was
+        # right only for 1080-high sources and stretched a 720p stream 1.5x tall
+        cw = f"trunc(min(iw,ih*1080/{stack_top})/2)*2"
+        vf = (f"[0:v]split[s1][s2];[s1]crop='{cw}':ih:(iw-ow)/2:0,"
+              f"scale=1080:{stack_top},setsar=1[top];"
               f"[s2]scale=1080:{1920 - stack_top},setsar=1[bot];[top][bot]vstack=2,"
               f"subtitles='{ass}':fontsdir='{cap_font_dir}'")
     elif geo:
@@ -403,7 +408,7 @@ def _render(source: str, source_t0: float, start_s: float, end_s: float,
                   "bleep_intervals": rel_bleeps}
     json.dump(transcript, open(base + ".transcript.json", "w"), indent=2)
     rep_audit = audit(out, end_s - start_s, payoff_s, max((c["end"] for c in cards_burn), default=None))
-    return {"out": out, "cards": len(cards), "audit": rep_audit, "censored": sum("***" in c["text"] for c in cards),
+    return {"out": out, "cards": len(cards), "audit": rep_audit, "speech_safety": speech_safety, "censored": sum("***" in c["text"] for c in cards),
             "bleeps": rel_bleeps, "watermark": use_wm, "crop": crop if layout == "single" else layout,
             "layout": layout, "facecam": fc_info, "title": title, "quote": quote, "card_slot": slot,
             "captions_later": later, "card_box": [card_y, card_h] if card_png else None}
@@ -435,8 +440,38 @@ def audit(out: str, want_s: float, payoff_s: float | None = None, captions_end_s
     return res
 
 
+_PURPOSE = __import__("threading").local()
+# A pre-render is an intermediate: publish re-encodes it with the card (burn_card) at the final preset. Measured
+# on real footage (24 Nov, 20 s, CRF 20): ultrafast encodes 2.5x faster than veryfast at the same quality (SSIM
+# 0.9974 vs 0.9963 against a veryslow reference); the file is ~4x bigger, which only the draft folder holds.
+PRERENDER_PRESET = "ultrafast"
+
+
+class purpose:
+    """`with purpose("prerender"):` — renders inside use the pre-render preset (config "prerender_preset" wins)."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.prev = getattr(_PURPOSE, "name", None)
+        _PURPOSE.name = self.name
+        return self
+
+    def __exit__(self, *exc):
+        _PURPOSE.name = self.prev
+        return False
+
+
 def render_preset() -> str:
-    """x264 preset: veryfast, or the ops profile's (lite: ultrafast) — config/ops.json "render_preset" wins."""
+    """x264 preset: veryfast, or the ops profile's (lite: ultrafast) — config/ops.json "render_preset" wins.
+    A pre-render (an intermediate the card is burned onto) uses PRERENDER_PRESET."""
+    if getattr(_PURPOSE, "name", None) == "prerender":
+        try:
+            from . import ops as O
+            return O.config().get("prerender_preset") or PRERENDER_PRESET
+        except Exception:
+            return PRERENDER_PRESET
     try:
         from . import ops as O
         if O._state().get("degraded"):

@@ -163,6 +163,14 @@ def main(argv: list[str] | None = None) -> int:
     sv_.add_argument("--sessions", action="store_true", help="only inside the roster's usual stream hours")
     at_ = sub.add_parser("attention", help="ONE line of what needs you now (nothing when nothing does)")
     at_.add_argument("--seen", action="store_true", help="mark what it shows as read")
+    at_.add_argument("--json", action="store_true", help="machine-readable (any agent)")
+    nx_ = sub.add_parser("next", help="the one thing to do now, with the exact command (any agent)")
+    nx_.add_argument("--json", action="store_true")
+    sub.add_parser("agent-check", help="what this host lets an agent do, and which layer to use (OP_SPEC §15)")
+    sub.add_parser("mcp", help="the hourly commands as MCP tools over stdio (any MCP-capable agent)")
+    sh_ = sub.add_parser("shadow", help="the trigger in shadow (§1.4): setup downloads its sound model; status = live recall")
+    sh_.add_argument("action", choices=["setup", "status"])
+    sh_.add_argument("--days", type=float, default=3.0)
     sc_ = sub.add_parser("schedule", help="each roster creator's usual stream hours and the next session (local time)")
     sc_.add_argument("--cached", action="store_true", help="don't re-read their broadcasts")
     cu_ = sub.add_parser("catchup", help="scan saved streams for a window nothing was running in; queue the best")
@@ -189,6 +197,11 @@ def main(argv: list[str] | None = None) -> int:
     hl_.add_argument("--id", required=True)
     fu_ = sub.add_parser("funnel", help="where moments are lost: each route's drafts → drops → skips → posts, viewer clips caught/missed, holes")
     fu_.add_argument("--days", type=float, default=3.0)
+    rt_ = sub.add_parser("rights", help="each creator's rights evidence (policy, source, checked) and what is needed")
+    rt_.add_argument("--stale", action="store_true", help="only creators whose evidence is missing or older than 90 days")
+    rt_.add_argument("--set", metavar="LOGIN", help="record where this creator's permission came from (with --source)")
+    rt_.add_argument("--source", help='e.g. "clip rules on their channel page", "their clip program", "DM 24 Nov"')
+    rt_.add_argument("--checked", help="the date it was checked, YYYY-MM-DD (default today)")
     mx_ = sub.add_parser("metrics", help="the weekly numbers: coverage, overnight yield, cost, speed, publishing, recommendations")
     mx_.add_argument("--days", type=float, default=7.0)
     mx_.add_argument("--save", action="store_true", help="also write runs/metrics/week-<date>.json")
@@ -230,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     answer.add_argument("--no", action="store_true", help="confirm the creator has no webcam box")
     dr = sub.add_parser("doctor", help="preflight: everything this machine needs, with the fix for each gap")
     dr.add_argument("--accounts", action="store_true", help="check public handles in agent mode or platform sign-ins in Chrome")
+    dr.add_argument("--json", action="store_true", help="machine-readable (any agent)")
     st = sub.add_parser("start", help="start a sentinel in the background (survives the shell)")
     st.add_argument("--channel", required=True)
     sp = sub.add_parser("stop", help="stop a sentinel (--all: every sentinel and the poster)")
@@ -240,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("sentinels", help="one line per running sentinel (DOWN ones print the restart command)")
     qu = sub.add_parser("queue", help="sentinel drafts worth a look, best first (one line each)")
     qu.add_argument("--all", action="store_true", help="include skipped/unsafe/stale/low drafts")
+    qu.add_argument("--json", action="store_true", help="machine-readable (any agent); stream text under 'untrusted'")
     pq = sub.add_parser("publish-queued", help="publish a sentinel draft (same checks as publish-live)")
     pq.add_argument("--id", required=True)
     pq.add_argument("--title", required=True)
@@ -272,8 +287,11 @@ def main(argv: list[str] | None = None) -> int:
     at_g = at_.add_mutually_exclusive_group(required=True)
     at_g.add_argument("--failed", metavar="WHY", help="the upload failed or isn't on the account")
     at_g.add_argument("--release", action="store_true", help="claimed but never handed to the browser")
-    sub.add_parser("bank", help="every finished clip per platform: waiting / ready / claimed / uncertain / live")
-    sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
+    bk_ = sub.add_parser("bank", help="every finished clip per platform: waiting / ready / blocked / claimed / uncertain / live")
+    bk_.add_argument("--receipts", action="store_true", help="every live post with how its link was verified (P2)")
+    bk_.add_argument("--json", action="store_true", help="machine-readable (any agent)")
+    tp_ = sub.add_parser("to-post", help="(post_with: agent) clips due now: the file and the exact text per platform")
+    tp_.add_argument("--json", action="store_true", help="machine-readable (any agent)")
     pd = sub.add_parser("posted", help="(post_with: agent) record a clip you posted with your own browser")
     pd.add_argument("--slug", required=True); pd.add_argument("--platform", required=True); pd.add_argument("--url")
     pd.add_argument("--correct-url", metavar="URL", help="fix the link of an already-recorded live post (with --why)")
@@ -310,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
     sk = sub.add_parser("skip", help="mark a sentinel draft as looked-at and not worth posting")
     sk.add_argument("--id", required=True)
     sk.add_argument("--reason", default="other", help="menu/map/loading/driving/dark/static/cutscene/sexual/dud/other, or your own reason")
+    reopen = sub.add_parser("reopen", help="return a skipped draft to review")
+    reopen.add_argument("--id", required=True)
+    reopen.add_argument("--reason", required=True, help="why the editorial decision should be revisited")
     sub.add_parser("eval-judge", help="compare the engine calls to human decisions")
     ch = sub.add_parser("check-headline", help="check a title against a queued draft")
     ch.add_argument("--id", required=True)
@@ -327,6 +348,12 @@ def main(argv: list[str] | None = None) -> int:
     tn.add_argument("--out", help="write the model here instead of config/sentinel_model.json")
     tn.add_argument("--per", type=int, default=2, help="recent broadcasts per streamer (default 2)")
     tn.add_argument("--force", action="store_true", help="write the model even if the one in use scores better")
+    tp = sub.add_parser("twitch-pass", help="the Twitch pass for the official clips feed: status, or --set it from stdin")
+    tp.add_argument("--set", action="store_true", help="read the pass (or Twitch's whole reply) from stdin, check it with Twitch, keep it")
+    yl = sub.add_parser("yield", help="the roster ranked by yield: viewer-clip velocity, strong drafts per hour live, ship rate")
+    yl.add_argument("--refresh", action="store_true", help="measure again now (one Twitch call per creator) and save data/yield.json")
+    ys = sub.add_parser("yardstick", help="weekly: other clip channels' YouTube Shorts of a creator this week vs ours (A10)")
+    ys.add_argument("--creator", action="append", help="Twitch login (repeatable); default: the two highest-yield")
     ln = sub.add_parser("learn", help="turn view counts into streamer weights (data/weights.json) + a calibration report")
     ln.add_argument("--dry", action="store_true", help="report only, don't write data/weights.json")
     fc = sub.add_parser("facecam", help="find a streamer's webcam box (for the facecam layout); saves a check image")
@@ -339,6 +366,14 @@ def main(argv: list[str] | None = None) -> int:
     sc = sub.add_parser("scouts", help="were we first? every moment viewers clipped on the roster vs our drafts")
     sc.add_argument("--hours", type=float, default=6.0)
     sc.add_argument("--min-views", type=int, default=25)
+    sc.add_argument("--explain", action="store_true",
+                    help="one concrete cause per miss, from the sentinels' event logs (events.jsonl)")
+    try:
+        from .house import cli as _house_cli         # our own commands; absent from a public copy
+    except ImportError:
+        _house_cli = None
+    if _house_cli is not None:
+        _house_cli.add(sub)
     so = sub.add_parser("sources", help="the last 10 yt: sentinel sessions: when, how long, chat or audio-only, drafts")
     so.add_argument("-n", type=int, default=10)
     kc = sub.add_parser("kick-check", help="one line: does Kick work from this machine (site, GTA VI listing, recording, chat)")
@@ -384,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
             hit = [r for r in SN.load_queue() if r["id"] == a.keep]
             if not hit:
                 ap.error(f"no draft {a.keep}")
+            if hit[0].get("status") == "skipped":
+                ap.error("draft was skipped; reopen it before marking it evergreen")
             TR.keep(hit[0], a.why)
             print(f"{a.keep}: kept as evergreen — {a.why.strip()}")
         else:
@@ -498,6 +535,33 @@ def main(argv: list[str] | None = None) -> int:
         from . import metrics as MX
         print("\n".join(MX.funnel_lines(MX.funnel(days=a.days))))
         return 0
+    if a.cmd == "rights" and a.set:
+        from pathlib import Path as _P
+        from . import brief as BR
+        try:
+            r = BR.record_rights(_P(BR.__file__).resolve().parent.parent / "config" / "creators.json",
+                                 a.set, a.source or "", a.checked)
+        except ValueError as exc:
+            print(f"rights: {exc}")
+            return 2
+        print(f"rights: {a.set} — policy {r.get('policy', 'allowed')} · source recorded · checked {r['policy_checked']} "
+              "(commit config/creators.json; the policy itself is the owner's call)")
+        return 0
+    if a.cmd == "rights":
+        import datetime as _dt
+        import time as _t
+        from pathlib import Path as _P
+        from . import brief as BR, untrusted as UT
+        roster = BR.read(_P(BR.__file__).resolve().parent.parent / "config" / "creators.json", {}).get("creators") or {}
+        rows = BR.rights_status(roster, _t.time())
+        stale = [r for r in rows if r["need"]]
+        for r in (stale if a.stale else rows):
+            when = _dt.datetime.fromtimestamp(r["checked"], _dt.timezone.utc).strftime("%Y-%m-%d") if r["checked"] else "never"
+            print(f"  {r['login']:<20} {r['policy']:<8} checked {when:<10} "
+                  + (f"NEEDS {'; '.join(r['need'])}" if r["need"] else f"ok · {UT.clean(str(r['source']), 60)}"))
+        print(f"rights: {len(stale)} of {len(rows)} creators missing or stale (>90 d) evidence"
+              + (" — record each in config/creators.json (policy_source, policy_checked); the owner decides policy" if stale else ""))
+        return 0
     if a.cmd == "metrics":
         from . import metrics as MX
         if a.compare:
@@ -541,8 +605,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 from . import ops as O
                 AP.autopilot_run(a.every or O.config().get("autopilot_every_min", 5), a.sessions, a.rounds)
+        elif a.cmd == "attention" and a.json:
+            from . import agent as AG
+            print(AG.dumps(AG.attention_json()))
         elif a.cmd == "attention":
             from . import attention as AT
+            from . import agent as AG
             items = AT.pending()
             AP.revive_supervised("attention")
             if AP.autopilot_died():
@@ -550,10 +618,15 @@ def main(argv: list[str] | None = None) -> int:
                 SV.reconcile(None, root=AP._root())         # records the outage once (and alerts once)
                 items = [{"kind": "failure", "text": "autopilot stopped unexpectedly → clipengine autopilot start"}] + AT.pending()
             text = AT.line(items)
+            changed = AG.guides_changed()
+            if changed:
+                text = (text + " · " if text else "") + "the guides changed: read " + ", ".join(changed)
             if text:
                 print(text)
             if a.seen:
                 print(f"marked {AT.mark_seen()} item(s) read")
+                if changed:
+                    AG.mark_guides_read()
         elif a.cmd == "schedule":
             AP.show_schedule(refresh=not a.cached)
         elif a.cmd == "catchup":
@@ -590,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
                             "kind": "sweep" if a.sweep else "catchup", "since": since, "until": until,
                             "channels": a.channel or "roster", "queued": len(got),
                             "windows": len(outcome.get("windows", [])), "failed": outcome.get("failed", []),
+                            "completed_windows": outcome.get("completed_windows", []),
                             "covered_until": mark})
                 if outcome.get("failed"):
                     return 3                                        # finished, but some sources weren't covered
@@ -627,8 +701,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd == "scouts":
         from . import scouts as SC
-        SC.show(a.hours, a.min_views)
+        SC.show(a.hours, a.min_views, explain_=a.explain)
         return 0
+    if _house_cli is not None and _house_cli.handles(a.cmd):
+        return _house_cli.run(a)
     if a.cmd == "import-posts":
         from . import moments
         try:
@@ -684,6 +760,11 @@ def main(argv: list[str] | None = None) -> int:
         from . import ops as O
         if a.cmd == "cycle":
             O.cycle(a.top, radar=not a.no_radar)
+        elif a.cmd == "doctor" and a.json:
+            from . import agent as AG
+            r = AG.doctor_json(a.accounts)
+            print(AG.dumps(r))
+            return 0 if r["ready"] else 1
         elif a.cmd == "doctor":
             return 0 if O.doctor(a.accounts) else 1
         elif a.cmd == "start":
@@ -698,8 +779,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd in ("claim", "attempt", "bank"):
         from . import bank as BK
-        if a.cmd == "bank":
-            BK.show()
+        if a.cmd == "bank" and a.json and not a.receipts:
+            from . import agent as AG
+            print(AG.dumps(AG.bank_json()))
+        elif a.cmd == "bank":
+            BK.show_receipts() if a.receipts else BK.show()
         elif a.cmd == "claim":
             r = BK.claim(a.slug, a.platform, a.by)
             c = r["caption"]
@@ -716,7 +800,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd in ("to-post", "posted", "views", "to-measure", "followers"):
         from . import handpost as HP
-        if a.cmd == "to-post":
+        if a.cmd == "to-post" and a.json:
+            from . import agent as AG
+            print(AG.dumps(AG.to_post_json()))
+        elif a.cmd == "to-post":
             HP.show()
         elif a.cmd == "posted":
             if a.correct_url:
@@ -767,12 +854,40 @@ def main(argv: list[str] | None = None) -> int:
         from . import judge as JG
         JG.eval_judge()
         return 0
+    if a.cmd == "shadow":
+        from . import shadow as SH
+        if a.action == "setup":
+            return 0 if SH.setup() else 1
+        m = SH.load_model()
+        print(f"shadow model: {m.get('name')} (trigger {m['trigger']}, {len(m['weights'])} features; held out: "
+              f"{m.get('evaluated', 'n/a')})" if m else "shadow model: none (config/shadow_model.json)")
+        print(f"sound model (YAMNet): {'ready' if SH.ready() else 'not set up — clipengine shadow setup'}")
+        from . import metrics as MX
+        f = MX.funnel(days=a.days)
+        line = SH.recall_line(f["shadow"]) if "triggers" in (f.get("shadow") or {}) else None
+        print(line or f"no shadow fires in the last {a.days:g} days")
+        return 0
+    if a.cmd in ("next", "agent-check", "mcp"):
+        from . import agent as AG
+        if a.cmd == "next":
+            r = AG.next_step()
+            print(AG.dumps(r) if a.json else AG.next_line(r))
+        elif a.cmd == "agent-check":
+            print("\n".join(AG.agent_check_lines(AG.agent_check())))
+        else:
+            from . import mcp as MC
+            MC.serve()
+        return 0
+    if a.cmd == "queue" and a.json:
+        from . import agent as AG
+        print(AG.dumps(AG.queue_json(a.all)))
+        return 0
     if a.cmd == "queue":
         from . import sentinel as SN
         if not SN.show_queue(all_=a.all):
             print("queue empty")
         return 0
-    if a.cmd in ("publish-queued", "skip", "check-headline", "review"):
+    if a.cmd in ("publish-queued", "skip", "reopen", "check-headline", "review"):
         from . import sentinel as SN
         e = next((r for r in SN.load_queue() if r["id"] == a.id), None)
         if not e:
@@ -793,6 +908,15 @@ def main(argv: list[str] | None = None) -> int:
             SN.set_status(e, "skipped", reason=reason)
             print(f"skipped {e['id']}")
             return 0
+        if a.cmd == "reopen":
+            reason = a.reason.strip()
+            if e.get("status") != "skipped" or not reason:
+                ap.error("reopen needs a skipped draft and a reason")
+            SN.set_status(e, "new", reason=None, judged_at=None, reopen_reason=reason)
+            print(f"reopened {e['id']} for review")
+            return 0
+        if SN.is_skipped(e):
+            raise SystemExit("PUBLISH REFUSED: draft was skipped; reopen it for review first")
         from . import publish as PB
         from . import autopilot as AP
         AP.refuse_never(e.get("login", ""))
@@ -845,6 +969,36 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "train":
         from . import train as TR
         TR.run(a.channel or None, a.vod or None, a.hours, write=not a.dry, out=a.out, force=a.force, per=a.per)
+        return 0
+    if a.cmd == "twitch-pass":
+        from . import helix as HX
+        if a.set:
+            import sys as _sys
+            if _sys.stdin.isatty():
+                print("twitch-pass: pipe the pass in (… | clipengine twitch-pass --set) — never as an argument")
+                return 2
+            try:
+                rec = HX.set_pass(_sys.stdin.read())
+            except Exception as exc:
+                why = ("Twitch says that pass isn't valid (expired, cancelled, or mistyped)" if "401" in str(exc)
+                       else str(exc)[:160])
+                print(f"twitch-pass: not saved — {why}")
+                return 1
+        print(HX.status()[1])
+        if HX.status()[0] != "ok":
+            print(HX.RENEW.format(cid=HX.client_id() or "<the app's Client ID>"))
+        return 0
+    if a.cmd == "yardstick":
+        from . import yardstick as YS
+        res = YS.run(a.creator)
+        return 0 if any(r["ok"] for r in res) else 3
+    if a.cmd == "yield":
+        from . import yields as YL
+        rep = YL.refresh() if a.refresh else (json.load(open(YL.PATH)) if os.path.exists(YL.PATH) else None)
+        if rep is None:
+            print("yield: not measured yet — `clipengine yield --refresh` (cycle does it once a day)")
+            return 0
+        print("\n".join(YL.lines(rep)))
         return 0
     if a.cmd == "learn":
         from . import learn as LN

@@ -13,3 +13,13 @@ def _isolated_judging_data(tmp_path_factory):
     judge.DATA = str(tmp_path_factory.mktemp("judging-data"))
     yield
     judge.DATA = before
+
+
+@pytest.fixture(autouse=True)
+def _isolated_facecam_checks(tmp_path_factory):
+    """Clips cut in tests never add to the install's weekly webcam-box re-check (runs/facecam_checks.jsonl)."""
+    from clipengine import facecam
+    before = facecam.CHECKS
+    facecam.CHECKS = str(tmp_path_factory.mktemp("facecam") / "checks.jsonl")
+    yield
+    facecam.CHECKS = before

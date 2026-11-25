@@ -78,16 +78,28 @@ def _threads() -> int:
         return os.cpu_count() or 4
 
 
-def model(name: str):
-    if name not in _MODELS:
+def requested_device() -> str:
+    from .ops import config
+
+    device = config().get("whisper_device", "cpu")
+    if device not in ("cpu", "cuda"):
+        raise ValueError("whisper_device must be cpu or cuda")
+    return device
+
+
+def model(name: str, device: str = "cpu"):
+    compute = {"cpu": "int8", "cuda": "float16"}[device]
+    key = (name, device, compute)
+    if key not in _MODELS:
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         from faster_whisper import WhisperModel
-        # Models are cached by setup; never re-check the hub on load — each
-        # check hits the model CDN and fires a network-approval prompt.
-        _MODELS[name] = WhisperModel(name, device="cpu", compute_type="int8",
-                                     cpu_threads=_threads(),
-                                     local_files_only=True)
-    return _MODELS[name]
+        # Setup caches models. Opening one must never contact the model hub.
+        _MODELS[key] = WhisperModel(name, device=device, compute_type=compute, cpu_threads=_threads(),
+                                    local_files_only=True)
+    return _MODELS[key]
+
+
+_CUDA_FAILURES: dict[str, str] = {}
 
 
 # ---- vocabulary: names Whisper should spell right ---------------------------------------------------
@@ -202,10 +214,28 @@ SECOND_PASS_MIN_P = 0.5      # ... and keep that run only if its words are this 
 
 
 def _whisper(x: np.ndarray, model_name: str, offset: float, prompt: str | None, vad) -> dict:
+    device = requested_device()
+    if device == "cpu":
+        return _whisper_once(x, model_name, offset, prompt, vad, device)
+    failure = _CUDA_FAILURES.get(model_name)
+    if failure is None:
+        try:
+            return _whisper_once(x, model_name, offset, prompt, vad, device)
+        except (OSError, RuntimeError, ValueError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"[:160]
+            _CUDA_FAILURES[model_name] = failure
+            _MODELS.pop((model_name, "cuda", "float16"), None)
+            import sys
+            print(f"[whisper] CUDA inference failed; retrying on CPU ({failure})", file=sys.stderr, flush=True)
+    retry = _whisper_once(x, model_name, offset, prompt, vad, "cpu")
+    return {**retry, "fallback": failure}
+
+
+def _whisper_once(x: np.ndarray, model_name: str, offset: float, prompt: str | None, vad, device: str) -> dict:
     kw = {"vad_filter": vad is not False}
     if isinstance(vad, dict):
         kw["vad_parameters"] = vad
-    segs, info = model(model_name).transcribe(
+    segs, info = model(model_name, device).transcribe(
         x, language="en", word_timestamps=True, condition_on_previous_text=False,
         initial_prompt=prompt or None, **kw)
     out = []
@@ -217,7 +247,7 @@ def _whisper(x: np.ndarray, model_name: str, offset: float, prompt: str | None, 
                  for w in (s.words or [])]
         out.append({"start": round(s.start + offset, 2), "end": round(s.end + offset, 2),
                     "text": s.text.strip(), "words": words})
-    return {"model": model_name, "language": info.language,
+    return {"model": model_name, "device": device, "language": info.language,
             "language_probability": round(info.language_probability, 2),
             "segments": out}
 

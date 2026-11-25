@@ -1,5 +1,5 @@
 // TikTok poster — TikTok Studio web upload. Handle is learned from the signed-in profile.
-import { ACCOUNTS, log, setLocalFiles } from './lib.mjs';
+import { ACCOUNTS, checkPostingRights, log, setLocalFiles } from './lib.mjs';
 
 const UPLOAD = 'https://www.tiktok.com/tiktokstudio/upload?from=webapp';
 const EXPECTED = (ACCOUNTS.tiktok.username || '').replace(/^@/, ''); // the signed-in handle must be exactly this (brand pack)
@@ -29,6 +29,7 @@ async function latestVideos(page, handle) {
 }
 
 export async function postTikTok(page, item, { dry = false } = {}) {
+  checkPostingRights(item);
   const chk = await checkTikTok(page);
   if (!chk.ok) throw new Error(`TikTok check failed: ${chk.why}`);
   const beforeList = await latestVideos(page, chk.handle);
@@ -79,9 +80,13 @@ export async function postTikTok(page, item, { dry = false } = {}) {
   }
   if (dry) { log('tiktok', item.slug, 'DRY RUN: stopped before Post'); return { dry: true }; }
 
+  checkPostingRights(item);
   await postBtn.click();
   const postNow = page.locator('button:has-text("Post now")');
-  if (await postNow.isVisible({ timeout: 4000 }).catch(() => false)) await postNow.click();
+  if (await postNow.isVisible({ timeout: 4000 }).catch(() => false)) {
+    checkPostingRights(item);
+    await postNow.click();
+  }
   await page.waitForURL(/tiktokstudio\/content|manage/, { timeout: 300000 }).catch(() => {});
 
   // Verify: a new video appears on the public profile.

@@ -10,7 +10,7 @@ machine). Most problems are one of these:
 | "not signed in" / "wrong channel" / "logged in as @…" | The user signs in again: `cd engine && node post.mjs --login`, then `--check` |
 | Posts stuck in `outbox/` | The poster isn't running: `cycle` starts it; or `cd engine && node post.mjs --once` |
 | A clip was HELD | Its reason is in `logs/engine.log`; held clips are in `failed/` |
-| Disk nearly full | `cycle` clears old drafts; lower `buffer_h` or `max_sentinels` in `config/ops.json` |
+| Disk/quota full | `cycle` clears the oldest recording; hidden quota: `disk_quota_gb` in `config/ops.json` |
 | Recording holes during ad breaks | Twitch shows ads to logged-out viewers. Optional: the user sets `TWITCH_AUTH_TOKEN` in the machine's environment (their own Twitch login token; never in a file or chat). With Turbo or a sub to that channel the recording is ad-free, and sub-only saved streams open. `doctor` says which mode is on |
 | No moments from a streamer | They may be offline, or their stream isn't saved — sentinels record it live |
 | Everything scores low | Normal at first; post the best, run `learn` daily, retrain weekly (`train`) |

@@ -145,6 +145,27 @@ def note_media(stage: str, media_s: float, route: str | None = None, root: str |
         pass
 
 
+def draft_key(draft: dict | None) -> str | None:
+    """Queue IDs reuse the same UTC clock time on different days."""
+    if not draft or not draft.get("id"):
+        return None
+    from .moments import timestamp
+    at = timestamp(draft.get("at"))
+    if at is None:
+        at = timestamp(draft.get("start"))
+    return f"{draft['id']}@{int(at // 86400)}" if at is not None else None
+
+
+@contextlib.contextmanager
+def track_draft(draft: dict | None):
+    previous = getattr(_local, "draft_key", None)
+    _local.draft_key = draft_key(draft) or previous
+    try:
+        yield
+    finally:
+        _local.draft_key = previous
+
+
 @contextlib.contextmanager
 def slot(stage: str, kind: str | None = None, root: str | None = None, slots: int | None = None,
          min_free_gb: float | None = None, poll_s: float = POLL_S, free=free_gb, say=print):
@@ -167,6 +188,7 @@ def slot(stage: str, kind: str | None = None, root: str | None = None, slots: in
     waiter = {"kind": kind, "stage": stage, "prio": PRIORITY.get(kind, 4), "pid": os.getpid(),
               "since": since, "file": me}
     told = None
+    reasons: dict[str, dict] = {}
     fd, idx = None, None
     try:
         while True:
@@ -174,10 +196,14 @@ def slot(stage: str, kind: str | None = None, root: str | None = None, slots: in
             now = time.time()
             ahead = [w for w in waiters(root, now=now) if _order(w, now) < _order(waiter, now)]
             mem = free()
+            holders = []
             if ahead:
                 reason = f"waiting behind {ahead[0]['kind']} ({ahead[0]['stage']})"
+                wait_cause = "priority"
+                holders = [ahead[0]]
             elif mem is not None and mem < floor:
                 reason = f"waiting: only {mem:.1f} GB memory free (recording comes first)"
+                wait_cause = "memory"
             else:
                 for i in range(n):
                     f = os.open(os.path.join(d, f"slot-{i}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
@@ -188,10 +214,24 @@ def slot(stage: str, kind: str | None = None, root: str | None = None, slots: in
                     except BlockingIOError:
                         os.close(f)
                 if fd is not None:
-                    break
-                busy = running(root)
-                reason = "waiting: all heavy slots busy" + (f" ({', '.join(r['kind'] + ' ' + r['stage'] for r in busy)})"
-                                                            if busy else "")
+                    # The check above and the lock are two steps: a waiter stalled between them (a loaded host)
+                    # could take a slot a waiter that aged in the meantime is owed. Look again holding it.
+                    now = time.time()
+                    if not any(_order(w, now) < _order(waiter, now) for w in waiters(root, now=now)):
+                        break
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                    fd, idx = None, None
+                    continue
+                wait_cause = "capacity"
+                holders = running(root)
+                reason = "waiting: all heavy slots busy" + (f" ({', '.join(r['kind'] + ' ' + r['stage'] for r in holders)})"
+                                                            if holders else "")
+            trace = reasons.setdefault(wait_cause, {"first_at": now, "polls": 0})
+            trace.update(last_at=now, polls=trace["polls"] + 1,
+                         blockers=[{k: w.get(k) for k in ("pid", "kind", "stage", "since")} for w in holders])
+            if wait_cause == "memory":
+                trace["last_free_gb"] = mem
             with open(me + ".tmp", "w") as fh:
                 json.dump({**waiter, "reason": reason}, fh)
             os.replace(me + ".tmp", me)
@@ -222,7 +262,9 @@ def slot(stage: str, kind: str | None = None, root: str | None = None, slots: in
             pass
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-        _log({"at": t0, "kind": kind, "stage": stage, "waited_s": round(waited, 1),
+        _log({"at": t0, "kind": kind, "stage": stage, "waited_s": round(waited, 1), "ready_at": since,
+              "slot": idx, "pid": os.getpid(), "draft_key": getattr(_local, "draft_key", None), "aged_publish": kind == "publish" and t0 - since >= PUBLISH_WAIT_S,
+              "wait_causes": reasons, "finished_at": time.time(),
               "ran_s": round(time.time() - t0, 1), "ok": ok}, root)
 
 
